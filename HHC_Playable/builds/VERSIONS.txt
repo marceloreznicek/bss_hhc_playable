@@ -1,0 +1,3 @@
+v1 - Versão com peladão para todas as redes
+v2 - Versão sem peladão para todas as redes (Apenas Portrait)
+v3 - Versão sem peladão com Portrait e Landscape para Unity Ads e Unity Ads 

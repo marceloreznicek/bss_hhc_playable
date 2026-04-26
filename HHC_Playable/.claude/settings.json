@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__unity__read_console",
+      "mcp__unity__find_gameobjects",
+      "mcp__claude_ai_Google_Cloud_BigQuery__execute_sql_readonly",
+      "mcp__claude_ai_Google_Cloud_BigQuery__get_table_info",
+      "mcp__claude_ai_Google_Cloud_BigQuery__list_dataset_ids"
+    ]
+  }
+}

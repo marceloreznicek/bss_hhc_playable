@@ -1,0 +1,1955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>HeroSwarm — Playable v0.1</title>
+<style>
+
+/* ─────────────────────────────────────────────────────────
+   RESET + BASE
+   ───────────────────────────────────────────────────────── */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #1a0d04;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Arial Black', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+/* ─────────────────────────────────────────────────────────
+   GAME CONTAINER (1080×1920 portrait, scaled to viewport)
+   ───────────────────────────────────────────────────────── */
+#game {
+  position: absolute;
+  width: 1080px;
+  height: 1920px;
+  transform-origin: top left;
+  overflow: hidden;
+  background: linear-gradient(180deg, #2d1810 0%, #1a0d04 100%);
+}
+
+/* ─────────────────────────────────────────────────────────
+   HUD (top wood bar + coin counter)
+   ───────────────────────────────────────────────────────── */
+#hud {
+  position: absolute;
+  top: 0; left: 0;
+  width: 1080px;
+  height: 120px;
+  background: linear-gradient(180deg, #6b3410 0%, #4a2008 100%);
+  border-bottom: 6px solid #2a0f04;
+  z-index: 10;
+}
+#coin-bar {
+  position: absolute;
+  top: 22px;
+  right: 30px;
+  width: 320px;
+  height: 76px;
+  background: rgba(0,0,0,0.45);
+  border: 4px solid #d4a04c;
+  border-radius: 38px;
+  display: flex;
+  align-items: center;
+  padding: 0 24px 0 70px;
+  color: #fff;
+  font-size: 44px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-shadow: 2px 2px 0 #3a1500;
+}
+#coin-bar::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #ffe066, #f5a623 60%, #b56c08);
+  border: 3px solid #6a3a00;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+}
+
+/* ─────────────────────────────────────────────────────────
+   BATTLEFIELD (y=120 to y=900, height=780)
+   ───────────────────────────────────────────────────────── */
+#battlefield {
+  position: absolute;
+  top: 120px;
+  left: 0;
+  width: 1080px;
+  height: 780px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #2a4a2a 0%, #1a3a1a 70%, #122a12 100%);
+  border-bottom: 4px solid #0a1a06;
+  transition: transform 1.0s cubic-bezier(0.4, 0, 0.2, 1), filter 1.0s ease;
+  transform-origin: center center;
+  will-change: transform;
+}
+#battlefield.zooming     { transform: scale(0.6) translateX(180px); filter: brightness(0.6); }
+#battlefield.zooming-far { transform: scale(0.45);                  filter: brightness(0.5); }
+/* Per-level background classes (placeholders, swapped to real bg in P9) */
+#battlefield.level-1 { background: linear-gradient(180deg, #2a4a2a 0%, #1a3a1a 70%, #122a12 100%); }
+#battlefield.level-2 { background: linear-gradient(180deg, #4a3018 0%, #2a1a08 70%, #1a0a04 100%); }
+#battlefield.level-3 { background: linear-gradient(180deg, #5a1010 0%, #2a0608 70%, #100204 100%); }
+#battlefield::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 200px;
+  background: linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.4) 100%);
+  pointer-events: none;
+}
+#lane {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ─────────────────────────────────────────────────────────
+   ACTORS (top-down) — actor anchored at CENTER (x,y) via translate.
+   Sprite bobs/idles in place; no facing/mirroring needed top-down.
+   ───────────────────────────────────────────────────────── */
+.actor {
+  position: absolute;
+  top: 0; left: 0;
+  pointer-events: none;
+  will-change: transform;
+}
+.actor .sprite {
+  position: relative;
+  display: block;
+  transform-origin: center center;
+  animation: bob 0.5s ease-in-out infinite alternate;
+}
+@keyframes bob {
+  from { transform: translateY(-3px) scale(1);    }
+  to   { transform: translateY( 3px) scale(1.02); }
+}
+.actor.tackling .sprite {
+  animation: tackleTop 0.28s ease-in-out infinite alternate;
+}
+@keyframes tackleTop {
+  from { transform: translateY(0)    scale(1);    }
+  to   { transform: translateY(-6px) scale(1.08); }
+}
+.actor.dying .sprite {
+  animation: dying 0.42s ease-out forwards;
+}
+@keyframes dying {
+  0%   { transform: scale(1)    rotate(0deg);   opacity: 1; }
+  100% { transform: scale(0.55) rotate(50deg);  opacity: 0; }
+}
+
+/* Placeholder sprite — colored rounded box with letter label */
+.placeholder-sprite {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+  border: 4px solid rgba(0,0,0,0.55);
+  font-weight: 900;
+  color: #fff;
+  text-shadow: 2px 2px 0 #000, -1px -1px 0 #000;
+  letter-spacing: 1px;
+  box-shadow: 0 4px 0 rgba(0,0,0,0.4), inset 0 4px 0 rgba(255,255,255,0.15);
+  font-family: 'Arial Black', sans-serif;
+}
+
+/* HP bar above an actor (positioned absolutely inside .actor) */
+.hp-bar {
+  position: absolute;
+  left: 50%;
+  top: -22px;
+  transform: translateX(-50%);
+  width: 70px;
+  height: 9px;
+  background: rgba(0,0,0,0.65);
+  border: 2px solid #1a0800;
+  border-radius: 5px;
+  overflow: hidden;
+  pointer-events: none;
+}
+.hp-bar-fill {
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(180deg, #4ad84a 0%, #1f8a18 100%);
+  transition: width 0.18s ease-out;
+}
+.hp-bar-fill.low { background: linear-gradient(180deg, #f56b3a 0%, #b53a10 100%); }
+.actor.player .hp-bar-fill { background: linear-gradient(180deg, #4af0ff 0%, #1080d0 100%); }
+.actor.player .hp-bar-fill.low { background: linear-gradient(180deg, #f56b3a 0%, #b53a10 100%); }
+
+/* Hit flash overlay (white pulse on tackle) */
+.hit-flash {
+  animation: hitFlash 0.18s ease-out;
+}
+@keyframes hitFlash {
+  0%   { filter: brightness(1) saturate(1); }
+  40%  { filter: brightness(6) saturate(0); }
+  100% { filter: brightness(1) saturate(1); }
+}
+
+/* Floating coin sprite (during fly-to-counter anim) */
+.fly-coin {
+  position: absolute;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #ffe066, #f5a623 60%, #b56c08);
+  border: 3px solid #6a3a00;
+  box-shadow: 0 0 8px rgba(255,200,60,0.7);
+  pointer-events: none;
+  z-index: 50;
+}
+
+/* Coin counter pop on increment */
+#coin-bar.pop {
+  animation: coinPop 0.18s ease-out;
+}
+@keyframes coinPop {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+
+/* ─────────────────────────────────────────────────────────
+   UNLOCK BURST (NEW UNIT! flash on card)
+   ───────────────────────────────────────────────────────── */
+.card.unlocking {
+  animation: unlockPulse 0.6s ease-out;
+}
+@keyframes unlockPulse {
+  0%   { transform: scale(1); box-shadow: 0 6px 0 #1a0800, inset 0 2px 0 rgba(255,255,255,0.1); }
+  40%  { transform: scale(1.06); box-shadow: 0 6px 0 #1a0800, 0 0 60px rgba(255,210,80,0.95); }
+  100% { transform: scale(1);    box-shadow: 0 6px 0 #1a0800, inset 0 2px 0 rgba(255,255,255,0.1); }
+}
+.unlock-burst {
+  position: absolute;
+  top: -32px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(180deg, #ffd97a 0%, #f5a623 100%);
+  border: 4px solid #1a0800;
+  border-radius: 20px;
+  padding: 8px 22px;
+  color: #1a0800;
+  font-size: 28px;
+  font-weight: 900;
+  text-shadow: 1px 1px 0 rgba(255,255,255,0.3);
+  letter-spacing: 1.5px;
+  box-shadow: 0 0 30px rgba(255,210,80,0.85);
+  animation: burstSlide 1.6s ease-out forwards;
+  pointer-events: none;
+  z-index: 20;
+}
+@keyframes burstSlide {
+  0%   { opacity: 0; transform: translateX(-50%) translateY(20px) scale(0.6); }
+  20%  { opacity: 1; transform: translateX(-50%) translateY(0)    scale(1.15); }
+  60%  { opacity: 1; transform: translateX(-50%) translateY(0)    scale(1); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-30px) scale(0.95); }
+}
+
+/* ─────────────────────────────────────────────────────────
+   TUTORIAL — guide hand + speech bubbles
+   ───────────────────────────────────────────────────────── */
+#guide-hand {
+  position: absolute;
+  z-index: 200;
+  pointer-events: none;
+  width: 90px;
+  height: 110px;
+  display: none;
+  filter: drop-shadow(0 4px 8px rgba(0,0,0,0.7));
+  animation: guideBounce 0.65s ease-in-out infinite alternate;
+  transform-origin: center center;
+}
+#guide-hand.show { display: block; }
+#guide-hand::before {
+  /* Pointing-finger placeholder — replaced by hand_pointer.png in P9 */
+  content: '👆';
+  font-size: 90px;
+  line-height: 1;
+  display: block;
+  filter: drop-shadow(2px 2px 0 #000);
+}
+@keyframes guideBounce {
+  from { transform: translate(0, 0); }
+  to   { transform: translate(0, -30px); }
+}
+
+.tut-bubble {
+  position: absolute;
+  z-index: 199;
+  background: linear-gradient(180deg, #fff5d4 0%, #ffd97a 100%);
+  border: 5px solid #1a0800;
+  border-radius: 24px;
+  padding: 18px 26px;
+  color: #1a0800;
+  font-size: 32px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-align: center;
+  box-shadow: 0 6px 0 rgba(0,0,0,0.4);
+  display: none;
+  pointer-events: none;
+  max-width: 540px;
+}
+.tut-bubble.show {
+  display: block;
+  animation: bubbleIn 0.32s ease-out forwards;
+}
+@keyframes bubbleIn {
+  from { opacity: 0; transform: translateY(20px) scale(0.9); }
+  to   { opacity: 1; transform: translateY(0)    scale(1);   }
+}
+.tut-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -22px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0; height: 0;
+  border-left:  18px solid transparent;
+  border-right: 18px solid transparent;
+  border-top:   22px solid #1a0800;
+}
+.tut-bubble.up::after {
+  /* Tail flipped to point down→up (used when bubble is BELOW the target) */
+  bottom: auto;
+  top: -22px;
+  border-top: 0;
+  border-bottom: 22px solid #1a0800;
+}
+
+/* ─────────────────────────────────────────────────────────
+   HORDE LAYER (level 3 — mass static enemies behind active lane)
+   ───────────────────────────────────────────────────────── */
+#horde-layer {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+  display: none;
+}
+#horde-layer.show { display: block; }
+.horde-mob {
+  position: absolute;
+  border-radius: 10px;
+  border: 3px solid rgba(0,0,0,0.55);
+  font-weight: 900;
+  color: #fff;
+  text-shadow: 1px 1px 0 #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  animation: hordeBob 0.6s ease-in-out infinite alternate;
+}
+@keyframes hordeBob {
+  from { transform: translateY(-2px); }
+  to   { transform: translateY( 2px); }
+}
+
+/* Screen shake on Dragon spawn / horde reveal */
+#game.shaking { animation: shake 0.6s ease-in-out 2; }
+@keyframes shake {
+  0%, 100% { transform: scale(var(--gs, 1)) translate(var(--gx, 0), var(--gy, 0)); }
+  20%      { transform: scale(var(--gs, 1)) translate(calc(var(--gx, 0px) + 12px), calc(var(--gy, 0px) - 8px)); }
+  40%      { transform: scale(var(--gs, 1)) translate(calc(var(--gx, 0px) - 10px), calc(var(--gy, 0px) + 6px)); }
+  60%      { transform: scale(var(--gs, 1)) translate(calc(var(--gx, 0px) + 8px),  calc(var(--gy, 0px) - 5px)); }
+  80%      { transform: scale(var(--gs, 1)) translate(calc(var(--gx, 0px) - 6px),  calc(var(--gy, 0px) + 4px)); }
+}
+
+/* Dragon AoE flash overlay */
+#aoe-flash {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(circle, #fff 0%, #ffd97a 20%, transparent 70%);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 80;
+}
+#aoe-flash.flash {
+  animation: aoeFlash 0.55s ease-out forwards;
+}
+@keyframes aoeFlash {
+  0%   { opacity: 0; }
+  20%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* ─────────────────────────────────────────────────────────
+   LEVEL BANNER (slides in across battlefield on transition)
+   ───────────────────────────────────────────────────────── */
+#level-banner {
+  position: absolute;
+  top: 380px;
+  left: 0;
+  width: 1080px;
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 130px;
+  font-weight: 900;
+  color: #ffd97a;
+  text-shadow: 6px 8px 0 #1a0800, 0 0 50px rgba(255,180,0,0.8);
+  letter-spacing: 6px;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 50;
+  transform: translateX(-1100px) skewX(-12deg);
+}
+#level-banner.show {
+  animation: bannerSlide 1.6s ease-in-out forwards;
+}
+@keyframes bannerSlide {
+  0%   { opacity: 0; transform: translateX(-1100px) skewX(-12deg); }
+  20%  { opacity: 1; transform: translateX(0)        skewX(-12deg); }
+  70%  { opacity: 1; transform: translateX(0)        skewX(-12deg); }
+  100% { opacity: 0; transform: translateX(1100px)  skewX(-12deg); }
+}
+
+/* ─────────────────────────────────────────────────────────
+   WAVE INFO (between battlefield and cards)
+   ───────────────────────────────────────────────────────── */
+#wave-info {
+  position: absolute;
+  top: 900px;
+  left: 0;
+  width: 1080px;
+  height: 100px;
+  background: linear-gradient(180deg, #3a1a08 0%, #2a1004 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffd97a;
+  font-size: 38px;
+  font-weight: 900;
+  text-shadow: 2px 2px 0 #1a0800;
+  letter-spacing: 1.5px;
+  z-index: 9;
+  border-top: 4px solid #1a0800;
+  border-bottom: 4px solid #1a0800;
+}
+
+/* ─────────────────────────────────────────────────────────
+   CARD STACK (y=1000 to y=1900, 3 cards, ~290px tall each)
+   ───────────────────────────────────────────────────────── */
+#card-stack {
+  position: absolute;
+  top: 1000px;
+  left: 0;
+  width: 1080px;
+  height: 920px;
+  padding: 20px 30px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.card {
+  position: relative;
+  flex: 1;
+  background: linear-gradient(180deg, #4a3018 0%, #2e1a08 100%);
+  border: 5px solid #d4a04c;
+  border-radius: 22px;
+  display: flex;
+  align-items: center;
+  padding: 16px 24px;
+  box-shadow: 0 6px 0 #1a0800, inset 0 2px 0 rgba(255,255,255,0.1);
+}
+.card.locked {
+  filter: grayscale(80%) brightness(0.45);
+  pointer-events: none;
+}
+.card-avatar {
+  width: 200px;
+  height: 200px;
+  border-radius: 50%;
+  border: 5px solid #d4a04c;
+  background: #1a0800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 60px;
+  font-weight: 900;
+  color: #fff;
+  flex-shrink: 0;
+  text-shadow: 2px 2px 0 #000;
+}
+.card-info {
+  flex: 1;
+  padding: 0 24px;
+  color: #fff;
+}
+.card-name {
+  font-size: 38px;
+  font-weight: 900;
+  color: #ffd97a;
+  text-shadow: 2px 2px 0 #1a0800;
+  margin-bottom: 8px;
+}
+.card-sub {
+  font-size: 24px;
+  color: #d4b48c;
+  font-weight: bold;
+}
+.card-action {
+  width: 220px;
+  height: 130px;
+  background: linear-gradient(180deg, #f56b3a 0%, #b53a10 100%);
+  border: 5px solid #ffd97a;
+  border-radius: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 36px;
+  font-weight: 900;
+  text-shadow: 2px 2px 0 #1a0800;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: transform 0.1s ease;
+  box-shadow: 0 5px 0 #6a1a00;
+}
+.card-action:active { transform: translateY(3px); box-shadow: 0 2px 0 #6a1a00; }
+.card-auto-label {
+  width: 220px;
+  height: 130px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  color: #ffd97a;
+  font-size: 26px;
+  font-weight: 900;
+  text-align: center;
+  flex-shrink: 0;
+  text-shadow: 2px 2px 0 #1a0800;
+  letter-spacing: 1px;
+}
+.card-auto-label .auto-cd { font-size: 36px; color: #fff; margin-top: 6px; }
+
+/* ─────────────────────────────────────────────────────────
+   INTRO OVERLAY
+   ───────────────────────────────────────────────────────── */
+#intro {
+  position: absolute;
+  top: 0; left: 0;
+  width: 1080px;
+  height: 1920px;
+  background: rgba(0,0,0,0.88);
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px;
+}
+#intro-title {
+  color: #ffd97a;
+  font-size: 110px;
+  font-weight: 900;
+  text-align: center;
+  text-shadow: 4px 6px 0 #1a0800, 0 0 30px rgba(255,180,0,0.5);
+  margin-bottom: 60px;
+  line-height: 1;
+}
+#intro-hero-placeholder {
+  width: 480px;
+  height: 600px;
+  background: linear-gradient(180deg, #d83020 0%, #8a1010 100%);
+  border: 8px solid #ffd97a;
+  border-radius: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 60px;
+  font-weight: 900;
+  margin-bottom: 80px;
+  text-shadow: 2px 2px 0 #000;
+}
+#intro-text {
+  color: #fff;
+  font-size: 44px;
+  text-align: center;
+  line-height: 1.4;
+  margin-bottom: 60px;
+  text-shadow: 2px 3px 8px rgba(0,0,0,0.9);
+}
+#intro-btn {
+  width: 480px;
+  height: 150px;
+  background: linear-gradient(180deg, #46c93a 0%, #1f8a18 100%);
+  border: 6px solid #ffd97a;
+  border-radius: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 56px;
+  font-weight: 900;
+  cursor: pointer;
+  box-shadow: 0 8px 0 #0c4a08, 0 0 30px rgba(70,200,50,0.5);
+  transition: transform 0.1s ease;
+  text-shadow: 2px 2px 0 #0c4a08;
+}
+#intro-btn:active { transform: translateY(4px); box-shadow: 0 4px 0 #0c4a08; }
+
+/* ─────────────────────────────────────────────────────────
+   ENDCARD OVERLAY
+   ───────────────────────────────────────────────────────── */
+#endcard {
+  display: none;
+  position: absolute;
+  top: 0; left: 0;
+  width: 1080px;
+  height: 1920px;
+  background: rgba(0,0,0,0.92);
+  z-index: 400;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px;
+}
+#endcard.show { display: flex; animation: endcardIn 0.5s ease-out; }
+@keyframes endcardIn {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1); }
+}
+#endcard-icon {
+  width: 380px;
+  height: 380px;
+  background: linear-gradient(135deg, #d83020, #8a1010);
+  border: 10px solid #ffd97a;
+  border-radius: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 56px;
+  font-weight: 900;
+  margin-bottom: 60px;
+  text-shadow: 2px 2px 0 #000;
+  box-shadow: 0 0 50px rgba(255,180,0,0.4);
+}
+#endcard-text {
+  color: #fff;
+  font-size: 72px;
+  font-weight: 900;
+  text-align: center;
+  margin-bottom: 60px;
+  text-shadow: 3px 4px 0 #1a0800, 0 0 30px rgba(255,180,0,0.5);
+  line-height: 1.1;
+}
+#endcard-btn {
+  width: 580px;
+  height: 170px;
+  background: linear-gradient(180deg, #46c93a 0%, #1f8a18 100%);
+  border: 7px solid #ffd97a;
+  border-radius: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 60px;
+  font-weight: 900;
+  cursor: pointer;
+  box-shadow: 0 10px 0 #0c4a08, 0 0 40px rgba(70,200,50,0.6);
+  text-shadow: 2px 2px 0 #0c4a08;
+  animation: ctaPulse 1.4s ease-in-out infinite alternate;
+}
+@keyframes ctaPulse {
+  from { transform: scale(1);    box-shadow: 0 10px 0 #0c4a08, 0 0 40px rgba(70,200,50,0.6); }
+  to   { transform: scale(1.06); box-shadow: 0 10px 0 #0c4a08, 0 0 60px rgba(70,200,50,0.9); }
+}
+#endcard-btn:active { animation: none; transform: translateY(4px); }
+
+</style>
+</head>
+<body>
+
+<div id="game">
+
+  <!-- HUD -->
+  <div id="hud">
+    <div id="coin-bar"><span id="coins-val">0</span></div>
+  </div>
+
+  <!-- BATTLEFIELD -->
+  <div id="battlefield" class="level-1">
+    <div id="horde-layer"></div>
+    <div id="lane"></div>
+    <div id="aoe-flash"></div>
+  </div>
+
+  <!-- LEVEL BANNER (slides in on level transition) -->
+  <div id="level-banner"><span id="level-banner-text">LEVEL 2</span></div>
+
+  <!-- TUTORIAL GUIDE -->
+  <div id="guide-hand"></div>
+  <div class="tut-bubble" id="tut-bubble"><span id="tut-bubble-text"></span></div>
+
+  <!-- WAVE INFO -->
+  <div id="wave-info"><span id="wave-info-text">Level 1 — Kills: 0 / 15</span></div>
+
+  <!-- CARD STACK -->
+  <div id="card-stack">
+    <!-- HERO CARD (tap-only) -->
+    <div class="card" id="card-hero">
+      <div class="card-avatar" style="background: linear-gradient(180deg, #d83020, #8a1010);">H</div>
+      <div class="card-info">
+        <div class="card-name">HERO</div>
+        <div class="card-sub">Tap to spawn</div>
+      </div>
+      <div class="card-action" id="btn-spawn-hero">TAP!</div>
+    </div>
+
+    <!-- OGRE CARD (auto-spawn, locked initially) -->
+    <div class="card locked" id="card-ogre">
+      <div class="card-avatar" style="background: linear-gradient(180deg, #4a8a3a, #2a5a20);">O</div>
+      <div class="card-info">
+        <div class="card-name">OGRE CRUSHER</div>
+        <div class="card-sub">Auto-spawn (locked)</div>
+      </div>
+      <div class="card-auto-label">AUTO<div class="auto-cd">4s</div></div>
+    </div>
+
+    <!-- KNIGHT CARD (auto-spawn, locked initially) -->
+    <div class="card locked" id="card-knight">
+      <div class="card-avatar" style="background: linear-gradient(180deg, #b0b8c0, #606870);">K</div>
+      <div class="card-info">
+        <div class="card-name">KNIGHT</div>
+        <div class="card-sub">Auto-spawn (locked)</div>
+      </div>
+      <div class="card-auto-label">AUTO<div class="auto-cd">3s</div></div>
+    </div>
+  </div>
+
+  <!-- INTRO -->
+  <div id="intro">
+    <div id="intro-title">HERO<br>SWARM</div>
+    <div id="intro-hero-placeholder">HERO</div>
+    <div id="intro-text">Lead the swarm.<br>Crush the horde.</div>
+    <div id="intro-btn">START</div>
+  </div>
+
+  <!-- ENDCARD -->
+  <div id="endcard">
+    <div id="endcard-icon">HS</div>
+    <div id="endcard-text">PLAY NOW<br>SAVE THE KINGDOM</div>
+    <div id="endcard-btn">PLAY NOW</div>
+  </div>
+
+</div>
+
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────
+// GAME STATE
+// ─────────────────────────────────────────────────────────
+var STATE = {
+  level: 1,
+  kills: 0,
+  killsThisLevel: 0,
+  coins: 0,
+  units: [],
+  enemies: [],
+  unitsUnlocked: { ogre: false, knight: false, dragon: false },
+  guideStep: 0,
+  introClosed: false,
+  gameActive: false,
+  gameEnded: false
+};
+
+// ─────────────────────────────────────────────────────────
+// AUDIO — WebAudio synth placeholders (replaced with base64 mp3s in P9)
+// Each "SFX_*" name maps to a synth recipe so trigger points are audible during dev.
+// ─────────────────────────────────────────────────────────
+var audioCtx = null;
+var bgmStarted = false;
+
+function getAudio() {
+  if (audioCtx) return audioCtx;
+  try {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctx();
+  } catch (e) { audioCtx = null; }
+  return audioCtx;
+}
+
+function tone(opts) {
+  var ctx = getAudio();
+  if (!ctx) return;
+  var t0 = ctx.currentTime;
+  var osc = ctx.createOscillator();
+  var gain = ctx.createGain();
+  osc.type = opts.type || 'square';
+  osc.frequency.setValueAtTime(opts.f0, t0);
+  if (opts.f1 != null) osc.frequency.exponentialRampToValueAtTime(Math.max(20, opts.f1), t0 + opts.dur);
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(opts.vol || 0.18, t0 + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + (opts.dur || 0.18));
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + (opts.dur || 0.2));
+}
+
+var SFX_RECIPES = {
+  hit:      function() { tone({ type: 'square', f0: 220, f1: 80,  dur: 0.07, vol: 0.14 }); },
+  hit2:     function() { tone({ type: 'square', f0: 280, f1: 90,  dur: 0.07, vol: 0.14 }); },
+  hit3:     function() { tone({ type: 'square', f0: 320, f1: 100, dur: 0.07, vol: 0.14 }); },
+  coin:     function() { tone({ type: 'sine',   f0: 880, f1:1320, dur: 0.18, vol: 0.16 }); },
+  unlock:   function() {
+    tone({ type: 'triangle', f0: 440, f1: 880, dur: 0.18, vol: 0.18 });
+    setTimeout(function() { tone({ type: 'triangle', f0: 660, f1:1320, dur: 0.20, vol: 0.18 }); }, 120);
+  },
+  levelup:  function() {
+    tone({ type: 'sawtooth', f0: 220, f1: 660, dur: 0.30, vol: 0.20 });
+    setTimeout(function() { tone({ type: 'sawtooth', f0: 660, f1:1100, dur: 0.30, vol: 0.20 }); }, 220);
+  },
+  spawn:    function() { tone({ type: 'square', f0: 360, f1: 720, dur: 0.06, vol: 0.10 }); },
+  dragon:   function() {
+    tone({ type: 'sawtooth', f0: 110, f1: 55, dur: 0.5, vol: 0.22 });
+    setTimeout(function() { tone({ type: 'sawtooth', f0: 80, f1: 40, dur: 0.6, vol: 0.20 }); }, 200);
+  },
+  aoe:      function() { tone({ type: 'sawtooth', f0: 1200, f1: 80, dur: 0.55, vol: 0.24 }); },
+  cta:      function() { tone({ type: 'triangle', f0: 540, f1: 880, dur: 0.18, vol: 0.18 }); }
+};
+var HIT_VARIANTS = ['hit', 'hit2', 'hit3'];
+function playRandomHit() { SFX_RECIPES[HIT_VARIANTS[Math.floor(Math.random() * 3)]](); }
+function playSFX(name) {
+  // Real audio takes precedence over the synth recipe
+  if (SOUNDS[name]) {
+    try {
+      var a = new Audio(SOUNDS[name]);
+      a.volume = 0.45;
+      a.play().catch(function() {});
+      return;
+    } catch (e) { /* fall through to synth */ }
+  }
+  var fn = SFX_RECIPES[name];
+  if (fn) fn();
+}
+
+var bgmAudio = null;
+function initBGM() {
+  if (bgmStarted) return;
+  bgmStarted = true;
+  var ctx = getAudio();
+  if (ctx && ctx.state === 'suspended' && ctx.resume) ctx.resume();
+  if (SOUNDS.bgm) {
+    try {
+      bgmAudio = new Audio(SOUNDS.bgm);
+      bgmAudio.loop = true;
+      bgmAudio.volume = 0.18;
+      bgmAudio.play().catch(function() { bgmStarted = false; });
+    } catch (e) { /* silent if no real BGM yet */ }
+  }
+}
+document.addEventListener('touchstart', initBGM, { once: true });
+document.addEventListener('click',      initBGM, { once: true });
+
+// ─────────────────────────────────────────────────────────
+// FORMAT
+// ─────────────────────────────────────────────────────────
+function fmt(n) {
+  n = Math.floor(n);
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000)    return (n / 1000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+// ─────────────────────────────────────────────────────────
+// UI UPDATE
+// ─────────────────────────────────────────────────────────
+function updateUI() {
+  document.getElementById('coins-val').textContent = fmt(STATE.coins);
+  var total = (WAVES && WAVES[STATE.level]) ? WAVES[STATE.level].length : 0;
+  var label = total > 0
+    ? ('Level ' + STATE.level + ' — Kills: ' + STATE.killsThisLevel + ' / ' + total)
+    : ('Level ' + STATE.level);
+  document.getElementById('wave-info-text').textContent = label;
+}
+
+// ─────────────────────────────────────────────────────────
+// INTRO / ENDCARD
+// ─────────────────────────────────────────────────────────
+function closeIntro() {
+  if (STATE.introClosed) return;
+  STATE.introClosed = true;
+  STATE.gameActive  = true;
+  var intro = document.getElementById('intro');
+  intro.style.transition = 'opacity 0.4s ease';
+  intro.style.opacity = '0';
+  setTimeout(function() { intro.style.display = 'none'; }, 420);
+  initBGM();
+  startWave(1);
+  tutorialOnIntroClose();
+}
+
+function showEndcard() {
+  if (STATE.gameEnded) return;
+  STATE.gameEnded  = true;
+  STATE.gameActive = false;
+  document.getElementById('endcard').classList.add('show');
+}
+
+function goToStore(){ playSFX('cta'); try { if (window.mraid && mraid.open) { mraid.open('https://example.com'); return; } } catch(e){} window.open('https://example.com','_blank'); }
+
+// Wire intro/endcard buttons
+document.getElementById('intro-btn').addEventListener('click', closeIntro);
+document.getElementById('endcard-btn').addEventListener('click', goToStore);
+
+(function(){
+      function ready(){ /* harness already runs scaleGame on load */ }
+      if (window.mraid) {
+        if (mraid.getState && mraid.getState() === 'loading') {
+          mraid.addEventListener('ready', ready);
+        } else { ready(); }
+      } else if (document.readyState !== 'loading') { ready(); }
+        else { document.addEventListener('DOMContentLoaded', ready); }
+    })();
+// ─────────────────────────────────────────────────────────
+// SCALE GAME TO VIEWPORT
+// ─────────────────────────────────────────────────────────
+function scaleGame() {
+  var g  = document.getElementById('game');
+  var s  = Math.min(window.innerWidth / 1080, window.innerHeight / 1920);
+  var ox = (window.innerWidth  - 1080 * s) / 2;
+  var oy = (window.innerHeight - 1920 * s) / 2;
+  g.style.transform = 'scale(' + s + ')';
+  g.style.left      = ox + 'px';
+  g.style.top       = oy + 'px';
+}
+window.addEventListener('resize', scaleGame);
+scaleGame();
+
+// ─────────────────────────────────────────────────────────
+// ASSET REGISTRY — Phase 9 swap-in target.
+// To replace a placeholder with real art, set SPRITES[<key>] = '<base64 dataURL>'.
+// Any key left null falls back to the colored-rect placeholder generator.
+// (Same pattern for SOUNDS — set to base64 mp3 dataURL to override the WebAudio synth.)
+// ─────────────────────────────────────────────────────────
+var SPRITES = {
+  hero:     null,  // assets/hero_red.png       — main char, red hair, faces right
+  ogre:     null,  // assets/ogre_crusher.png   — bulky, club, green
+  knight:   null,  // assets/knight.png         — plate armor, sword
+  dragon:   null,  // assets/dragon.png         — large, breathes fire
+  goblin:   null,  // assets/enemy_goblin.png   — small grunt
+  brute:    null,  // assets/enemy_brute.png    — level 1 mini-boss
+  skeleton: null,  // assets/enemy_skeleton.png — level 2 grunt
+  captain:  null,  // assets/enemy_captain.png  — level 2 elite
+  troll:    null,  // assets/enemy_troll.png    — level 2 mini-boss
+  bgL1:     null,  // assets/bg_battlefield_l1.png (1080×780)
+  bgL2:     null,  // assets/bg_battlefield_l2.png
+  bgL3:     null,  // assets/bg_battlefield_l3.png
+  hand:     null,  // assets/hand_pointer.png   — guide hand sprite
+  banner:   null   // assets/banner_level_up.png
+};
+
+var SOUNDS = {
+  hit:      null,  // assets/sfx/hit_1.mp3
+  hit2:     null,  // assets/sfx/hit_2.mp3
+  hit3:     null,  // assets/sfx/hit_3.mp3
+  coin:     null,  // assets/sfx/ka-ching.mp3
+  unlock:   null,  // assets/sfx/power_up.mp3
+  levelup:  null,  // assets/sfx/magic_revealed.mp3
+  spawn:    null,  // assets/sfx/clink.mp3
+  dragon:   null,  // assets/sfx/dragon_roar.mp3   (NEW — needs creation)
+  aoe:      null,  // assets/sfx/dragon_aoe.mp3    (NEW — needs creation)
+  cta:      null,  // assets/sfx/endcard_btn.wav
+  bgm:      null   // assets/sfx/bgm_loop.mp3
+};
+
+// ─────────────────────────────────────────────────────────
+// ACTOR DATA TABLES
+// (HP/DMG/speed tunable per unit; final balancing in Phase 8)
+// ─────────────────────────────────────────────────────────
+var UNIT_TYPES = {
+  hero: {
+    side: 'player', label: 'HERO', color: '#d83020',
+    w: 130, h: 180, hp: 6, dmg: 2, speed: 110
+  },
+  ogre: {
+    side: 'player', label: 'OGRE', color: '#4a8a3a',
+    w: 160, h: 200, hp: 10, dmg: 3, speed: 70
+  },
+  knight: {
+    side: 'player', label: 'KNGT', color: '#9098a0',
+    w: 130, h: 180, hp: 8, dmg: 2, speed: 140
+  },
+  dragon: {
+    side: 'player', label: 'DRAGON', color: '#7030b0',
+    w: 380, h: 280, hp: 50, dmg: 10, speed: 90
+  }
+};
+
+var ENEMY_TYPES = {
+  goblin: {
+    side: 'enemy', label: 'GOB', color: '#806040',
+    w: 100, h: 140, hp: 2, dmg: 1, speed: 90
+  },
+  brute: {
+    side: 'enemy', label: 'BRUTE', color: '#5a3818',
+    w: 200, h: 240, hp: 20, dmg: 2, speed: 50
+  },
+  skeleton: {
+    side: 'enemy', label: 'SKEL', color: '#e8e8d8',
+    w: 110, h: 150, hp: 3, dmg: 1, speed: 100
+  },
+  captain: {
+    side: 'enemy', label: 'CAPT', color: '#b0b0a0',
+    w: 130, h: 170, hp: 5, dmg: 2, speed: 90
+  },
+  troll: {
+    side: 'enemy', label: 'TROLL', color: '#6a7038',
+    w: 220, h: 260, hp: 25, dmg: 3, speed: 50
+  }
+};
+
+// Battlefield bounds (in 1080×1920 game coords).
+// Battlefield is positioned at top:120 with height 780. Actors live INSIDE #lane (coords local to lane).
+// TOP-DOWN: actor (x, y) is the CENTER of the unit. No floor anchoring.
+var LANE_W      = 1080;
+var LANE_H      = 780;
+var CENTER_Y    = LANE_H / 2;     // 390 — center of vertical band
+var SPAWN_DELTA_Y = 220;           // player spawn band: CENTER_Y ± SPAWN_DELTA_Y → y in [170, 610]
+var SPAWN_X_PLAYER = -60;          // off-screen left, center x
+var FIELD_PAD_TOP    = 100;
+var FIELD_PAD_BOTTOM = 700;        // keep actors out of the very bottom edge
+
+// ─────────────────────────────────────────────────────────
+// ACTOR FACTORY
+// ─────────────────────────────────────────────────────────
+var nextActorId = 1;
+
+function createActor(typeKey, defs, spawnX, spawnY) {
+  var def  = defs[typeKey];
+  var lane = document.getElementById('lane');
+
+  var el = document.createElement('div');
+  el.className = 'actor ' + (def.side === 'enemy' ? 'enemy' : 'player');
+  el.style.width  = def.w + 'px';
+  el.style.height = def.h + 'px';
+
+  var sprite;
+  if (SPRITES[typeKey]) {
+    sprite = document.createElement('img');
+    sprite.className = 'sprite';
+    sprite.src = SPRITES[typeKey];
+    sprite.style.width  = def.w + 'px';
+    sprite.style.height = def.h + 'px';
+    sprite.draggable = false;
+  } else {
+    sprite = document.createElement('div');
+    sprite.className = 'sprite placeholder-sprite';
+    sprite.style.width  = def.w + 'px';
+    sprite.style.height = def.h + 'px';
+    sprite.style.background = 'radial-gradient(circle at 50% 35%, ' + def.color + ' 0%, rgba(0,0,0,0.7) 130%)';
+    sprite.style.fontSize = Math.max(18, Math.floor(def.w / 5)) + 'px';
+    sprite.style.borderRadius = '50%';
+    sprite.textContent = def.label;
+  }
+
+  // HP bar above the sprite
+  var hpBar = document.createElement('div');
+  hpBar.className = 'hp-bar';
+  var barW = Math.min(120, Math.max(60, Math.round(def.w * 0.7)));
+  hpBar.style.width = barW + 'px';
+  hpBar.style.left = ((def.w - barW) / 2) + 'px';
+  hpBar.style.top  = '-22px';
+  var hpFill = document.createElement('div');
+  hpFill.className = 'hp-bar-fill';
+  hpBar.appendChild(hpFill);
+
+  el.appendChild(sprite);
+  el.appendChild(hpBar);
+  lane.appendChild(el);
+
+  var actor = {
+    id: nextActorId++,
+    type: typeKey,
+    def: def,
+    side: def.side,
+    el: el,
+    spriteEl: sprite,
+    hpFillEl: hpFill,
+    x: spawnX,                // CENTER x
+    y: spawnY,                // CENTER y
+    w: def.w,
+    h: def.h,
+    r: Math.min(def.w, def.h) / 2 * 0.75,   // collision radius (approximate disc footprint)
+    hp: def.hp,
+    maxHp: def.hp,
+    speed: def.speed,
+    dmg: def.dmg,
+    state: def.side === 'enemy' ? 'idle' : 'walking', // enemies are immobile until contacted
+    target: null,
+    tackleTimer: 0,
+    dead: false
+  };
+  applyActorTransform(actor);
+  return actor;
+}
+
+function applyActorTransform(a) {
+  // Anchor at center: translate to (x - w/2, y - h/2)
+  a.el.style.transform = 'translate3d(' + (a.x - a.w / 2) + 'px, ' + (a.y - a.h / 2) + 'px, 0)';
+}
+
+// ─────────────────────────────────────────────────────────
+// SPAWNERS
+// ─────────────────────────────────────────────────────────
+function spawnUnit(typeKey) {
+  if (!STATE.gameActive) return;
+  // Player units spawn at left edge with random y in the spawn band.
+  var y = CENTER_Y + (Math.random() * 2 - 1) * SPAWN_DELTA_Y;
+  var a = createActor(typeKey, UNIT_TYPES, SPAWN_X_PLAYER, y);
+  STATE.units.push(a);
+  playSFX('spawn');
+  return a;
+}
+
+function spawnEnemy(typeKey, x, y) {
+  if (!STATE.gameActive) return;
+  // Enemies are placed at explicit (x, y) at level start and stay still.
+  var a = createActor(typeKey, ENEMY_TYPES, x, y);
+  STATE.enemies.push(a);
+  return a;
+}
+
+// ─────────────────────────────────────────────────────────
+// GAME LOOP
+// ─────────────────────────────────────────────────────────
+var lastTickTs = 0;
+function gameLoop(ts) {
+  if (!lastTickTs) lastTickTs = ts;
+  var dt = Math.min((ts - lastTickTs) / 1000, 0.05); // clamp 50ms
+  lastTickTs = ts;
+  if (STATE.gameActive) gameTick(dt);
+  requestAnimationFrame(gameLoop);
+}
+
+function gameTick(dt) {
+  acquireTargets();
+  moveActors(dt);
+  resolveStacking();
+  resolveCollisions();
+  tickTackles(dt);
+}
+
+// ─────────────────────────────────────────────────────────
+// TARGET ACQUISITION — each player unit picks the closest LIVING enemy.
+// Recompute when target dies or doesn't exist.
+// ─────────────────────────────────────────────────────────
+function acquireTargets() {
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u.dead || u.state === 'dying') continue;
+    if (!u.target || u.target.dead) {
+      u.target = findClosestEnemy(u);
+      // Always drop tackling state when target changes/dies — let resolveCollisions re-trigger it
+      if (u.state === 'tackling') {
+        u.state = 'walking';
+        u.el.classList.remove('tackling');
+      }
+    }
+  }
+}
+
+function findClosestEnemy(u) {
+  var best = null;
+  var bestD2 = Infinity;
+  for (var i = 0; i < STATE.enemies.length; i++) {
+    var e = STATE.enemies[i];
+    if (e.dead || e.state === 'dying') continue;
+    var dx = e.x - u.x, dy = e.y - u.y;
+    var d2 = dx * dx + dy * dy;
+    if (d2 < bestD2) { bestD2 = d2; best = e; }
+  }
+  return best;
+}
+
+// ─────────────────────────────────────────────────────────
+// MOVEMENT — player units steer toward target. Enemies are immobile.
+// ─────────────────────────────────────────────────────────
+function moveActors(dt) {
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u.dead || u.state === 'dying' || u.state === 'tackling') continue;
+    var t = u.target;
+    if (!t) {
+      // No enemies left — drift toward the field center (gentle assembly)
+      var dx0 = LANE_W * 0.55 - u.x;
+      var dy0 = CENTER_Y - u.y;
+      var d0 = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+      if (d0 > 12) {
+        u.x += (dx0 / d0) * u.speed * 0.5 * dt;
+        u.y += (dy0 / d0) * u.speed * 0.5 * dt;
+        applyActorTransform(u);
+      }
+      continue;
+    }
+    var dx = t.x - u.x;
+    var dy = t.y - u.y;
+    var d  = Math.sqrt(dx * dx + dy * dy);
+    var range = u.r + t.r + 6;
+    if (d > range) {
+      u.x += (dx / d) * u.speed * dt;
+      u.y += (dy / d) * u.speed * dt;
+      // clamp to field
+      u.y = Math.max(FIELD_PAD_TOP, Math.min(FIELD_PAD_BOTTOM, u.y));
+      applyActorTransform(u);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// RIGID-BODY STACKING — separate overlapping circles.
+// Player↔player: split push 50/50.   Player↔enemy: enemy is a static wall (push only player).
+// ─────────────────────────────────────────────────────────
+function resolveStacking() {
+  var units = STATE.units;
+  for (var i = 0; i < units.length; i++) {
+    var a = units[i];
+    if (a.dead || a.state === 'dying') continue;
+    // vs other player units (50/50 split)
+    for (var j = i + 1; j < units.length; j++) {
+      var b = units[j];
+      if (b.dead || b.state === 'dying') continue;
+      var dx = b.x - a.x, dy = b.y - a.y;
+      var d  = Math.sqrt(dx * dx + dy * dy);
+      var minD = a.r + b.r;
+      if (d < minD && d > 0.001) {
+        var push = (minD - d) / 2;
+        var nx = dx / d, ny = dy / d;
+        a.x -= nx * push; a.y -= ny * push;
+        b.x += nx * push; b.y += ny * push;
+      } else if (d <= 0.001) {
+        a.x -= 0.5; b.x += 0.5;
+      }
+    }
+    // vs enemies (one-way push — enemies stay put)
+    for (var k = 0; k < STATE.enemies.length; k++) {
+      var e = STATE.enemies[k];
+      if (e.dead || e.state === 'dying') continue;
+      var ex = e.x - a.x, ey = e.y - a.y;
+      var ed = Math.sqrt(ex * ex + ey * ey);
+      var minE = a.r + e.r;
+      if (ed < minE && ed > 0.001) {
+        var pe = (minE - ed);
+        a.x -= (ex / ed) * pe;
+        a.y -= (ey / ed) * pe;
+      }
+    }
+    // clamp + commit transform
+    a.y = Math.max(FIELD_PAD_TOP, Math.min(FIELD_PAD_BOTTOM, a.y));
+    applyActorTransform(a);
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// COLLISION + TACKLE (top-down, distance-based)
+// ─────────────────────────────────────────────────────────
+var TACKLE_INTERVAL = 0.6; // seconds between tackle hits
+
+function resolveCollisions() {
+  // Walking unit tackles whatever enemy is closest within reach (not just its current target).
+  // This prevents congestion deadlocks where a unit's path is blocked by other enemies.
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u.dead || u.state !== 'walking') continue;
+    var bestE = null, bestD = Infinity;
+    for (var j = 0; j < STATE.enemies.length; j++) {
+      var e = STATE.enemies[j];
+      if (e.dead || e.state === 'dying') continue;
+      var dx = e.x - u.x, dy = e.y - u.y;
+      var d  = Math.sqrt(dx * dx + dy * dy);
+      var range = u.r + e.r + 6;
+      if (d <= range && d < bestD) { bestD = d; bestE = e; }
+    }
+    if (bestE) {
+      u.state = 'tackling'; u.el.classList.add('tackling');
+      u.target = bestE;
+      u.tackleTimer = TACKLE_INTERVAL * 0.4;
+      if (bestE.state === 'idle') {
+        bestE.state  = 'tackling';
+        bestE.el.classList.add('tackling');
+        bestE.target = u;
+        bestE.tackleTimer = TACKLE_INTERVAL * 0.5;
+      }
+    }
+  }
+}
+
+function tickTackles(dt) {
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u.state !== 'tackling' || !u.target || u.target.dead) continue;
+    u.tackleTimer -= dt;
+    if (u.tackleTimer <= 0) {
+      applyDamage(u, u.target);
+      u.tackleTimer = TACKLE_INTERVAL;
+    }
+  }
+  for (var j = 0; j < STATE.enemies.length; j++) {
+    var e = STATE.enemies[j];
+    if (e.state !== 'tackling' || !e.target || e.target.dead) continue;
+    e.tackleTimer -= dt;
+    if (e.tackleTimer <= 0) {
+      applyDamage(e, e.target);
+      e.tackleTimer = TACKLE_INTERVAL;
+    }
+  }
+}
+
+function applyDamage(attacker, defender) {
+  if (defender.dead) return;
+  defender.hp -= attacker.dmg;
+  playRandomHit();
+  // hit flash
+  defender.spriteEl.classList.remove('hit-flash');
+  void defender.spriteEl.offsetWidth;
+  defender.spriteEl.classList.add('hit-flash');
+  // HP bar update
+  if (defender.hpFillEl) {
+    var pct = Math.max(0, defender.hp / defender.maxHp);
+    defender.hpFillEl.style.width = (pct * 100) + '%';
+    if (pct < 0.35) defender.hpFillEl.classList.add('low');
+    else            defender.hpFillEl.classList.remove('low');
+  }
+  if (defender.hp <= 0) {
+    killActor(defender, attacker);
+  }
+}
+
+function killActor(actor, killedBy) {
+  actor.dead   = true;
+  actor.state  = 'dying';
+  actor.el.classList.remove('tackling');
+  actor.el.classList.add('dying');
+  // Free the attacker so it re-acquires a target
+  if (killedBy) {
+    killedBy.state = 'walking';
+    killedBy.target = null;
+    killedBy.el.classList.remove('tackling');
+  }
+  setTimeout(function() {
+    removeActor(actor);
+    if (actor.side === 'enemy') {
+      var idx = STATE.enemies.indexOf(actor);
+      if (idx >= 0) STATE.enemies.splice(idx, 1);
+      onEnemyKilled(actor);
+    } else {
+      var idx2 = STATE.units.indexOf(actor);
+      if (idx2 >= 0) STATE.units.splice(idx2, 1);
+    }
+  }, 440);
+}
+
+// ─────────────────────────────────────────────────────────
+// COIN DROP + COUNTER
+// ─────────────────────────────────────────────────────────
+var COIN_REWARDS = { goblin: 5, brute: 50, skeleton: 8, captain: 12, troll: 75 };
+
+function onEnemyKilled(enemy) {
+  STATE.kills++;
+  STATE.killsThisLevel++;
+  var coins = COIN_REWARDS[enemy.type] || 5;
+  // Mini-boss kills: extra coins (3 burst), screen shake
+  var isMiniBoss = (enemy.type === 'brute' || enemy.type === 'troll');
+  if (isMiniBoss) {
+    var game = document.getElementById('game');
+    game.classList.remove('shaking'); void game.offsetWidth; game.classList.add('shaking');
+    setTimeout(function() { game.classList.remove('shaking'); }, 700);
+    // Burst of 3 coins
+    for (var k = 0; k < 3; k++) {
+      (function(idx) {
+        setTimeout(function() {
+          flyCoin(enemy.x + enemy.w / 2 + (idx - 1) * 30, enemy.y + enemy.h / 2, Math.floor(coins / 3));
+        }, idx * 90);
+      })(k);
+    }
+  } else {
+    flyCoin(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2, coins);
+  }
+  updateUI();
+  checkUnlocks();
+  checkWaveClear();
+}
+
+// ─────────────────────────────────────────────────────────
+// UNLOCK SYSTEM (kill thresholds → cards activate, auto-spawn starts)
+// ─────────────────────────────────────────────────────────
+var UNLOCK_THRESHOLDS = { ogre: 3, knight: 8 };
+var AUTO_SPAWN_CD     = { ogre: 4000, knight: 3000 };
+var autoSpawnTimers   = { ogre: null, knight: null };
+
+function checkUnlocks() {
+  if (!STATE.unitsUnlocked.ogre   && STATE.kills >= UNLOCK_THRESHOLDS.ogre)   unlockUnit('ogre');
+  if (!STATE.unitsUnlocked.knight && STATE.kills >= UNLOCK_THRESHOLDS.knight) unlockUnit('knight');
+}
+
+function unlockUnit(typeKey) {
+  if (STATE.unitsUnlocked[typeKey]) return;
+  STATE.unitsUnlocked[typeKey] = true;
+  playSFX('unlock');
+
+  var cardId = 'card-' + typeKey;
+  var card   = document.getElementById(cardId);
+  if (card) {
+    card.classList.remove('locked');
+    card.classList.add('unlocking');
+    setTimeout(function() { card.classList.remove('unlocking'); }, 620);
+    // Update card sub-text
+    var sub = card.querySelector('.card-sub');
+    if (sub) sub.textContent = 'Auto-spawning';
+    // Show "NEW UNIT!" burst
+    var burst = document.createElement('div');
+    burst.className = 'unlock-burst';
+    burst.textContent = 'NEW UNIT!';
+    card.appendChild(burst);
+    setTimeout(function() { if (burst.parentNode) burst.remove(); }, 1700);
+  }
+  // Start auto-spawn loop for this type
+  startAutoSpawn(typeKey, AUTO_SPAWN_CD[typeKey]);
+  // Spawn one immediately so the unlock has visible payoff
+  spawnUnit(typeKey);
+  // Tutorial hooks
+  if (typeKey === 'ogre')   tutorialOnOgreUnlock();
+  if (typeKey === 'knight') tutorialOnKnightUnlock();
+}
+
+function startAutoSpawn(typeKey, cdMs) {
+  if (autoSpawnTimers[typeKey]) return;
+  autoSpawnTimers[typeKey] = setInterval(function() {
+    if (!STATE.gameActive) return;
+    spawnUnit(typeKey);
+  }, cdMs);
+}
+
+function stopAllAutoSpawns() {
+  Object.keys(autoSpawnTimers).forEach(function(k) {
+    if (autoSpawnTimers[k]) clearInterval(autoSpawnTimers[k]);
+    autoSpawnTimers[k] = null;
+  });
+}
+
+function flyCoin(laneX, laneY, coinValue) {
+  // laneX/laneY are inside #lane (battlefield). Convert to game coords by offsetting battlefield top.
+  var bf = document.getElementById('battlefield');
+  var bfTop = parseInt(bf.style.top) || 120;
+  var startX = laneX;
+  var startY = bfTop + laneY;
+  var coinBar = document.getElementById('coin-bar');
+  var cbRect  = coinBar.getBoundingClientRect();
+  var gameRect = document.getElementById('game').getBoundingClientRect();
+  var scaleF = 1080 / gameRect.width;
+  var endX = (cbRect.left - gameRect.left) * scaleF + 28; // coin icon center on the bar
+  var endY = (cbRect.top  - gameRect.top)  * scaleF + 38;
+
+  var c = document.createElement('div');
+  c.className = 'fly-coin';
+  c.style.left = (startX - 24) + 'px';
+  c.style.top  = (startY - 24) + 'px';
+  document.getElementById('game').appendChild(c);
+
+  var t0 = performance.now();
+  var dur = 550;
+  function step(ts) {
+    var t = Math.min((ts - t0) / dur, 1);
+    var ease = t * t * (3 - 2 * t); // smoothstep
+    var arcY = -120 * Math.sin(t * Math.PI); // arc upward
+    var x = startX + (endX - startX) * ease;
+    var y = startY + (endY - startY) * ease + arcY;
+    c.style.left = (x - 24) + 'px';
+    c.style.top  = (y - 24) + 'px';
+    if (t < 1) requestAnimationFrame(step);
+    else {
+      c.remove();
+      STATE.coins += coinValue;
+      updateUI();
+      coinBar.classList.remove('pop');
+      void coinBar.offsetWidth;
+      coinBar.classList.add('pop');
+      playSFX('coin');
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+function removeActor(a) {
+  if (a.el && a.el.parentNode) a.el.parentNode.removeChild(a.el);
+}
+
+// ─────────────────────────────────────────────────────────
+// SCRIPTED WAVES (per level) — TOP-DOWN
+// Enemies are placed at explicit (x, y) at level start and stay still.
+// Wave clears when all enemies are dead.
+// ─────────────────────────────────────────────────────────
+var WAVES = {
+  1: [
+    { type: 'goblin', x: 720, y: 200 },
+    { type: 'goblin', x: 800, y: 290 },
+    { type: 'goblin', x: 870, y: 400 },
+    { type: 'goblin', x: 800, y: 510 },
+    { type: 'goblin', x: 720, y: 600 },
+    { type: 'goblin', x: 600, y: 250 },
+    { type: 'goblin', x: 600, y: 540 },
+    { type: 'goblin', x: 950, y: 200 },
+    { type: 'goblin', x: 950, y: 600 },
+    { type: 'brute',  x: 880, y: 400 } // mini-boss in the middle
+  ],
+  2: [
+    { type: 'skeleton', x: 700, y: 200 },
+    { type: 'skeleton', x: 760, y: 300 },
+    { type: 'skeleton', x: 820, y: 400 },
+    { type: 'captain',  x: 760, y: 500 },
+    { type: 'skeleton', x: 700, y: 600 },
+    { type: 'skeleton', x: 880, y: 240 },
+    { type: 'captain',  x: 940, y: 360 },
+    { type: 'skeleton', x: 940, y: 480 },
+    { type: 'skeleton', x: 880, y: 580 },
+    { type: 'troll',    x: 880, y: 400 } // mini-boss at center-right
+  ]
+  // Level 3 is the horde finale (handled separately).
+};
+
+var waveSpawnedCount = 0;
+var waveTotalCount   = 0;
+var waveActive       = false;
+
+function startWave(levelNum) {
+  if (waveActive) return;
+  waveActive = true;
+  waveSpawnedCount = 0;
+  var schedule = WAVES[levelNum] || [];
+  waveTotalCount = schedule.length;
+  STATE.killsThisLevel = 0;
+  updateUI();
+  // Place all enemies immediately
+  schedule.forEach(function(spawn) {
+    spawnEnemy(spawn.type, spawn.x, spawn.y);
+    waveSpawnedCount++;
+  });
+}
+
+// Stub for backwards compatibility — nothing to clear since spawns are instant now.
+function clearWaveTimers() { /* no-op (instant spawn) */ }
+
+// Called from onEnemyKilled — when all spawns done AND no enemies left, wave is clear.
+function checkWaveClear() {
+  if (!waveActive) return;
+  if (waveSpawnedCount < waveTotalCount) return;
+  if (STATE.enemies.length > 0) return;
+  waveActive = false;
+  onWaveCleared();
+}
+
+function onWaveCleared() {
+  console.log('[wave] cleared level', STATE.level);
+  transitionToNextLevel();
+}
+
+// ─────────────────────────────────────────────────────────
+// LEVEL TRANSITIONS (camera pan/zoom + banner)
+// ─────────────────────────────────────────────────────────
+function applyLevelBg(levelNum) {
+  var bf = document.getElementById('battlefield');
+  bf.classList.remove('level-1', 'level-2', 'level-3');
+  bf.classList.add('level-' + levelNum);
+  // If real bg asset is registered, paint it; otherwise the .level-N gradient class shows.
+  var key = 'bgL' + levelNum;
+  if (SPRITES[key]) {
+    bf.style.backgroundImage = 'url(' + SPRITES[key] + ')';
+    bf.style.backgroundSize  = '1080px 780px';
+    bf.style.backgroundRepeat = 'no-repeat';
+  } else {
+    bf.style.backgroundImage = '';
+  }
+}
+
+function transitionToNextLevel() {
+  var nextLevel = STATE.level + 1;
+  if (nextLevel === 3) {
+    // Level 3 is the horde finale (Phase 6 wires the actual horde).
+    runLevel3Sequence();
+    return;
+  }
+  if (!WAVES[nextLevel]) {
+    // No more configured levels (shouldn't happen for normal flow)
+    return;
+  }
+  // Pause: enemies are 0 already, but stop further spawn loops just in case
+  clearWaveTimers();
+
+  var bf = document.getElementById('battlefield');
+  // Camera zoom out
+  bf.classList.add('zooming');
+  // Show banner
+  showLevelBanner('LEVEL ' + nextLevel);
+
+  // After camera pulls back, swap level + reset
+  setTimeout(function() {
+    // Remove all currently-walking units and any lingering enemies — fresh slate
+    clearAllActors();
+    STATE.level = nextLevel;
+    STATE.killsThisLevel = 0;
+    // Swap battlefield bg class + image
+    applyLevelBg(nextLevel);
+    updateUI();
+  }, 900);
+
+  // Restore camera + start next wave
+  setTimeout(function() {
+    bf.classList.remove('zooming');
+    startWave(nextLevel);
+  }, 2000);
+}
+
+function showLevelBanner(text) {
+  var b = document.getElementById('level-banner');
+  document.getElementById('level-banner-text').textContent = text;
+  b.classList.remove('show');
+  void b.offsetWidth;
+  b.classList.add('show');
+  setTimeout(function() { b.classList.remove('show'); }, 1700);
+  playSFX('levelup');
+}
+
+function clearAllActors() {
+  STATE.units.forEach(function(u)   { removeActor(u); });
+  STATE.enemies.forEach(function(e) { removeActor(e); });
+  STATE.units.length   = 0;
+  STATE.enemies.length = 0;
+}
+
+// ─────────────────────────────────────────────────────────
+// LEVEL 3 — HORDE REVEAL + DRAGON FINALE
+// ─────────────────────────────────────────────────────────
+var HORDE_COUNT = 110;
+var dragonActor = null;
+var dragonTapped = false;
+
+function runLevel3Sequence() {
+  clearWaveTimers();
+  var bf  = document.getElementById('battlefield');
+  var game = document.getElementById('game');
+
+  // Camera zooms way out
+  bf.classList.add('zooming-far');
+  // Slight shake (anxiety hook)
+  game.classList.remove('shaking');
+  void game.offsetWidth;
+  game.classList.add('shaking');
+  setTimeout(function() { game.classList.remove('shaking'); }, 1200);
+
+  // Show banner
+  showLevelBanner('THE HORDE!');
+
+  // Mid-transition: clear active actors, swap bg, populate horde
+  setTimeout(function() {
+    clearAllActors();
+    STATE.level = 3;
+    STATE.killsThisLevel = 0;
+    applyLevelBg(3);
+    populateHorde();
+    updateUI();
+  }, 900);
+
+  // Camera restore + light combat resumes (steady stream of low-tier enemies for taps)
+  setTimeout(function() {
+    bf.classList.remove('zooming-far');
+    startLevel3StreamSpawner();
+  }, 2200);
+
+  // After 5s in L3, spawn the Dragon mega-unit
+  setTimeout(function() {
+    spawnDragon();
+  }, 7200);
+}
+
+function populateHorde() {
+  var layer = document.getElementById('horde-layer');
+  layer.innerHTML = '';
+  layer.classList.add('show');
+  for (var i = 0; i < HORDE_COUNT; i++) {
+    var m = document.createElement('div');
+    m.className = 'horde-mob';
+    // Random scale (depth) and position. Place across 60% of right side for "horde wall" feeling.
+    var depth = Math.random();              // 0=near, 1=far
+    var size  = 60 - depth * 25;            // 60→35 px
+    var x     = LANE_W * 0.45 + Math.random() * (LANE_W * 0.55);
+    // Top-down: spread horde across the field; "depth" reduces y so far mobs sit higher.
+    var y     = LANE_H * 0.85 - depth * (LANE_H * 0.65);
+    m.style.left   = x + 'px';
+    m.style.top    = y + 'px';
+    m.style.width  = size + 'px';
+    m.style.height = (size * 1.3) + 'px';
+    // Color tint based on type variety
+    var tints = ['#806040', '#5a3818', '#6a7038', '#404060'];
+    m.style.background = 'linear-gradient(180deg, ' + tints[i % tints.length] + ' 0%, rgba(0,0,0,0.55) 130%)';
+    m.style.fontSize = Math.max(10, Math.floor(size / 4)) + 'px';
+    m.textContent = ['G','S','O','T'][i % 4];
+    m.style.opacity = (0.6 + Math.random() * 0.4).toFixed(2);
+    m.style.animationDelay = (Math.random() * 0.6) + 's';
+    layer.appendChild(m);
+  }
+}
+
+// Steady drip of weak enemies during L3 so player taps still spawn defenders that fight visibly.
+// Each enemy is dropped at a random spot on the right half of the field (top-down).
+var l3StreamTimer = null;
+function startLevel3StreamSpawner() {
+  if (l3StreamTimer) return;
+  l3StreamTimer = setInterval(function() {
+    if (!STATE.gameActive || dragonTapped) return;
+    var type = Math.random() < 0.5 ? 'goblin' : 'skeleton';
+    var x = LANE_W * 0.55 + Math.random() * (LANE_W * 0.4);
+    var y = FIELD_PAD_TOP + Math.random() * (FIELD_PAD_BOTTOM - FIELD_PAD_TOP);
+    spawnEnemy(type, x, y);
+  }, 1200);
+}
+
+function stopLevel3Stream() {
+  if (l3StreamTimer) clearInterval(l3StreamTimer);
+  l3StreamTimer = null;
+}
+
+function spawnDragon() {
+  if (dragonActor || dragonTapped) return;
+  // Stop the lightweight enemy stream so the Dragon takes center stage
+  stopLevel3Stream();
+  playSFX('dragon');
+  // Spawn dragon as a player-side mega-unit at far left center, ready for the player tap
+  dragonActor = createActor('dragon', UNIT_TYPES, SPAWN_X_PLAYER - 50, CENTER_Y);
+  // Make it state-locked (not walking yet) until tap
+  dragonActor.state = 'idle';
+  STATE.units.push(dragonActor);
+  // Highlight + make tappable via DOM listener on the lane (delegated)
+  dragonActor.el.style.pointerEvents = 'auto';
+  dragonActor.el.style.cursor = 'pointer';
+  dragonActor.spriteEl.style.boxShadow = '0 0 60px rgba(255,80,30,0.95)';
+  dragonActor.el.addEventListener('click', onDragonTap, { once: true });
+
+  // Update card stack: replace Hero card text to indicate "TAP THE DRAGON"
+  var hero = document.getElementById('card-hero');
+  if (hero) {
+    var sub = hero.querySelector('.card-sub');
+    if (sub) sub.textContent = 'TAP THE DRAGON →';
+  }
+  tutorialOnDragonSpawn();
+  // Also flash the screen briefly
+  var aoe = document.getElementById('aoe-flash');
+  aoe.classList.remove('flash'); void aoe.offsetWidth; aoe.classList.add('flash');
+}
+
+function onDragonTap() {
+  if (dragonTapped) return;
+  dragonTapped = true;
+  if (!dragonActor) return;
+  tutorialOnDragonTap();
+  // Dragon flies forward (set walking with high speed)
+  dragonActor.state = 'walking';
+  dragonActor.speed = 600;
+  // After short windup, AoE flash and kill all visible enemies in lane + part of horde
+  setTimeout(function() {
+    var aoe = document.getElementById('aoe-flash');
+    aoe.classList.remove('flash'); void aoe.offsetWidth; aoe.classList.add('flash');
+    playSFX('aoe');
+    // Shake on big kill
+    var game = document.getElementById('game');
+    game.classList.remove('shaking'); void game.offsetWidth; game.classList.add('shaking');
+    // Kill all active enemies
+    STATE.enemies.slice().forEach(function(e) { killActor(e); });
+    // Fade horde mobs
+    var layer = document.getElementById('horde-layer');
+    if (layer) {
+      var mobs = layer.querySelectorAll('.horde-mob');
+      mobs.forEach(function(m, i) {
+        setTimeout(function() {
+          m.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+          m.style.opacity = '0';
+          m.style.transform = 'translateY(20px)';
+        }, i * 6);
+      });
+    }
+  }, 350);
+  // Endcard after the spectacle settles
+  setTimeout(function() { showEndcard(); }, 1800);
+}
+
+// ─────────────────────────────────────────────────────────
+// TUTORIAL — guide hand + bubble positioning
+// ─────────────────────────────────────────────────────────
+function showGuideHand(gameX, gameY) {
+  // gameX/gameY are in 1080×1920 game coords. Position hand so its tip (top-center) is at (gameX, gameY).
+  var h = document.getElementById('guide-hand');
+  // If a real hand sprite is registered, use it; otherwise the CSS ::before emoji shows.
+  if (SPRITES.hand && !h.dataset.swapped) {
+    h.style.backgroundImage = 'url(' + SPRITES.hand + ')';
+    h.style.backgroundSize  = 'contain';
+    h.style.backgroundRepeat = 'no-repeat';
+    h.style.backgroundPosition = 'center';
+    h.style.color = 'transparent';        // hide the emoji ::before
+    h.dataset.swapped = '1';
+  }
+  h.style.left = (gameX - 45) + 'px';
+  h.style.top  = (gameY - 10) + 'px';
+  h.classList.add('show');
+}
+function hideGuideHand() {
+  document.getElementById('guide-hand').classList.remove('show');
+}
+
+function showTutBubble(text, gameX, gameY, opts) {
+  opts = opts || {};
+  var b = document.getElementById('tut-bubble');
+  document.getElementById('tut-bubble-text').textContent = text;
+  b.classList.remove('show', 'up');
+  if (opts.up) b.classList.add('up');
+  // Briefly hidden so we can measure
+  b.style.visibility = 'hidden';
+  b.style.left = '0px';
+  b.style.top  = '0px';
+  b.classList.add('show');
+  // Center on (gameX, gameY); for bubble pointing UP at target, position bubble below target.
+  requestAnimationFrame(function() {
+    var w = b.offsetWidth;
+    var hh = b.offsetHeight;
+    var x = Math.max(20, Math.min(1080 - w - 20, gameX - w / 2));
+    var y;
+    if (opts.up) y = gameY + 30;          // bubble sits below target, tail points up
+    else         y = gameY - hh - 30;     // bubble sits above target, tail points down
+    b.style.left = x + 'px';
+    b.style.top  = y + 'px';
+    b.style.visibility = 'visible';
+  });
+}
+function hideTutBubble() {
+  document.getElementById('tut-bubble').classList.remove('show', 'up');
+}
+
+// Game-coord positions for tutorial targets (1080×1920 base coords)
+// Hero TAP button: card stack at y=1000, hero card top ~1020, button ~ centered vertically
+// Card width ~1020, button right side ~ x=860, y center ~1110.
+var TUT_POS = {
+  heroBtn:   { x: 870, y: 1090 },
+  coinBar:   { x: 870, y: 60   },
+  ogreCard:  { x: 540, y: 1310 },
+  knightCard:{ x: 540, y: 1620 },
+  dragon:    { x: 200, y: 700  } // approximate dragon location in lane (game coords)
+};
+
+function tutAt(name) { return TUT_POS[name]; }
+
+function tutGoTo(stepName) {
+  hideGuideHand();
+  hideTutBubble();
+  if (!stepName) return;
+  switch (stepName) {
+    case 'tap-hero':
+      showGuideHand(tutAt('heroBtn').x, tutAt('heroBtn').y);
+      showTutBubble('TAP to spawn your HERO!', tutAt('heroBtn').x, tutAt('heroBtn').y - 110);
+      break;
+    case 'coins':
+      showGuideHand(tutAt('coinBar').x, tutAt('coinBar').y + 100);
+      showTutBubble('Defeat enemies for COINS!', tutAt('coinBar').x, tutAt('coinBar').y + 200, { up: true });
+      break;
+    case 'ogre-unlocked':
+      showGuideHand(tutAt('ogreCard').x, tutAt('ogreCard').y - 130);
+      showTutBubble('OGRE CRUSHER joins the fight!', tutAt('ogreCard').x, tutAt('ogreCard').y - 230);
+      break;
+    case 'knight-unlocked':
+      showGuideHand(tutAt('knightCard').x, tutAt('knightCard').y - 130);
+      showTutBubble('KNIGHT unlocked!', tutAt('knightCard').x, tutAt('knightCard').y - 230);
+      break;
+    case 'tap-dragon':
+      showGuideHand(tutAt('dragon').x + 60, tutAt('dragon').y + 250); // dragon is in battlefield (top:120) — game coords
+      showTutBubble('TAP THE DRAGON!', tutAt('dragon').x + 60, tutAt('dragon').y + 350, { up: true });
+      break;
+  }
+}
+
+// Drive the tutorial state machine from gameplay events
+function tutorialOnIntroClose() {
+  STATE.guideStep = 1;
+  tutGoTo('tap-hero');
+}
+function tutorialOnFirstTap() {
+  if (STATE.guideStep !== 1) return;
+  STATE.guideStep = 2;
+  tutGoTo('coins');
+  // Auto-dismiss the coin bubble after 2s — they'll see it again on first kill
+  setTimeout(function() {
+    if (STATE.guideStep === 2) { hideGuideHand(); hideTutBubble(); }
+  }, 2200);
+}
+function tutorialOnOgreUnlock() {
+  STATE.guideStep = 3;
+  tutGoTo('ogre-unlocked');
+  setTimeout(function() {
+    if (STATE.guideStep === 3) { hideGuideHand(); hideTutBubble(); }
+  }, 2400);
+}
+function tutorialOnKnightUnlock() {
+  STATE.guideStep = 4;
+  tutGoTo('knight-unlocked');
+  setTimeout(function() {
+    if (STATE.guideStep === 4) { hideGuideHand(); hideTutBubble(); }
+  }, 2400);
+}
+function tutorialOnDragonSpawn() {
+  STATE.guideStep = 5;
+  tutGoTo('tap-dragon');
+}
+function tutorialOnDragonTap() {
+  STATE.guideStep = 6;
+  hideGuideHand(); hideTutBubble();
+}
+
+// ─────────────────────────────────────────────────────────
+// CARD WIRING
+// ─────────────────────────────────────────────────────────
+document.getElementById('btn-spawn-hero').addEventListener('click', function() {
+  if (!STATE.gameActive) return;
+  spawnUnit('hero');
+  tutorialOnFirstTap();
+});
+
+// Initialize UI + start loop
+updateUI();
+requestAnimationFrame(gameLoop);
+
+// Dev helpers (removed in production)
+window.STATE = STATE;
+window.spawnUnit  = spawnUnit;
+window.spawnEnemy = spawnEnemy;
+window.runLevel3Sequence    = runLevel3Sequence;
+window.transitionToNextLevel = transitionToNextLevel;
+window.addEventListener('keydown', function(e) {
+  if (e.key === 'e' || e.key === 'E') showEndcard();
+});
+
+</script>
+</body>
+</html>

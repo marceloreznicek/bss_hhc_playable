@@ -1,0 +1,19 @@
+# Node QA harness
+**/node_modules/
+**/package-lock.json
+
+# Build output / generated screenshots (regenerate via qa scripts)
+HeroSwarm/qa/screenshots/
+
+# Large binary archives (duplicates of unpacked folder contents)
+HHC_Playable.rar
+Herois.zip
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+desktop.ini
+**/desktop.ini
+
+# Local Claude settings
+.claude/settings.local.json

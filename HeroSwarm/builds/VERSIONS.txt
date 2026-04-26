@@ -1,0 +1,13 @@
+HeroSwarm Playable Builds — v0.1
+=================================
+HeroSwarm_v01_AppLovin.html   — AppLovin / generic (window.open)
+HeroSwarm_v01_UnityAds.html   — Unity Ads (mraid.open)
+HeroSwarm_v01_GoogleAds.html  — Google Ads HTML (ExitApi.exit), unzipped
+HeroSwarm_v01_GoogleAds.zip   — Google Ads upload package (contains index.html)
+
+Source: ../HeroSwarm_playable_v0.1.html
+Notes:
+- Portrait only (1080×1920).
+- Placeholder sprites still in place. Real art is swapped via SPRITES/SOUNDS registries
+  in the source — re-run this build script after dropping in base64 dataURLs.
+- Replace STORE_URL (currently https://example.com) with the real app store link before shipping.
