@@ -17,11 +17,11 @@ const master = fs.readFileSync(SRC, 'utf8');
 // We just inject Unity-Ads' mraid-ready wait shim.
 const VARIANTS = {
   applovin: {
-    file: 'HeroSwarm_v01_AppLovin.html',
+    file: 'bss_hhc_swarm_v2_AppLovin.html',
     initBefore: ''
   },
   unityads: {
-    file: 'HeroSwarm_v01_UnityAds.html',
+    file: 'bss_hhc_swarm_v2_UnityAds.html',
     initBefore: `(function(){
       function ready(){ /* harness already runs scaleGame on load */ }
       if (window.mraid) {
@@ -33,7 +33,7 @@ const VARIANTS = {
     })();`
   },
   googleads: {
-    file: 'HeroSwarm_v01_GoogleAds.html',
+    file: 'bss_hhc_swarm_v2_GoogleAds.html',
     initBefore: `(function(){
       // Google Ads expects the document.readyState path only — no mraid.
     })();`
@@ -63,33 +63,31 @@ for (const [name, opts] of Object.entries(VARIANTS)) {
 }
 
 // Google Ads zip: index.html + zip
-const googleHtml = path.join(OUT_DIR, 'HeroSwarm_v01_GoogleAds.html');
+const googleHtml = path.join(OUT_DIR, 'bss_hhc_swarm_v2_GoogleAds.html');
 const googleZipDir = path.join(OUT_DIR, '_google_zip_tmp');
 if (fs.existsSync(googleZipDir)) execSync(`rm -rf "${googleZipDir}"`);
 fs.mkdirSync(googleZipDir);
 fs.copyFileSync(googleHtml, path.join(googleZipDir, 'index.html'));
-const zipPath = path.join(OUT_DIR, 'HeroSwarm_v01_GoogleAds.zip');
+const zipPath = path.join(OUT_DIR, 'bss_hhc_swarm_v2_GoogleAds.zip');
 if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
 execSync(`cd "${googleZipDir}" && zip -q "${zipPath}" index.html`);
 execSync(`rm -rf "${googleZipDir}"`);
 const zipSizeKB = (fs.statSync(zipPath).size / 1024).toFixed(1);
-console.log(`✓ HeroSwarm_v01_GoogleAds.zip — ${zipSizeKB} KB`);
+console.log(`✓ bss_hhc_swarm_v2_GoogleAds.zip — ${zipSizeKB} KB`);
 
 // Versions readme
 const versionsTxt =
-`HeroSwarm Playable Builds — v0.1
-=================================
-HeroSwarm_v01_AppLovin.html   — AppLovin / generic (window.open)
-HeroSwarm_v01_UnityAds.html   — Unity Ads (mraid.open)
-HeroSwarm_v01_GoogleAds.html  — Google Ads HTML (ExitApi.exit), unzipped
-HeroSwarm_v01_GoogleAds.zip   — Google Ads upload package (contains index.html)
+`HeroSwarm Playable Builds — v2
+==============================
+bss_hhc_swarm_v2_AppLovin.html   — AppLovin / generic (window.open)
+bss_hhc_swarm_v2_UnityAds.html   — Unity Ads (mraid.open)
+bss_hhc_swarm_v2_GoogleAds.html  — Google Ads HTML (ExitApi.exit), unzipped
+bss_hhc_swarm_v2_GoogleAds.zip   — Google Ads upload package (contains index.html)
 
 Source: ../HeroSwarm_playable_v0.1.html
-Notes:
-- Portrait only (1080×1920).
-- Placeholder sprites still in place. Real art is swapped via SPRITES/SOUNDS registries
-  in the source — re-run this build script after dropping in base64 dataURLs.
-- Replace STORE_URL (currently https://example.com) with the real app store link before shipping.
+Real assets are baked in via SPRITES/SOUNDS registries (see qa/bundle_assets.cjs).
+Store CTA routes to the live HHC iOS / Android listings (goToStore() in master HTML).
+Portrait only (1080×1920).
 `;
 fs.writeFileSync(path.join(OUT_DIR, 'VERSIONS.txt'), versionsTxt);
 

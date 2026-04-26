@@ -6,6 +6,7 @@ const path = require('path');
 const ART     = path.resolve(__dirname, '..', '..', 'HHC_Playable', 'art');
 const SFX     = path.resolve(__dirname, '..', '..', 'HHC_Playable', 'sfx');
 const HSASSET = path.resolve(__dirname, '..', 'assets'); // trimmed sprites (no dead space)
+const BG      = path.resolve(__dirname, '..', '..', 'sprites', 'backgrounds');
 const HTML    = path.resolve(__dirname, '..', 'HeroSwarm_playable_v0.1.html');
 
 function dataUrl(file, mime) {
@@ -26,7 +27,10 @@ const SPRITE_MAP = {
   troll:       ['ogro.png',         'image/png', HSASSET],
   dragon:      ['overlord.png',     'image/png', HSASSET],
   hand:        ['hand_pointer.png', 'image/png', ART],
-  bgL1:        ['forest_back.png',  'image/png', ART]
+  bgL1:        ['forest_back.png',  'image/png', ART],
+  bgCity:      ['Cidade Destruida 21 por 9.png', 'image/png', BG],  // L1
+  bgNight:     ['Cidade a noite 21 por 9.png',   'image/png', BG],  // L2
+  bgCave:      ['cave 21 por 9.png',             'image/png', BG]   // L3
 };
 const SOUND_MAP = {
   hit:     ['hit 1.mp3',                            'audio/mpeg'],
