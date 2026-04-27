@@ -1,0 +1,372 @@
+TAREFA: VALIDAÇÃO FINAL do plano consolidado para corrigir bugs do servidor World Boss (Cloud Functions Node.js).
+
+Esta é a 2ª rodada de pré-code. Vocês já validaram o plano inicial (round 1) e levantaram 8 ajustes consensuais. Esta versão incorpora TODOS os ajustes consensuais (sem inventar nada novo), com 2 decisões do usuário:
+- (a) **Sem `MAX_PLAUSIBLE_SCORE`** (anti-fraude fica fora deste PR — usuário não quer adicionar features)
+- (b) **Foco em mudança mínima e ZERO novos bugs** (não estamos refatorando, só corrigindo)
+- Sobre idempotência: Claude decidiu por **transaction em `BossStarted`** (mais robusto que guard simples, sem precisar mexer em `setGlobalBossTrueAndSetTimeNew`).
+
+## RECAPITULAÇÃO DOS BUGS (já confirmados no round 1)
+
+1. **CRÍTICO**: Snapshot de `Positions` desatualizado em até 1 minuto
+2. **CRÍTICO**: Race com `toggleCronJobNew` (que recalcula Positions em paralelo)
+3. **CRÍTICO**: `Tops` mistura position de momento X com score de momento Y
+4. **CRÍTICO**: Loop `await` sequencial em 15.911 players → estoura timeout 540s
+5. **MENOR**: `.update()` em `Tops` deixa lixo do boss anterior
+6. **MENOR**: `Object.values()` ordem frágil
+
+## CÓDIGO ATUAL (resumido — versão completa no round 1)
+
+```javascript
+// turnOffBossStartedNew (BUGADO)
+exports.turnOffBossStartedNew = functionsV1.runWith({timeoutSeconds: 540, memory: '2GB'}).https.onRequest(async (req, res) => {
+  await Promise.all([
+    worldDb.ref('/BossStarted').set(false),  // ← race com toggleCron
+    worldDb.ref('/TimeToStart').set(''),
+  ]);
+  const positionsSnapshot = await worldDb.ref('/Positions').orderByValue().once('value');  // ← stale
+  const topPlayers = positionsSnapshot.val() || {};
+  const topPlayersKeys = Object.keys(topPlayers);
+  const topPlayersValues = Object.values(topPlayers);
+  let topsUpdate = {};
+  for (let i = 0; i < topPlayersKeys.length; i++) {
+    if (topPlayersValues[i] > 3) continue;
+    const playerId = topPlayersKeys[i];
+    const scoreSnapshot = await worldDb.ref(`/Players/${playerId}`).once('value');  // ← await sequencial
+    const score = scoreSnapshot.val();
+    topsUpdate[`${topPlayersValues[i]}`] = `${playerId};${score}`;
+  }
+  await worldDb.ref('/Tops').update(topsUpdate);  // ← .update() não .set()
+  // ... lê bosses, lê Positions DE NOVO, loop com 15911 awaits, etc
+});
+
+// toggleCronJobNew (BUGADO — recalcula Positions causando race)
+exports.toggleCronJobNew = ... .onUpdate(async (change) => {
+  if (bossStarted) { resumeJob(); /* agenda turn-off em 30 min */ }
+  else {
+    pauseJob();
+    // RECALCULA Positions a partir de Players — causa race com turnOffBossStartedNew
+  }
+});
+```
+
+## PLANO FINAL CONSOLIDADO (incorpora 7 ajustes consensuais do round 1)
+
+```javascript
+exports.turnOffBossStartedNew = functionsV1
+  .runWith({ timeoutSeconds: 540, memory: '2GB' })
+  .https.onRequest(async (request, response) => {
+    const startTime = Date.now();
+    try {
+      // ═══════════════════════════════════════════════════════════════
+      // 1. IDEMPOTÊNCIA: transaction atômica em BossStarted
+      //    Se já estiver false, aborta (noop). Garante 1-execução-por-ciclo
+      //    contra retries do Cloud Scheduler ou execuções paralelas.
+      // ═══════════════════════════════════════════════════════════════
+      const txResult = await worldDb.ref('/BossStarted').transaction(curr => {
+        if (curr === false) return; // aborta — outra execução já começou
+        return false;               // commita: marca como encerrado
+      });
+      if (!txResult.committed) {
+        console.log('[turnOffBoss] noop — boss já encerrado por outra execução');
+        response.status(200).send({ message: 'Boss já encerrado; noop' });
+        return;
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // 2. PAUSE CRON (idempotente — dispara em paralelo com toggleCronJobNew
+      //    que também tenta pausar; pauseJob é idempotente no Cloud Scheduler)
+      // ═══════════════════════════════════════════════════════════════
+      const projectId = process.env.GCLOUD_PROJECT;
+      const location = 'us-central1';
+      const cronJobName = `projects/${projectId}/locations/${location}/jobs/firebase-schedule-calculatePositionsNew-us-central1`;
+      try {
+        await schedulerClient.pauseJob({ name: cronJobName });
+      } catch (e) {
+        console.warn('[turnOffBoss] pauseJob falhou (continua, filtro fakefakefake protege):', e.message);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // 3. SNAPSHOT ÚNICO de Players — fonte da verdade
+      // ═══════════════════════════════════════════════════════════════
+      const playersSnap = await worldDb.ref('/Players').once('value');
+      const players = playersSnap.val() || {};
+
+      // ═══════════════════════════════════════════════════════════════
+      // 4. FILTRO + PARSE + SORT estável
+      //    - startsWith('fakefakefake') (mais correto que includes)
+      //    - Number.isFinite + score >= 0 (rejeita NaN/Infinity/negativo)
+      //    - tie-breaker por nome (determinístico em empates)
+      // ═══════════════════════════════════════════════════════════════
+      const sortedPlayers = Object.entries(players)
+        .filter(([name]) => !name.startsWith('fakefakefake'))
+        .map(([name, rawScore]) => {
+          const score = Number(rawScore);
+          return { name, score: (Number.isFinite(score) && score >= 0) ? score : 0 };
+        })
+        .sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+
+      // ═══════════════════════════════════════════════════════════════
+      // 5. Calcula Positions e Tops do MESMO snapshot
+      // ═══════════════════════════════════════════════════════════════
+      const newPositions = {};
+      const topsUpdate = {};
+      const topPlayersData = [];
+      sortedPlayers.forEach((p, i) => {
+        const position = i + 1;
+        newPositions[p.name] = position;
+        if (position <= 3) {
+          topsUpdate[String(position)] = `${p.name};${p.score}`;
+          topPlayersData.push({ playerId: p.name, score: p.score });
+        }
+      });
+
+      // ═══════════════════════════════════════════════════════════════
+      // 6. PERSISTÊNCIA ATÔMICA via multi-path update (RTDB tudo-ou-nada)
+      //    Substitui Tops INTEIRAMENTE (resolve bug #5: lixo do boss anterior).
+      //    NÃO inclui BossStarted aqui (já foi setado pela transaction no passo 1).
+      // ═══════════════════════════════════════════════════════════════
+      await worldDb.ref().update({
+        '/Positions': newPositions,
+        '/Tops': topsUpdate,
+        '/TimeToStart': '',
+      });
+
+      // ═══════════════════════════════════════════════════════════════
+      // 7. LÊ DADOS DO BOSS ATUAL (rewards + name)
+      // ═══════════════════════════════════════════════════════════════
+      const currentBossSnapshot = await worldDb.ref('/CurrentSelectedBoss').once('value');
+      const currentBoss = currentBossSnapshot.val();
+      if (!currentBoss) throw new Error('Current boss not found.');
+
+      const [rewards101Snap, rewards1_10Snap, rewards11_100Snap, topExtraSnap, bossNameSnap] = await Promise.all([
+        worldDb.ref(`/Bosses/${currentBoss}/rewards101`).once('value'),
+        worldDb.ref(`/Bosses/${currentBoss}/rewards1_10`).once('value'),
+        worldDb.ref(`/Bosses/${currentBoss}/rewards11_100`).once('value'),
+        worldDb.ref(`/Bosses/${currentBoss}/topExtraRewards`).once('value'),
+        worldDb.ref(`/Bosses/${currentBoss}/name`).once('value'),
+      ]);
+      const rewards101 = rewards101Snap.val() || {};
+      const rewards1_10 = rewards1_10Snap.val() || {};
+      const rewards11_100 = rewards11_100Snap.val() || {};
+      const topExtraRewards = topExtraSnap.val() || {};
+      const allBossNames = bossNameSnap.val() || '';
+
+      // ═══════════════════════════════════════════════════════════════
+      // 8. MONTAGEM DAS RECOMPENSAS (em memória — SEM await por player)
+      //    Preserva 100% da lógica original de bandas/títulos/descrições.
+      // ═══════════════════════════════════════════════════════════════
+      const updatesMain = {};
+      const mailBoxList = [];
+      const mailBoxRootRef = mainDb.ref('/000-MailBoxIndividual');
+      const top3Names = new Set(topPlayersData.map(t => t.playerId));
+
+      for (const p of sortedPlayers) {
+        const playerId = p.name;
+        const position = newPositions[playerId];
+        const playerScore = p.score;
+        if (playerScore === 0) continue;
+
+        const uid = playerId.split(';')[0];
+
+        // Caso especial: score == 1 → recompensa "lostboss"
+        if (playerScore === 1) {
+          const rewards = { reward1: 'boss_horn;1' };
+          const title = 'mailbox_congrats_boss_title_lostboss';
+          const desc = 'mailbox_congrats_boss_desc_lostboss';
+          const newMailKey = mailBoxRootRef.push().key;
+          updatesMain[`/000-MailBoxIndividual/${uid}/${newMailKey}`] = { ...rewards, title, desc };
+          mailBoxList.push({ playerId: uid, position, rewards, title, desc });
+          continue;
+        }
+
+        let rewards, title, desc;
+        if (position >= 101) {
+          rewards = { ...rewards101 };
+          title = 'mailbox_congrats_boss_title_100plus';
+          desc = 'mailbox_congrats_boss_desc_100plus';
+        } else if (position >= 1 && position <= 10) {
+          rewards = { ...rewards1_10 };
+          title = position <= 3 ? 'mailbox_congrats_boss_title_tops' : 'mailbox_congrats_boss_title_4-10';
+          desc  = position <= 3 ? 'mailbox_congrats_boss_desc_tops'  : 'mailbox_congrats_boss_desc_4-10';
+        } else if (position >= 11 && position <= 100) {
+          rewards = { ...rewards11_100 };
+          title = 'mailbox_congrats_boss_title_11-100';
+          desc  = 'mailbox_congrats_boss_desc_11-100';
+        }
+        if (!rewards) continue;
+
+        // Recompensa extra para top 3 (preserva lógica original)
+        if (topExtraRewards && top3Names.has(playerId) && topExtraRewards[position]) {
+          const [extraKey, extraVal] = topExtraRewards[position].split(';');
+          for (const rk in rewards) {
+            if (rewards[rk].startsWith(extraKey)) {
+              const [k, cv] = rewards[rk].split(';');
+              rewards[rk] = `${k};${parseInt(cv) + parseInt(extraVal)}`;
+            }
+          }
+        }
+
+        const newMailKey = mailBoxRootRef.push().key;
+        updatesMain[`/000-MailBoxIndividual/${uid}/${newMailKey}`] = { ...rewards, title, desc };
+        mailBoxList.push({ playerId: uid, position, rewards, title, desc });
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // 9. MENSAGEM GLOBAL CHAT (top 3 agora correto)
+      // ═══════════════════════════════════════════════════════════════
+      const top1User = topPlayersData[0]?.playerId.split(';')[1] || 'N/A';
+      const top2User = topPlayersData[1]?.playerId.split(';')[1] || 'N/A';
+      const top3User = topPlayersData[2]?.playerId.split(';')[1] || 'N/A';
+      const gcMessage = {
+        message: `localization;congratulation_all_heroes;${top1User};${top2User};${top3User};boss_loc;${allBossNames}`,
+        timestamp: Date.now(),
+        user: '',
+      };
+      const newGCKey = mainDb.ref('/000-GlobalChat').push().key;
+      updatesMain[`/000-GlobalChat/${newGCKey}`] = gcMessage;
+
+      // ═══════════════════════════════════════════════════════════════
+      // 10. PERSISTE EM BATCHES SEQUENCIAIS (mais seguro que paralelo
+      //     para não tomar throttle do Firebase)
+      //     500 entries × ~250 bytes = ~125 KB por batch (limite 16 MB OK)
+      // ═══════════════════════════════════════════════════════════════
+      const updateKeys = Object.keys(updatesMain);
+      const BATCH_SIZE = 500;
+      for (let i = 0; i < updateKeys.length; i += BATCH_SIZE) {
+        const batch = {};
+        for (const k of updateKeys.slice(i, i + BATCH_SIZE)) batch[k] = updatesMain[k];
+        await mainDb.ref().update(batch);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // 11. LOG ESTRUTURADO (diagnóstico futuro)
+      // ═══════════════════════════════════════════════════════════════
+      console.log('[turnOffBoss] OK', JSON.stringify({
+        bossId: currentBoss,
+        totalPlayers: sortedPlayers.length,
+        rewardedPlayers: mailBoxList.length,
+        top3: topPlayersData,
+        batchCount: Math.ceil(updateKeys.length / BATCH_SIZE),
+        durationMs: Date.now() - startTime,
+      }));
+
+      response.send({ message: 'BossStarted desligado, recompensas distribuídas.', mailBoxList });
+    } catch (error) {
+      console.error('[turnOffBoss] ERRO:', error);
+      response.status(500).send(error);
+    }
+  });
+
+// toggleCronJobNew SIMPLIFICADO — remove recálculo de Positions (causa do bug #2)
+exports.toggleCronJobNew = functionsV1.database
+  .instance('hero-hero-clicker-world-boss-room')
+  .ref('/BossStarted')
+  .onUpdate(async (change, context) => {
+    const bossStarted = change.after.val();
+    const projectId = process.env.GCLOUD_PROJECT;
+    const location = 'us-central1';
+    const jobName = `projects/${projectId}/locations/${location}/jobs/firebase-schedule-calculatePositionsNew-us-central1`;
+
+    if (bossStarted) {
+      try { await schedulerClient.resumeJob({ name: jobName }); console.log('Job resumed.'); }
+      catch (e) { console.error('Error resuming:', e); }
+
+      // PRESERVADO: agenda turn-off em 30 min (mantém comportamento original)
+      const jobPath = `projects/${projectId}/locations/${location}`;
+      const ts = new Date(Date.now() + 60000 * 30);
+      const job = {
+        name: `${jobPath}/jobs/turn-off-boss-${ts.getTime()}`,
+        httpTarget: {
+          uri: `https://us-central1-${projectId}.cloudfunctions.net/turnOffBossStartedNew`,
+          httpMethod: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: Buffer.from('{}').toString('base64'),
+        },
+        schedule: `${ts.getMinutes()} ${ts.getHours()} ${ts.getDate()} ${ts.getMonth() + 1} *`,
+        timeZone: 'UTC',
+      };
+      try {
+        const [resp] = await schedulerClient.createJob({ parent: jobPath, job });
+        console.log('Job agendado para desligar BossStarted:', resp.name);
+      } catch (e) { console.error('Erro ao agendar job:', e); }
+    } else {
+      try { await schedulerClient.pauseJob({ name: jobName }); console.log('Job paused.'); }
+      catch (e) { console.error('Error pausing:', e); }
+
+      // ❌ REMOVIDO: recálculo de Positions
+      //    turnOffBossStartedNew agora faz isso de forma consistente.
+      //    Se algum dia BossStarted virar false por outra via (manual?),
+      //    Positions ficará desatualizado — mas isso é situação operacional,
+      //    não fluxo normal. Não regride o caso atual.
+    }
+  });
+```
+
+## ANÁLISE DO QUE NÃO FOI INCLUÍDO (decisões do usuário)
+
+| Item rejeitado | Razão |
+|---|---|
+| `MAX_PLAUSIBLE_SCORE` anti-fraude | Usuário não quer features novas, só fix |
+| Strategy pattern para reward bands | Refactor opcional, não corrige bug; manteve if/else original |
+| Detecção de morte por damage | Mudança de feature, fora do escopo |
+| Remoção do `fakefakefake` heartbeat | Pode ter listeners não documentados; manter por segurança |
+| `bossId/timestamp` em Tops | Requer cliente novo, incompatível |
+| Status "calculating_rewards" | Requer cliente novo |
+| Migrar para Firestore | Mudança arquitetural grande |
+| Firebase Security Rules | Hardening separado |
+| Lock dedicado em `/_locks/turnOffBoss` | Mais código; transaction em BossStarted resolve com mudança mínima |
+
+## PERGUNTAS PARA AS 8 IAs (re-validação focada)
+
+### Para Claude Opus 4.7:
+1. O plano final resolve TODOS os 6 bugs identificados? Algum não foi resolvido?
+2. Há ALGUM novo bug introduzido pela refatoração? (Foco em zero novos bugs)
+3. A `transaction()` em BossStarted é a forma correta de garantir idempotência? Há corner case?
+4. Lógica de bandas de recompensa preservada 100% do original? Comparar com o código original linha-a-linha mentalmente.
+5. A ordem (transaction → pause → snapshot → calc → multi-path → rewards lê → batches → BossStarted=false JÁ FOI feito no início) está correta?
+6. **CRÍTICO**: BossStarted vai para `false` no INÍCIO (via transaction). Cliente Unity detecta e mostra animação de boss morto antes das recompensas serem entregues. Isso JÁ era o comportamento atual, certo? (Não é regressão.)
+
+### Para Claude Sonnet 4.6:
+1. Sem `MAX_PLAUSIBLE_SCORE`, há vetor de exploit ativado pela refatoração que NÃO existia antes?
+2. `Number.isFinite(score) && score >= 0` cobre Infinity/NaN/negativo. Há outro edge case (ex: `Number("0x1F4")` = 500 hex)?
+3. A transaction em BossStarted protege contra concurrent execution (2 instances do Cloud Function rodando simultâneo)?
+4. Tem como um cliente disparar a function HTTP diretamente para causar harm? (Endpoint público?)
+
+### Para o3:
+1. Edge case: durante o multi-path update (~50ms), um cliente atualiza Players. Esse score NÃO entra no top 3 (pos errada). Comportamento aceitável? Mesmo do original?
+2. Edge case: pause cron falha (IAM/permissão). O cron continua rodando. Calcula Positions baseado em Players ANTES do snapshot do turnOff. Conflict no multi-path? RTDB resolve quem ganha — qual o último a escrever?
+3. Edge case: 32 batches × ~300ms cold start latency = ~10s. Total da função: ~15s. Limite 540s = OK. Confere?
+4. Edge case: `currentBoss` é null/empty (boss não configurado). Atualmente lança exception → 500 → Cloud Scheduler RETRY → idempotência absorve? Sim porque transaction já commitou BossStarted=false → retry bate no guard.
+5. Edge case: o `topPlayersData[i]?.playerId.split(';')[1]` falha se o nome tem `;` interior (ex: "Player;Name"). RTDB key não pode conter `;`? Validar.
+6. Race extremo: 2 instâncias do Cloud Function rodando turnOff EXATAMENTE ao mesmo tempo. Transaction commits em ORDEM no RTDB. Uma vence, outra aborta. ✓
+7. Race extremo: pause do cron falha + turnOff vai gravar Positions/Tops + cron já rodou (escreveu fakefakefake novo + escreveu Positions). multi-path update sobrescreve TUDO em Positions. fakefakefake fica em Players (filtrado). ✓ Mas se o cron rodar DEPOIS do multi-path, ele sobrescreve Positions com dados do snapshot OLD! Isso é bug?
+
+### Para Qwen 3.6 Plus:
+1. Esta abordagem é a MAIS MÍNIMA possível para corrigir os 6 bugs sem introduzir novos? Há algo mais simples?
+2. Algum risco de operação (deploy, rollback) que vale destacar?
+3. Vale separar em commits/PRs distintos (ex: idempotência em PR1, snapshot único em PR2) para reduzir blast radius?
+
+### Para Gemini 3 Flash:
+1. Cenários "esquisitos" que poderiam quebrar este plano?
+2. O código preserva exatamente o comportamento atual em todos os edge cases (score=0, score=1, score=2..10, position>100, etc)?
+
+### Para KAT Coder Pro V2:
+1. Snippet final de cada parte está idiomático e correto em Node.js + Firebase Admin SDK v9?
+2. `worldDb.ref().update({'/Positions': obj, '/Tops': obj, '/TimeToStart': ''})` — sintaxe correta para multi-path com sub-objetos?
+3. `transaction()` em RTDB Admin SDK retorna `{ committed: bool, snapshot }` — o uso está correto?
+
+### Para GPT-5.4 (co-coder):
+1. Revisar cada um dos 11 passos do plano. Há algo a ajustar?
+2. Há algum ponto onde 2 ou mais ajustes recomendados podem CONFLITAR entre si?
+3. Sugestão de nome para uma flag de "dry-run" para teste em produção (loga sem persistir)?
+4. Vale pré-deploy testar via Firebase Emulator? Como simular 15k players?
+
+### Para MiniMax M2.7:
+1. Tabela A/B: estado antes vs depois para cada cenário (boss morre normal, retry, pause cron falha, score=0, score=1, score>=2, position 1, position 2, position 3, position 4, position 11, position 101, etc).
+2. Checklist final de smoke test (sequência exata de comandos para validar em produção após deploy).
+
+## OBJETIVO DESTA VALIDAÇÃO
+
+- Aprovar o plano se zero novos bugs forem identificados.
+- Reportar bugs/inconsistências CONCRETAS (não opiniões de estilo).
+- Se aprovar, preparem para que esta seja a versão final que será aplicada.

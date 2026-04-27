@@ -1,0 +1,737 @@
+TASK: pós-code review do feature **Status Icons (Shield + DOT) on hero portrait HP bar** no DiverDungeon. Pequeno feature de UI complementar ao Cast Banner v1 e ao framework de habilidades v1.
+
+CONTEXTO:
+- Sprites carregadas de Assets/Resources/StatusIcons/{shield,dot}.png (com .meta files maxTextureSize=256, textureType=Sprite).
+- HeroVisual class ganhou: shieldIconRoot/shieldLabel/dotIconRoot/dotLabel.
+- BuildHeroStatusIcon helper constrói um Image (sprite) + Text label sobreposto, anchorado bottom-right de hero rt, sizeDelta 36×36, font size 22 bold white.
+- UpdateHeroStatusIcons(slot, bag, heroAlive) lê o ActiveStatus bag — primeiro Shield → ícone shield + magnitude; primeiro DamageOverTime → ícone dot + magnitude. Hide se hp<=0 ou magnitude<=0.
+- RefreshAllCombatBars assinatura mudada: agora aceita heroStatuses (lista paralela). 4 call sites atualizados (cast queue, end-of-round, enemy ability cast, floor-start enemy autoability).
+- Direct call em onHeroHit lambda (após AbsorbWithShieldLive) garante shield icon refresca em tempo real ao drenar — load-bearing edge case identificado no precode.
+- Floor-start initialization: UpdateHeroStatusIcons chamado para limpar ícones leftover (heroVisuals reused entre floors).
+
+DECISÕES TOMADAS NO PRECODE (8 IAs):
+- §1 propagação de estado: PARÂMETRO em RefreshAllCombatBars (não field, não método separado). Force compile-error em call sites esquecidos.
+- §3 layout: shield esquerda, dot direita, ambos anchored (1,0)/(1,0)/pivot(1,0) na hero rt. Anchored positions (-44, 8) e (-4, 8).
+- §4 edge cases: hide on hp<=0, hide on magnitude<=0, refresh DURING enemy attack (não só em cast).
+
+DIFF (vs HEAD):
+
+diff --git a/Assets/Prototype/Scripts/UIController.cs b/Assets/Prototype/Scripts/UIController.cs
+index e21d28c..390f3f8 100644
+--- a/Assets/Prototype/Scripts/UIController.cs
++++ b/Assets/Prototype/Scripts/UIController.cs
+@@ -43,11 +43,49 @@ namespace DiverDungeon.Prototype
+         Text resultLabel;
+         Text previewLabel;
+         Image flashOverlay;
++        Text fightBanner;
+         RectTransform damageLayer;
+         readonly List<HeroVisual> heroVisuals = new List<HeroVisual>();
+         readonly List<EnemyVisual> enemyVisuals = new List<EnemyVisual>();
+         bool isPlayingFloor = false;
+ 
++        // Cast banner (per-character special-ability flash). Built once in BuildCombat,
++        // shown by ShowCastBanner during RunLiveCombat. raycastTarget=true on the input
++        // blocker so the existing focus/descend buttons are ignored while the banner is up.
++        RectTransform castBannerRoot;
++        Image castBannerInputBlocker;
++        Image castBannerBg;
++        Image castBannerPortrait;
++        Image castBannerPortraitFallback;
++        Text castBannerName;
++        bool isCastBannerActive = false;
++
++        // Status-icon sprites loaded once from Resources/StatusIcons/ in Awake (before BuildCombat).
++        // Display is presentation-only — read out of CombatResolver.heroStatuses bag passed by
++        // RunLiveCombat. Adding a third icon = drop the PNG in Resources/StatusIcons/, add a
++        // sprite field here, extend UpdateHeroStatusIcons to inspect another StatusType.
++        Sprite shieldIconSprite;
++        Sprite dotIconSprite;
++
++        // Floor transition (walk-out → fade → walk-in → FIGHT) — all unscaled time so a future
++        // pause menu (timeScale=0) can't deadlock the UI.
++        // Hero walk pace: original 0.5s × 2.5 (-60%) × ~1.43 (-30% more) ≈ 1.785s.
++        const float WalkOutDuration   = 1.785f;
++        const float FadeOutDuration   = 0.25f;
++        const float FadeInDuration    = 0.25f;
++        const float WalkInDuration    = 1.785f;
++        const float FightBannerInTime = 0.1f;
++        const float FightBannerHold   = 0.4f;
++        const float FightBannerOut    = 0.1f;
++        // Cast banner timing (real-time, not scaled by SpeedMultiplier — locked at 1.0s for
++        // legibility per character-ability-cast-banner spec §5.3).
++        const float CastBannerInTime  = 0.15f;
++        const float CastBannerHold    = 0.70f;
++        const float CastBannerOut     = 0.15f;
++        const float WalkOffsetMargin  = 200f; // extra px past panel height so heroes go fully off-screen
++
++        public event System.Action OnFightBannerShown;
++
+         // Main menu
+         Text mainMenuStatus;
+         Button menuEnterDungeonBtn;
+@@ -81,6 +119,8 @@ namespace DiverDungeon.Prototype
+             public Graphic sprite;
+             public Image hpFill;
+             public Text hpLabel;
++            public Image manaBg;
++            public Image manaFill;
+             public Text nameLabel;
+             public Vector2 homeAnchoredPos;
+             public Color baseColor;
+@@ -89,6 +129,14 @@ namespace DiverDungeon.Prototype
+             public Camera heroCam;
+             public RenderTexture heroRT;
+             public Animator animator;
++            public ParticleSystem dustParticles;
++
++            // Status icons (Shield + DoT) shown over the bottom-right of the HP bar.
++            // GameObject refs let SetActive be O(1) when the status expires.
++            public GameObject shieldIconRoot;
++            public Text shieldLabel;
++            public GameObject dotIconRoot;
++            public Text dotLabel;
+         }
+         class EnemyVisual {
+             public RectTransform root;
+@@ -128,6 +176,10 @@ namespace DiverDungeon.Prototype
+         {
+             if (run == null) run = FindObjectOfType<RunController>();
+             if (meta == null) meta = FindObjectOfType<MetaState>();
++            shieldIconSprite = Resources.Load<Sprite>("StatusIcons/shield");
++            dotIconSprite    = Resources.Load<Sprite>("StatusIcons/dot");
++            if (shieldIconSprite == null) Debug.LogWarning("[UIController] StatusIcons/shield not found in Resources — shield icon will fall back to color block.");
++            if (dotIconSprite == null)    Debug.LogWarning("[UIController] StatusIcons/dot not found in Resources — DoT icon will fall back to color block.");
+             BuildCanvas();
+             BuildDungeonSelect();
+             BuildMainMenu();
+@@ -151,6 +203,9 @@ namespace DiverDungeon.Prototype
+             if (meta != null) meta.OnDungeonUnlocked -= OnDungeonUnlocked;
+             DisposeAllHeroVisuals();
+             StopDescendTimer();
++            // Coroutine `finally` blocks aren't guaranteed to run on StopAllCoroutines or
++            // scene unload; reset transition state here as a belt-and-suspenders.
++            isPlayingFloor = false;
+         }
+ 
+         void DisposeAllHeroVisuals()
+@@ -887,6 +942,78 @@ namespace DiverDungeon.Prototype
+             flashOverlay = MakeImage("FlashOverlay", combatPanel, new Color(1, 0, 0, 0));
+             Stretch(flashOverlay.rectTransform);
+             flashOverlay.raycastTarget = false;
++
++            // FIGHT banner — shown after walk-in, before combat ticks
++            fightBanner = MakeText("FightBanner", combatPanel, "FIGHT", 200, TextAnchor.MiddleCenter);
++            fightBanner.fontStyle = FontStyle.Bold;
++            fightBanner.raycastTarget = false;
++            var fbRt = fightBanner.rectTransform;
++            fbRt.anchorMin = new Vector2(0.5f, 0.5f);
++            fbRt.anchorMax = new Vector2(0.5f, 0.5f);
++            fbRt.pivot = new Vector2(0.5f, 0.5f);
++            fbRt.anchoredPosition = Vector2.zero;
++            fbRt.sizeDelta = new Vector2(800, 240);
++            fightBanner.gameObject.SetActive(false);
++
++            BuildCastBanner();
++        }
++
++        // Per-cast banner: portrait + ability name, full-screen pause for 1s real-time.
++        // Built once at startup; ShowCastBanner just toggles activation + swaps the portrait/text.
++        // Designed to scale to any hero in HeroClassRegistry (portrait fetched at cast time via
++        // MetaState.GetPortrait(heroId)) — adding hero #6 requires no UI change.
++        void BuildCastBanner()
++        {
++            // Full-screen invisible image that absorbs raycasts so combat buttons (focus, descend,
++            // bank, speed) are ignored while a cast is mid-flash. raycastTarget defaults to true.
++            castBannerInputBlocker = MakeImage("CastBannerInputBlocker", combatPanel, new Color(0f, 0f, 0f, 0.001f));
++            Stretch(castBannerInputBlocker.rectTransform);
++            castBannerInputBlocker.gameObject.SetActive(false);
++
++            castBannerRoot = new GameObject("CastBannerRoot", typeof(RectTransform)).GetComponent<RectTransform>();
++            castBannerRoot.SetParent(combatPanel, false);
++            castBannerRoot.anchorMin = new Vector2(0.5f, 0.5f);
++            castBannerRoot.anchorMax = new Vector2(0.5f, 0.5f);
++            castBannerRoot.pivot = new Vector2(0.5f, 0.5f);
++            castBannerRoot.anchoredPosition = Vector2.zero;
++            castBannerRoot.sizeDelta = new Vector2(1200f, 400f);
++
++            // Translucent backdrop strip behind portrait + name.
++            castBannerBg = MakeImage("Bg", castBannerRoot, new Color(0f, 0f, 0f, 0.85f));
++            Stretch(castBannerBg.rectTransform);
++            castBannerBg.raycastTarget = false;
++
++            // Color-block fallback rendered behind the portrait so a missing sprite still gives a
++            // visible silhouette in the hero's color. Sized identically to the portrait.
++            castBannerPortraitFallback = MakeImage("PortraitFallback", castBannerRoot, Color.gray);
++            castBannerPortraitFallback.raycastTarget = false;
++            var pfRt = castBannerPortraitFallback.rectTransform;
++            pfRt.anchorMin = new Vector2(0f, 0.5f);
++            pfRt.anchorMax = new Vector2(0f, 0.5f);
++            pfRt.pivot = new Vector2(0f, 0.5f);
++            pfRt.anchoredPosition = new Vector2(40f, 0f);
++            pfRt.sizeDelta = new Vector2(360f, 360f);
++
++            castBannerPortrait = MakeImage("Portrait", castBannerRoot, Color.white);
++            castBannerPortrait.raycastTarget = false;
++            castBannerPortrait.preserveAspect = true;
++            var pRt = castBannerPortrait.rectTransform;
++            pRt.anchorMin = new Vector2(0f, 0.5f);
++            pRt.anchorMax = new Vector2(0f, 0.5f);
++            pRt.pivot = new Vector2(0f, 0.5f);
++            pRt.anchoredPosition = new Vector2(40f, 0f);
++            pRt.sizeDelta = new Vector2(360f, 360f);
++
++            castBannerName = MakeText("Name", castBannerRoot, "", 96, TextAnchor.MiddleLeft);
++            castBannerName.fontStyle = FontStyle.Bold;
++            castBannerName.raycastTarget = false;
++            var nRt = castBannerName.rectTransform;
++            nRt.anchorMin = new Vector2(0f, 0f);
++            nRt.anchorMax = new Vector2(1f, 1f);
++            nRt.offsetMin = new Vector2(440f, 20f);
++            nRt.offsetMax = new Vector2(-40f, -20f);
++
++            castBannerRoot.gameObject.SetActive(false);
+         }
+ 
+         void ToggleFastSpeed()
+@@ -958,6 +1085,7 @@ namespace DiverDungeon.Prototype
+                 Camera heroCam = null;
+                 RenderTexture heroRT = null;
+                 Animator heroAnim = null;
++                ParticleSystem dustPs = null;
+ 
+                 var prefabSrc = meta != null ? meta.GetPrefab(hd.id) : null;
+                 if (prefabSrc != null)
+@@ -985,6 +1113,8 @@ namespace DiverDungeon.Prototype
+                     heroAnim = heroInstance.GetComponentInChildren<Animator>();
+                     if (heroAnim != null) heroAnim.Play("Idle");
+ 
++                    dustPs = BuildDustParticles(heroInstance.transform);
++
+                     var raw = go.AddComponent<RawImage>();
+                     raw.texture = heroRT;
+                     raw.color = Color.white;
+@@ -1008,13 +1138,13 @@ namespace DiverDungeon.Prototype
+                     heroGraphic = img;
+                 }
+ 
+-                // Name + level under the character (below the HP bar)
++                // Name + level under the character (below the HP and mana bars)
+                 var nm = MakeText("Name", rt, hd.heroName.ToUpperInvariant(), 24, TextAnchor.MiddleCenter);
+                 nm.color = Color.white;
+                 var nmRt = nm.rectTransform;
+                 nmRt.anchorMin = new Vector2(0f, 0f); nmRt.anchorMax = new Vector2(1f, 0f);
+                 nmRt.pivot = new Vector2(0.5f, 1f);
+-                nmRt.anchoredPosition = new Vector2(0, -40);
++                nmRt.anchoredPosition = new Vector2(0, -54);
+                 nmRt.sizeDelta = new Vector2(0, 30);
+ 
+                 var lvl = MakeText("Lvl", rt, $"L{hd.level}", 20, TextAnchor.MiddleCenter);
+@@ -1022,7 +1152,7 @@ namespace DiverDungeon.Prototype
+                 var lvlRt = lvl.rectTransform;
+                 lvlRt.anchorMin = new Vector2(0f, 0f); lvlRt.anchorMax = new Vector2(1f, 0f);
+                 lvlRt.pivot = new Vector2(0.5f, 1f);
+-                lvlRt.anchoredPosition = new Vector2(0, -72);
++                lvlRt.anchoredPosition = new Vector2(0, -86);
+                 lvlRt.sizeDelta = new Vector2(0, 24);
+ 
+                 // HP bar under sprite
+@@ -1046,40 +1176,553 @@ namespace DiverDungeon.Prototype
+                 hpLbl.rectTransform.anchorMin = Vector2.zero; hpLbl.rectTransform.anchorMax = Vector2.one;
+                 hpLbl.rectTransform.offsetMin = Vector2.zero; hpLbl.rectTransform.offsetMax = Vector2.zero;
+ 
++                // Mana bar — slim blue bar directly beneath the HP bar. Hidden when the hero has no ability.
++                var manaBg = MakeImage("ManaBg", rt, new Color(0.05f, 0.05f, 0.05f));
++                var manaBgRt = manaBg.rectTransform;
++                manaBgRt.anchorMin = new Vector2(0f, 0f); manaBgRt.anchorMax = new Vector2(1f, 0f);
++                manaBgRt.pivot = new Vector2(0.5f, 1f);
++                manaBgRt.anchoredPosition = new Vector2(0, -36);
++                manaBgRt.sizeDelta = new Vector2(0, 14);
++
++                var manaFill = MakeImage("ManaFill", manaBg.rectTransform, new Color(0.25f, 0.55f, 1f));
++                manaFill.raycastTarget = false;
++                var manaFillRt = manaFill.rectTransform;
++                manaFillRt.anchorMin = new Vector2(0f, 0f); manaFillRt.anchorMax = new Vector2(1f, 1f);
++                manaFillRt.pivot = new Vector2(0f, 0.5f);
++                manaFillRt.offsetMin = new Vector2(2, 2);
++                manaFillRt.offsetMax = new Vector2(-2, -2);
++                float manaT0 = hd.maxMana > 0 ? Mathf.Clamp01((float)hd.startingMana / hd.maxMana) : 0f;
++                manaFillRt.localScale = new Vector3(manaT0, 1f, 1f);
++                if (hd.maxMana <= 0) manaBg.gameObject.SetActive(false);
++
++                // Status icons (Shield + DoT) anchored bottom-right of the hero rect, overlaid
++                // on the HP bar. Built once per hero, kept hidden until UpdateHeroStatusIcons
++                // flips them on. Shield sits to the left of DoT — left-to-right reading order.
++                BuildHeroStatusIcon(rt, "ShieldIcon", shieldIconSprite, hd.color,
++                    new Vector2(-44f, 8f), out var shieldRoot, out var shieldLbl);
++                BuildHeroStatusIcon(rt, "DotIcon", dotIconSprite, hd.color,
++                    new Vector2(-4f, 8f), out var dotRoot, out var dotLbl);
++
+                 heroVisuals.Add(new HeroVisual {
+-                    root = rt, sprite = heroGraphic, hpFill = hpFill, hpLabel = hpLbl, nameLabel = nm,
++                    root = rt, sprite = heroGraphic, hpFill = hpFill, hpLabel = hpLbl,
++                    manaBg = manaBg, manaFill = manaFill, nameLabel = nm,
+                     homeAnchoredPos = home, baseColor = heroGraphic != null ? heroGraphic.color : Color.white, slot = i,
+-                    heroInstance = heroInstance, heroCam = heroCam, heroRT = heroRT, animator = heroAnim
++                    heroInstance = heroInstance, heroCam = heroCam, heroRT = heroRT, animator = heroAnim,
++                    dustParticles = dustPs,
++                    shieldIconRoot = shieldRoot, shieldLabel = shieldLbl,
++                    dotIconRoot = dotRoot, dotLabel = dotLbl
+                 });
+             }
+         }
+ 
++        // Builds a status-icon GameObject (Image + centered Text label) anchored to the
++        // bottom-right corner of the hero rect with `pivot=(1,0)`. Hidden by default;
++        // UpdateHeroStatusIcons toggles visibility and writes the magnitude. `fallbackTint`
++        // is used when the sprite failed to load — visible silhouette beats invisible state.
++        void BuildHeroStatusIcon(RectTransform parent, string name, Sprite sprite, Color fallbackTint,
++            Vector2 anchoredPos, out GameObject root, out Text label)
++        {
++            var img = MakeImage(name, parent, sprite != null ? Color.white : fallbackTint);
++            img.sprite = sprite;
++            img.preserveAspect = true;
++            img.raycastTarget = false;
++            var rt = img.rectTransform;
++            rt.anchorMin = new Vector2(1f, 0f);
++            rt.anchorMax = new Vector2(1f, 0f);
++            rt.pivot = new Vector2(1f, 0f);
++            rt.anchoredPosition = anchoredPos;
++            rt.sizeDelta = new Vector2(36f, 36f);
++
++            label = MakeText(name + "Label", rt, "0", 22, TextAnchor.MiddleCenter);
++            label.fontStyle = FontStyle.Bold;
++            label.color = Color.white;
++            label.raycastTarget = false;
++            var lblRt = label.rectTransform;
++            lblRt.anchorMin = Vector2.zero;
++            lblRt.anchorMax = Vector2.one;
++            lblRt.offsetMin = Vector2.zero;
++            lblRt.offsetMax = Vector2.zero;
++
++            root = img.gameObject;
++            root.SetActive(false);
++        }
++
++        // Inspects a hero's ActiveStatus bag and toggles their Shield / DoT icons accordingly.
++        // Hidden when: hero is KO'd, status type absent, or magnitude <= 0 (defensive — the
++        // resolver prunes drained shields, but UI must not display "0"). Called from
++        // RefreshAllCombatBars (cast + end-of-round) and directly from the enemy-attack loop
++        // after AbsorbWithShieldLive — wherever shield magnitude or DoT presence can change.
++        void UpdateHeroStatusIcons(int slot, List<ActiveStatus> bag, bool heroAlive)
++        {
++            if (slot < 0 || slot >= heroVisuals.Count) return;
++            var hv = heroVisuals[slot];
++
++            int shieldMag = 0;
++            int dotMag = 0;
++            if (heroAlive && bag != null)
++            {
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    var s = bag[i];
++                    if (s.magnitude <= 0) continue;
++                    if (s.type == StatusType.Shield && shieldMag == 0) shieldMag = s.magnitude;
++                    else if (s.type == StatusType.DamageOverTime && dotMag == 0) dotMag = s.magnitude;
++                }
++            }
++
++            if (hv.shieldIconRoot != null)
++            {
++                bool show = shieldMag > 0;
++                if (hv.shieldIconRoot.activeSelf != show) hv.shieldIconRoot.SetActive(show);
++                if (show && hv.shieldLabel != null) hv.shieldLabel.text = shieldMag.ToString();
++            }
++            if (hv.dotIconRoot != null)
++            {
++                bool show = dotMag > 0;
++                if (hv.dotIconRoot.activeSelf != show) hv.dotIconRoot.SetActive(show);
++                if (show && hv.dotLabel != null) hv.dotLabel.text = dotMag.ToString();
++            }
++        }
++
+         void DisposeHeroVisual(HeroVisual hv)
+         {
+             if (hv == null) return;
++            // dustParticles is parented under heroInstance, so destroying heroInstance disposes it too.
+             if (hv.heroCam != null) Destroy(hv.heroCam.gameObject);
+             if (hv.heroInstance != null) Destroy(hv.heroInstance);
+             if (hv.heroRT != null) { hv.heroRT.Release(); Destroy(hv.heroRT); }
+             if (hv.root != null) Destroy(hv.root.gameObject);
+         }
+ 
++        // Per-hero ground-dust ParticleSystem rendered into the same per-hero camera as the
++        // 3D model. Emission is off by default and toggled on by WalkOut/WalkInAlive while the
++        // hero is "running" between floors. The system lives on the world stage at the model's
++        // feet — the model itself doesn't translate during walk (the UI rect does), so the
++        // illusion of running comes from the particles puffing up around stationary feet plus
++        // the rect lerping across the canvas.
++        ParticleSystem BuildDustParticles(Transform parent)
++        {
++            var go = new GameObject("DustFx");
++            go.transform.SetParent(parent, false);
++            // Slight forward offset (-Z) so puffs aren't occluded by the model torso/legs.
++            go.transform.localPosition = new Vector3(0f, 0.05f, -0.25f);
++            go.transform.localRotation = Quaternion.identity;
++            // Force Default layer (0) so the per-hero camera (cullingMask = 1<<0) actually renders it,
++            // even if heroInstance lives on a custom layer.
++            go.layer = 0;
++
++            var ps = go.AddComponent<ParticleSystem>();
++            // Configure BEFORE the system auto-plays. We never call Play() here — emission is
++            // gated entirely by StartDustForAlive / StopDustAll.
++            var main = ps.main;
++            main.duration = 5f;
++            main.loop = true;
++            main.playOnAwake = false;
++            main.startLifetime = 0.6f;
++            main.startSpeed = 0.5f;
++            main.startSize = new ParticleSystem.MinMaxCurve(0.4f, 0.7f);
++            main.startColor = new Color(0.55f, 0.45f, 0.32f, 0.85f);
++            main.simulationSpace = ParticleSystemSimulationSpace.World;
++            main.gravityModifier = -0.2f;
++            main.maxParticles = 96;
++
++            var emission = ps.emission;
++            emission.enabled = false;
++            emission.rateOverTime = 40f;
++
++            var shape = ps.shape;
++            shape.shapeType = ParticleSystemShapeType.Cone;
++            shape.angle = 35f;
++            shape.radius = 0.18f;
++            shape.rotation = new Vector3(-90f, 0f, 0f);   // emit upward out of the ground
++
++            var color = ps.colorOverLifetime;
++            color.enabled = true;
++            var grad = new Gradient();
++            grad.SetKeys(
++                new[] {
++                    new GradientColorKey(new Color(0.55f, 0.45f, 0.32f), 0f),
++                    new GradientColorKey(new Color(0.7f, 0.6f, 0.45f), 1f)
++                },
++                new[] {
++                    new GradientAlphaKey(0.95f, 0f),
++                    new GradientAlphaKey(0f, 1f)
++                });
++            color.color = grad;
++
++            var size = ps.sizeOverLifetime;
++            size.enabled = true;
++            size.size = new ParticleSystem.MinMaxCurve(1f, AnimationCurve.EaseInOut(0f, 0.4f, 1f, 1.8f));
++
++            var psr = go.GetComponent<ParticleSystemRenderer>();
++            if (psr != null)
++            {
++                psr.renderMode = ParticleSystemRenderMode.Billboard;
++                psr.alignment = ParticleSystemRenderSpace.View;
++                psr.material = ResolveDustMaterial();
++                psr.sortingOrder = 100;
++            }
++
++            // Belt-and-suspenders: ensure the system isn't already emitting from the auto-play
++            // it might have done before our config landed.
++            ps.Clear();
++            return ps;
++        }
++
++        // Tries Built-in render pipeline shaders first, then falls back to Sprites/Default,
++        // then to Standard. The first one that resolves wins. Without this, ParticleSystem-
++        // Renderer ships with a null material and renders invisible (or magenta in editor).
++        Material ResolveDustMaterial()
++        {
++            string[] candidates = {
++                "Legacy Shaders/Particles/Alpha Blended",
++                "Particles/Standard Unlit",
++                "Mobile/Particles/Alpha Blended",
++                "Sprites/Default",
++                "UI/Default"
++            };
++            for (int i = 0; i < candidates.Length; i++)
++            {
++                var sh = Shader.Find(candidates[i]);
++                if (sh != null) return new Material(sh);
++            }
++            // Last-resort fallback so renderer never has null material.
++            return new Material(Shader.Find("Standard"));
++        }
++
++        void StartDustForAlive(bool[] wasAlive)
++        {
++            int n = Mathf.Min(wasAlive.Length, heroVisuals.Count);
++            for (int i = 0; i < n; i++)
++            {
++                if (!wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv == null || hv.dustParticles == null) continue;
++                var em = hv.dustParticles.emission;
++                em.enabled = true;
++                hv.dustParticles.Play();
++            }
++        }
++
++        void StopDustAll()
++        {
++            for (int i = 0; i < heroVisuals.Count; i++)
++            {
++                var hv = heroVisuals[i];
++                if (hv == null || hv.dustParticles == null) continue;
++                var em = hv.dustParticles.emission;
++                em.enabled = false;
++                hv.dustParticles.Stop(true, ParticleSystemStopBehavior.StopEmitting);
++            }
++        }
++
+         void OnDescendClicked()
+         {
+             if (isPlayingFloor) return;
++            // Synchronous lock BEFORE StopDescendTimer / StartCoroutine — closes the same-frame
++            // race between manual click and the auto-descend timer (and Bank).
++            isPlayingFloor = true;
+             StopDescendTimer();
+             ClearDamageLayer();
++            descendButton.interactable = false;
++            bankButton.interactable = false;
++            // First descend of a run (CurrentFloor==0 before BeginFloor) skips walk-out — heroes
++            // haven't been "in" any room yet. Floor 1 still gets fade + walk-in + FIGHT.
++            bool playWalkOut = run.CurrentFloor > 0;
++            StartCoroutine(FloorTransitionThenCombat(playWalkOut));
++        }
++
++        IEnumerator FloorTransitionThenCombat(bool playWalkOut)
++        {
++            // Snapshot alive state BEFORE BeginFloor so any future BeginFloor mutation can't
++            // desync visual decisions. Used by walk-out, reposition, and walk-in.
++            int n = Mathf.Min(heroVisuals.Count, run.Party.Count);
++            var wasAlive = new bool[n];
++            for (int i = 0; i < n; i++) wasAlive[i] = run.Party[i].hp > 0;
++
++            // Defensive: re-assert Defeat clip on dead heroes so they look right during walk-out.
++            for (int i = 0; i < n; i++)
++            {
++                if (wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv != null && hv.animator != null) hv.animator.Play("Defeat", 0, 1f);
++            }
++
++            float walkOffset = GetWalkOffsetY();
++
++            if (playWalkOut)
++                yield return WalkOutAlive(wasAlive, walkOffset);
++
++            yield return FadeOverlay(0f, 1f, FadeOutDuration);
++
++            // Room swap (under fully black overlay)
+             var enemies = run.BeginFloor();
+             BuildEnemyVisuals(enemies);
+             UpdateFocusVisuals();
+-            descendButton.interactable = false;
+-            bankButton.interactable = false;
+-            StartCoroutine(RunLiveCombat(enemies));
++            UpdateCounters();
++            // Reposition alive heroes to below-screen entry; leave dead heroes where they are
++            // so the slumped visual is preserved.
++            for (int i = 0; i < n; i++)
++            {
++                if (!wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv == null || hv.root == null) continue;
++                hv.root.anchoredPosition = hv.homeAnchoredPos + new Vector2(0f, -walkOffset);
++                if (hv.animator != null) hv.animator.Play("Idle", 0, 0f);
++            }
++            // Keep flashOverlay above newly built enemy visuals; force layout update so the
++            // first fade-in frame doesn't show a 1-frame pop of un-rebuilt rects.
++            if (flashOverlay != null) flashOverlay.transform.SetAsLastSibling();
++            if (fightBanner != null) fightBanner.transform.SetAsLastSibling();
++            Canvas.ForceUpdateCanvases();
++
++            yield return FadeOverlay(1f, 0f, FadeInDuration);
++
++            yield return WalkInAlive(wasAlive, walkOffset);
++
++            yield return ShowFightBanner();
++
++            // Hand off to combat. RunLiveCombat sets isPlayingFloor=true on entry and =false on
++            // exit; we yield it so the transition coroutine spans the full floor.
++            yield return RunLiveCombat(enemies);
++        }
++
++        float GetWalkOffsetY()
++        {
++            if (combatPanel == null) return 800f;
++            return combatPanel.rect.height + WalkOffsetMargin;
++        }
++
++        IEnumerator WalkOutAlive(bool[] wasAlive, float walkOffset)
++        {
++            int n = wasAlive.Length;
++            var starts = new Vector2[n];
++            for (int i = 0; i < n; i++)
++            {
++                if (heroVisuals[i] != null && heroVisuals[i].root != null)
++                    starts[i] = heroVisuals[i].root.anchoredPosition;
++            }
++            StartDustForAlive(wasAlive);
++            // 2x toggle accelerates the walk too (duration / SpeedMultiplier).
++            float duration = WalkOutDuration / Mathf.Max(0.01f, SpeedMultiplier);
++            float t = 0f;
++            while (t < duration)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / duration);
++                for (int i = 0; i < n; i++)
++                {
++                    if (!wasAlive[i]) continue;
++                    var hv = heroVisuals[i];
++                    if (hv == null || hv.root == null) continue;
++                    hv.root.anchoredPosition = starts[i] + new Vector2(0f, walkOffset * u);
++                }
++                yield return null;
++            }
++            StopDustAll();
++        }
++
++        IEnumerator WalkInAlive(bool[] wasAlive, float walkOffset)
++        {
++            int n = wasAlive.Length;
++            var starts = new Vector2[n];
++            for (int i = 0; i < n; i++)
++            {
++                if (heroVisuals[i] != null && heroVisuals[i].root != null)
++                    starts[i] = heroVisuals[i].root.anchoredPosition;
++            }
++            StartDustForAlive(wasAlive);
++            float duration = WalkInDuration / Mathf.Max(0.01f, SpeedMultiplier);
++            float t = 0f;
++            while (t < duration)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / duration);
++                for (int i = 0; i < n; i++)
++                {
++                    if (!wasAlive[i]) continue;
++                    var hv = heroVisuals[i];
++                    if (hv == null || hv.root == null) continue;
++                    hv.root.anchoredPosition = Vector2.Lerp(starts[i], hv.homeAnchoredPos, u);
++                }
++                yield return null;
++            }
++            StopDustAll();
++            // Snap to exact home — avoids float drift after lerp.
++            for (int i = 0; i < n; i++)
++            {
++                if (!wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv != null && hv.root != null)
++                    hv.root.anchoredPosition = hv.homeAnchoredPos;
++            }
++        }
++
++        IEnumerator FadeOverlay(float fromAlpha, float toAlpha, float duration)
++        {
++            if (flashOverlay == null) yield break;
++            // Force black for the room-swap fade. flashOverlay is reused for damage flashes,
++            // but those set their own RGB before flashing, so leaving it black is harmless.
++            var c = flashOverlay.color;
++            c.r = 0f; c.g = 0f; c.b = 0f; c.a = fromAlpha;
++            flashOverlay.color = c;
++            float t = 0f;
++            while (t < duration)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / duration);
++                c.a = Mathf.Lerp(fromAlpha, toAlpha, u);
++                flashOverlay.color = c;
++                yield return null;
++            }
++            c.a = toAlpha;
++            flashOverlay.color = c;
++        }
++
++        // Plays the cast banner for one ability: portrait + display name + 1s real-time pause.
++        // Caller (RunLiveCombat) yields on this coroutine, blocking the combat tick loop for its
++        // full duration. Cast EFFECTS are applied BEFORE this coroutine is yielded — so the
++        // target's HP/mana bars already reflect the cast when the banner punches in (visual
++        // coherence). This coroutine is presentation-only and never mutates combat state.
++        IEnumerator ShowCastBanner(int casterSlotIdx, string abilityId)
++        {
++            // Resolve display payload. Fallbacks handle: missing portrait → colored block in
++            // hero's HeroData.color; unknown abilityId → "???" (matches spec §5.5 failure rule).
++            HeroData hero = (run != null && casterSlotIdx >= 0 && casterSlotIdx < run.PartyData.Count)
++                ? run.PartyData[casterSlotIdx] : null;
++            Sprite portrait = (meta != null && hero != null) ? meta.GetPortrait(hero.id) : null;
++            var def = AbilityRegistry.Get(abilityId);
++            string displayName;
++            if (def == null || string.IsNullOrEmpty(def.displayName) || def.displayName == "None")
++                displayName = "???";
++            else
++                displayName = def.displayName;
++
++            if (castBannerPortrait != null)
++            {
++                if (portrait != null)
++                {
++                    castBannerPortrait.sprite = portrait;
++                    castBannerPortrait.color = Color.white;
++                    castBannerPortrait.gameObject.SetActive(true);
++                    if (castBannerPortraitFallback != null)
++                        castBannerPortraitFallback.gameObject.SetActive(false);
++                }
++                else
++                {
++                    castBannerPortrait.gameObject.SetActive(false);
++                    if (castBannerPortraitFallback != null)
++                    {
++                        castBannerPortraitFallback.color = hero != null ? hero.color : new Color(0.5f, 0.5f, 0.5f, 1f);
++                        castBannerPortraitFallback.gameObject.SetActive(true);
++                    }
++                }
++            }
++            if (castBannerName != null) castBannerName.text = displayName.ToUpperInvariant();
++
++            isCastBannerActive = true;
++            if (castBannerInputBlocker != null) castBannerInputBlocker.gameObject.SetActive(true);
++
++            if (castBannerRoot == null)
++            {
++                yield return new WaitForSecondsRealtime(CastBannerInTime + CastBannerHold + CastBannerOut);
++                if (castBannerInputBlocker != null) castBannerInputBlocker.gameObject.SetActive(false);
++                isCastBannerActive = false;
++                yield break;
++            }
++
++            castBannerRoot.gameObject.SetActive(true);
++            castBannerRoot.SetAsLastSibling();
++
++            // Punch-in: scale 1.4 → 1.0, alpha 0 → 1
++            float t = 0f;
++            while (t < CastBannerInTime)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / CastBannerInTime);
++                castBannerRoot.localScale = Vector3.Lerp(new Vector3(1.4f, 1.4f, 1f), Vector3.one, u);
++                SetCastBannerAlpha(u);
++                yield return null;
++            }
++            castBannerRoot.localScale = Vector3.one;
++            SetCastBannerAlpha(1f);
++
+
+Sprite files (binários):
+- Assets/Resources/StatusIcons/dot.png (1024x1024 RGBA, GUID a81f8ccb701f4bf3ba953b3a4eadc4a9)
+- Assets/Resources/StatusIcons/shield.png (1024x1024 RGBA, GUID 1dafefe448fc44c68f9c1048291b9bdc)
+- .meta files com textureType=8 (Sprite), maxTextureSize=256, alphaIsTransparency=1
+
+══════════════════════════════════════════════════════════════════
+DELIVERABLE
+══════════════════════════════════════════════════════════════════
+
+Cada modelo: review tight. Cite arquivo:linha. Cobrir:
+- §1 Bugs / regressões (lifecycle, null deref, stale state)
+- §2 Race conditions ou ordering issues no fluxo de combat
+- §3 Sprite import / Resources lifecycle
+- §4 Edge cases (KO, magnitude=0, drain during attack, leftover entre floors)
+- §5 Performance
+- §6 Sugestões mínimas (sem scope creep)
+
+End com **APPROVE** / **APPROVE_WITH_NITS** / **REJECT** + 1 frase de justificativa.

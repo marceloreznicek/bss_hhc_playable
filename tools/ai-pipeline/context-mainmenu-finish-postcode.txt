@@ -1,0 +1,211 @@
+TAREFA POSTCODE: Validar a aplicação dos 5 itens pendentes da Main Menu Mockup B já implementados. Confirmar zero regressões e zero novos bugs.
+
+## CONTEXTO
+- Cena Prototype.unity tem agora MainMenuCanvas estático (Mockup B mobile RPG) já construído via MCP.
+- UIController.cs (3121 linhas) foi editado para parar de instanciar mainMenuPanel runtime.
+- 5 itens da round precode foram aplicados conforme consenso (Opção C / B / D / soft_blob / child border ring).
+
+## DIFFS APLICADOS
+
+### 1. UIController.cs — fields novos (linha ~26)
+```csharp
+[SerializeField] GameObject staticMainMenuCanvas;
+[SerializeField] Button staticDiveButton;
+[SerializeField] Button staticPartyButton;
+bool staticMainMenuWired;
+```
+
+### 2. UIController.Awake — adicionada chamada
+```csharp
+BuildCanvas();
+BuildDungeonSelect();
+BuildMainMenu();      // ← agora vazio
+BuildRoster();
+BuildCombat();
+WireStaticMainMenu(); // ← novo
+```
+
+### 3. UIController.WireStaticMainMenu (novo método)
+```csharp
+void WireStaticMainMenu()
+{
+    if (staticMainMenuCanvas == null)
+    {
+        var go = GameObject.Find("MainMenuCanvas");
+        if (go != null) staticMainMenuCanvas = go;
+    }
+    if (staticMainMenuCanvas == null) return;
+
+    if (staticDiveButton == null)
+    {
+        var t = staticMainMenuCanvas.transform.Find("DiveCenter/DiveButton");
+        if (t != null) staticDiveButton = t.GetComponent<Button>();
+    }
+    if (staticPartyButton == null)
+    {
+        var t = staticMainMenuCanvas.transform.Find("Navbar/NavParty");
+        if (t != null) staticPartyButton = t.GetComponent<Button>();
+    }
+
+    if (staticMainMenuWired) return;
+    if (staticDiveButton != null)
+    {
+        staticDiveButton.onClick.RemoveAllListeners();
+        staticDiveButton.onClick.AddListener(OnEnterDungeonClicked);
+    }
+    if (staticPartyButton != null)
+    {
+        staticPartyButton.onClick.RemoveAllListeners();
+        staticPartyButton.onClick.AddListener(OnEnterDungeonClicked);
+    }
+    staticMainMenuWired = true;
+}
+```
+
+### 4. BuildMainMenu — esvaziado
+```csharp
+void BuildMainMenu()
+{
+    // Main menu is authored in Prototype.unity (MainMenuCanvas, Mockup B).
+    // Skip the legacy runtime build — wiring happens in WireStaticMainMenu.
+}
+```
+
+### 5. ShowScreen — null-safe + roteia para canvas estático
+```csharp
+void ShowScreen(Screen s)
+{
+    currentScreen = s;
+    if (dungeonSelectPanel != null) dungeonSelectPanel.gameObject.SetActive(s == Screen.DungeonSelect);
+    if (staticMainMenuCanvas != null) staticMainMenuCanvas.SetActive(s == Screen.MainMenu);
+    else if (mainMenuPanel != null) mainMenuPanel.gameObject.SetActive(s == Screen.MainMenu);
+    if (rosterPanel != null) rosterPanel.gameObject.SetActive(s == Screen.Roster);
+    if (combatPanel != null) combatPanel.gameObject.SetActive(s == Screen.Combat);
+}
+```
+
+### 6. RefreshMainMenu — null-safe
+```csharp
+void RefreshMainMenu()
+{
+    if (mainMenuStatus == null && menuEnterDungeonBtn == null) return;
+    var party = meta.GetParty();
+    string partyText = "Party: " + (party.Count == 0 ? "<color=#ff6464>(none — pick one!)</color>" : "");
+    for (int i = 0; i < party.Count; i++)
+    {
+        if (i > 0) partyText += ", ";
+        partyText += $"{party[i].heroName} L{party[i].level}";
+    }
+    if (mainMenuStatus != null)
+        mainMenuStatus.text =
+            partyText + "\n" +
+            $"Banked total: {meta.metaGold} gold\n" +
+            $"Runs: {meta.totalRuns}   Deepest: F{meta.deepestFloor}";
+    if (menuEnterDungeonBtn != null)
+        menuEnterDungeonBtn.interactable = party.Count > 0;
+}
+```
+
+### 7. Novo arquivo Assets/Prototype/Scripts/UIPulse.cs
+```csharp
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace DiverDungeon.Prototype
+{
+    [RequireComponent(typeof(RectTransform))]
+    public class UIPulse : MonoBehaviour
+    {
+        [SerializeField] float duration = 2.4f;
+        [SerializeField] float minScale = 0.85f;
+        [SerializeField] float maxScale = 1.25f;
+        [SerializeField] float startAlpha = 0.7f;
+        [SerializeField] float endAlpha = 0f;
+        [SerializeField, Range(0f, 1f)] float phaseOffset = 0f;
+
+        Graphic graphic;
+        RectTransform rt;
+        float baseAlpha;
+
+        void Awake()
+        {
+            rt = (RectTransform)transform;
+            graphic = GetComponent<Graphic>();
+            if (graphic != null) baseAlpha = graphic.color.a;
+        }
+
+        void OnEnable() => ApplyAt(phaseOffset);
+
+        void Update()
+        {
+            float t = Mathf.Repeat(Time.unscaledTime / duration + phaseOffset, 1f);
+            ApplyAt(t);
+        }
+
+        void ApplyAt(float t)
+        {
+            float s = Mathf.Lerp(minScale, maxScale, t);
+            rt.localScale = new Vector3(s, s, 1f);
+            if (graphic != null)
+            {
+                var c = graphic.color;
+                c.a = Mathf.Lerp(startAlpha, endAlpha, t);
+                graphic.color = c;
+            }
+        }
+    }
+}
+```
+
+### 8. Cena Prototype.unity — mudanças via MCP
+- `PulseRing1`: addComponent UIPulse (phaseOffset=0)
+- `PulseRing2`: addComponent UIPulse (phaseOffset=0.5)
+- `AtmosphereGold/Red/Purple`: sprite trocada para `Assets/UI/Sprites/soft_blob.png`; alpha ajustado (0.45/0.40/0.55)
+- `PlayFab`: removida componente Outline
+- Novo `PlayFab_BorderRing` criado como filho de NavPlay (siblingIndex=0, atrás do PlayFab):
+  - Image circle_solid.png, color #0e0a1f, sizeDelta 62×62, anchoredPosition (0, 22)
+
+### 9. Buttons wiring
+- `MainMenuCanvas/DiveCenter/DiveButton` → `OnEnterDungeonClicked` (via WireStaticMainMenu)
+- `MainMenuCanvas/Navbar/NavParty` → `OnEnterDungeonClicked` (via WireStaticMainMenu)
+
+## COMPILAÇÃO
+- Unity refresh: OK, zero erros, zero warnings.
+
+## PERGUNTAS DE VALIDAÇÃO
+
+### Para GPT-5.5 (triagem rápida)
+1. Há regressão óbvia em alguma das 4 telas (DungeonSelect, MainMenu, Roster, Combat)?
+2. Algum spot onde mainMenuPanel ainda é dereferenciado sem null-check?
+
+### Para GPT-5.5 (reasoning)
+1. WireStaticMainMenu é idempotente? Pode ser chamado múltiplas vezes sem inscrever onClick duas vezes?
+2. Em `ReturnToMainMenu()` (linha 2768) há chamada para `RefreshMainMenu()` — com mainMenuStatus null no canvas estático, RefreshMainMenu retorna cedo. Isso significa que os chips do canvas estático (Gold/Deepest/Runs) NÃO são atualizados pelo gameplay. Aceitável por enquanto (placeholder values) ou bloqueante?
+3. UIPulse usa `Time.unscaledTime` — ok pra UI mesmo com timeScale=0 (pause)?
+
+### Para Gemini 3.1 Pro (análise de impacto)
+1. A flag `staticMainMenuWired` impede dupla inscrição de onClick. Mas se a cena for descarregada e recarregada, a flag persiste no UIController? Se UIController está em DontDestroyOnLoad, sim — e os Button refs ficam zumbi.
+2. UIPulse altera `graphic.color.a` toda frame — isso causa Canvas rebuild a cada frame? Custo de SetVerticesDirty?
+3. PlayFab_BorderRing como sibling 0 garante que renderiza ATRÁS de PlayFab? Confirmar regra uGUI.
+
+### Para Grok 4.20 (cross-file exaustivo)
+1. Existe algum outro consumidor de `mainMenuPanel`, `mainMenuStatus`, `menuEnterDungeonBtn`, `menuEnterDungeonLabel` no UIController.cs ou em outros arquivos?
+2. `OnEnterDungeonClicked` é chamado por DIVE e PARTY — ambos vão para Roster screen. Isso é o comportamento desejado pra PARTY ou PARTY deveria ir para uma tela diferente?
+3. Após desligar BuildMainMenu, há algum lugar que chama `BuildMainMenu()` esperando que crie referências? grep no projeto.
+
+### Para MiniMax M2.7 (QA planner)
+1. Smoke test: sequência de cliques pra validar:
+   - Boot → DungeonSelect aparece (default)
+   - Clicar para voltar ao MainMenu → MainMenuCanvas aparece, sem duplicação
+   - Clicar DIVE → vai para Roster
+   - Clicar PARTY no navbar → vai para Roster
+   - Clicar BACK em Roster → volta a MainMenu sem NRE
+   - Iniciar run, terminar (wipe ou banked) → ReturnToMainMenu → MainMenuCanvas mostra (pulse rings continuam tocando? state limpo?)
+2. Cenário borda: desligar e ligar CanvasGroup do MainMenuCanvas — UIPulse continua atualizando?
+
+### Para MiMo V2.5 Pro (PR description)
+Escreva um PR description curto (3-5 bullets) descrevendo o que mudou e por quê.
+
+## OBJETIVO
+- Aprovar OR sinalizar bug concreto.
+- Critério: zero regressão + zero novo bug. Polish visual pode ser fine-tune posterior.

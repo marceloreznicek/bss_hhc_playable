@@ -1,0 +1,462 @@
+TAREFA: você é o consolidador multi-agente. Receba os 8 pareceres da ETAPA 1 (precode) sobre a feature 'Multiple Dungeons' do DiverDungeon e consolide em um plano único acionável.
+
+Formato OBRIGATÓRIO (4 seções):
+1. **Causa raiz consolidada**
+2. **Plano priorizado** (passos numerados)
+3. **Conflitos entre IAs** (declare divergências)
+4. **Convergências** (priorizar estes)
+
+Máx 600 palavras.
+
+---
+
+## CONTEXTO ORIGINAL DO PRECODE (resumo do que as IAs revisaram)
+
+Feature: 3 dungeons (Vault/Hollow/Crypt) com focus rules (Standard/NoFocus/ForcedFocus), CSV-driven balance via Balance/balance_dungeons.csv, save migration v1→v2, Tide enemy determinístico no Crypt. Spec completo em product/specs/multiple-dungeons.md.
+
+## PARECERES DAS 8 IAs (output bruto, ETAPA 1)
+
+
+### === OPUS ===
+
+# Claude Opus 4.7
+
+- Modelo: `anthropic/claude-opus-4.7`
+
+---
+
+# Revisão Pré-Code — Multiple Dungeons
+
+## 🔴 Riscos Críticos
+
+**1. Determinismo Tide quebrado pelo `enemyCount`**
+`tideIdx = hash(dungeonId, floor) % enemyCount` — se `enemyCount` mudar entre preview e run real (ou entre patches), o tideIdx muda. Pior: em `BuildEnemiesForFloor`, o count depende de `EnemyCountBase/Step` que vêm do CSV — **qualquer rebalance invalida replays/previews em flight**.
+→ **Sugestão:** `tideIdx = hash(dungeonId, floor) % enemyCount` é OK pra runtime, mas NUNCA derive de outro lugar. Centralize numa função pura `GetTideIdx(dungeonId, floor, count)` chamada por Build E Preview. Garanta que `PreviewNextFloor` use EXATAMENTE o mesmo `BuildEnemiesForFloor` (passe a lista construída, não reconstrua).
+
+**2. Race: `EvaluateUnlocks()` vs `OnRunBanked`**
+Se `RecordRunEnd` atualiza `deepestFloorByDungeon` e depois dispara `OnRunBanked` → UI navega pro Dungeon Select que chama `EvaluateUnlocks()`. Se a ordem inverter (callback antes do save), novo dungeon não aparece até próxima abertura.
+→ **Sugestão:** `RecordRunEnd` deve: (1) update state, (2) `EvaluateUnlocks()`, (3) `Save()`, (4) SÓ ENTÃO disparar callback. Torne isso explícito no código.
+
+**3. JsonUtility + Dictionary/HashSet**
+Já mencionado no spec, mas reforço: `JsonUtility` também não serializa `Dictionary` em field público. Use `List<string> dungeonsUnlocked` + `List<DungeonProgress>` com `[Serializable]`. Rebuild dos dicts em `Load()`. **Cuidado com duplicatas no load** (save corrupto pode ter 2 entries pro mesmo id → último vence, logue warning).
+
+**4. `deepestFloor` global como getter derivado**
+PM-default diz "vira getter derivado". Mas migração v1→v2 seta `deepestFloorByDungeon["vault"] = deepestFloor`. OK. Porém: depois da migração, se algum código legado escrever em `deepestFloor` (o field), drift silencioso.
+→ **Remova o field**. Só getter: `public int DeepestFloor => deepestFloorByDungeon.Values.DefaultIfEmpty(0).Max();`. Grep por write-sites.
+
+## 🟡 Overengineering / Simplificações
+
+**5. CSV-loader com `[InitializeOnLoad]` + runtime fallback**
+Duas fontes de verdade (CSV vs SO gerado) = bugs de "editei CSV mas esqueci de reimportar". Para protótipo:
+→ **Simplifique:** loader edit-time apenas, via menu item `Tools/Reimport Balance CSV`. Runtime lê SO. Zero fallback runtime (SO faltando = erro duro em dev, impossível em build).
+
+**6. `DungeonRule` struct vs enum + lookup**
+Passar struct por combate resolver é fine, mas não invente 3 enums. Só:
+```csharp
+public struct DungeonRule {
+    public FocusRule focusRule;  // Standard, NoFocus, ForcedFocus
+    public int tideIdx;          // -1 se não aplicável
+    public float misFocusMult;   // 1.0 se não aplicável
+}
+```
+`Standard` = `tideIdx=-1, mult=1.0`. Uma só code path.
+
+## 🟢 Edge Cases Específicos
+
+**7. Crypt floor 1 com `enemyCount==1`**
+Tide é o único inimigo → mis-focus impossível (focus=0=tide sempre, ou focus=-1 mata ele). Verifique `enemyCountBase >= 2` para Crypt no CSV, ou clampe.
+
+**8. Tide morre mid-floor**
+Spec diz "enquanto Tide vivo". Post-morte, penalty off. Confirme que `CombatResolver` re-checa `enemies[tideIdx].hp > 0` **a cada tick de ataque inimigo**, não só no início.
+
+**9. Focus em enemy que não é Tide, depois Tide morre**
+Penalty some, mas `focusIdx` continua apontando pro não-tide. Correto pelo spec? Sim (mis-focus penalty só existe com Tide vivo). OK, só documente.
+
+**10. "New" badge clear timing**
+Spec: "limpa após visualização OU após rodar". "Visualização" = abriu Dungeon Select e viu o card? Ou hover/tap? Ambíguo. Default seguro: limpa ao entrar no Roster daquele dungeon.
+
+## 📋 Ordem Sugerida (minimiza retrabalho)
+
+1. Save v1→v2 migration + novos campos MetaState (isolado, testável)
+2. CsvLoader + DungeonDefinition/Registry (sem toc
+
+
+### === SONNET ===
+
+# Claude Sonnet 4.6
+
+- Modelo: `anthropic/claude-sonnet-4-6`
+
+---
+
+# Revisão de Segurança — Multiple Dungeons (Rodada 1 Pré-Code)
+
+## Contexto de Ameaça
+
+Protótipo mobile, Unity 6, save em `PlayerPrefs` + JSON. Ainda sem backend. Risco real **agora** é baixo (sem IAP, sem placar público), mas as decisões de arquitetura tomadas aqui vão determinar o custo de remediar depois.
+
+---
+
+## Vetores de Ataque
+
+### 1. Save File — Cliente como Fonte de Verdade Total
+**Risco: ALTO (futuro próximo)**
+
+`PlayerPrefs` é texto puro em disco. Com GameGuardian ou simplesmente `adb pull`, qualquer jogador edita:
+```json
+{ "dungeonsUnlocked": ["vault","hollow","drowned_crypt"], "deepestFloorByDungeon": {"vault":99} }
+```
+Hollow e Crypt desbloqueados instantaneamente. Sem validação server-side, **não há mitigação real** — mas o plano não menciona nem um HMAC/checksum local.
+
+**Mitigação mínima para protótipo:** Hash do conteúdo + salt hardcoded antes de salvar. Não impede ataque avançado, mas elimina edição casual.
+```csharp
+// Antes de SetString:
+string checksum = ComputeHmac(json, SAVE_SALT);
+PlayerPrefs.SetString("save_checksum", checksum);
+// No Load: rejeita se hash não bate → fallback para defaults
+```
+
+### 2. Unlock Race Condition — `EvaluateUnlocks()` Pós-Wipe
+**Risco: MÉDIO**
+
+Fluxo: `OnRunWiped → RecordRunEnd → EvaluateUnlocks → Save`. Se `EvaluateUnlocks` lê `deepestFloorByDungeon` *antes* de `RecordRunEnd` persistir o floor atual, wipe no exato Floor 10 pode **não desbloquear Hollow**.
+
+Pior: se o jogador força-fecha o app entre `RecordRunEnd` e `Save()`, o floor fica gravado mas o unlock não. Na reabertura, `EvaluateUnlocks` não roda novamente.
+
+**Mitigação:** `EvaluateUnlocks` deve ser chamado **dentro** de `Save()`, sempre, não como evento isolado. Tornar unlock derivado dos dados brutos (computado on-read), não campo persistido separado.
+
+### 3. Tide Index — Manipulação de `focusIdx` via Memory Edit
+**Risco: MÉDIO**
+
+`tideIdx = hash(dungeonId, floor) % enemyCount` é determinístico e correto. Porém `FocusEnemyIndex` vive como campo público mutável em `RunController`. Com IL2CppDumper + GameGuardian, atacante pode:
+- Forçar `FocusEnemyIndex = tideIdx` permanentemente → zerar penalidade.
+- `enemyCount` em memória → alterar `tideIdx` calculado.
+
+Sem server-side, mitigação completa é impossível. **Registre isso como dívida técnica** antes de adicionar placar público ou recompensas vinculadas ao Crypt.
+
+### 4. `DungeonRule` struct — Injeção via CSV editado
+**Risco: BAIXO (protótipo local)**
+
+`misFocusDamageMultiplier` lido de CSV sem range check. Valor `0.0` desabilita penalidade inteira; valor negativo *cura* inimigos. Adicione validação ao loader:
+```csharp
+if (def.misFocusDamageMultiplier < 1f) 
+    Debug.LogWarning($"[Security] misFocusDamageMultiplier suspeito: {def.misFocusDamageMultiplier}");
+```
+
+---
+
+## Dívidas a Registrar (não bloqueia v1)
+
+| Item | Risco Futuro |
+|---|---|
+| Sem HMAC no save | Unlock bypass trivial quando houver gatekeeping real |
+| `EvaluateUnlocks` como evento | Race condition em crash/wipe |
+| `FocusEnemyIndex` mutável público | Memory edit elimina penalidade Crypt |
+| CSV sem validação de ranges | Config manipulation silenciosa |
+
+**Recomendação:** Abrir tickets de segurança para os itens 1 e 2 antes de qualquer feature que vincule dungeons a recompensas monetizadas ou rankings públicos. O plano atual é aceitável para protótipo fechado.
+
+
+### === GPT53-CODEX ===
+
+# GPT-5.3 Codex
+
+- Modelo: `openai/gpt-5.3-codex`
+
+---
+
+(1) Análise passo-a-passo da lógica  
+1) Núcleo determinístico: hoje combate depende de `(party,enemies,focusIdx,seed)`. Com dungeons, preserve isso via `RunContext` imutável por run (`dungeonId`, curva, regra de focus).  
+2) `BeginFloor` e `PreviewNextFloor` precisam usar o MESMO pipeline: mesmo `enemyCount`, mesmo `tideIdx`, mesmo seed derivado dos mesmos inputs.  
+3) `tideIdx = hash(dungeonId,floor)%enemyCount` é bom, mas só se hash for estável cross-run/cross-platform.  
+4) Persistência: `RecordRunEnd(id, floor, gold)` deve atualizar deepest por dungeon + unlocks + badges em uma transação lógica única antes de `Save()`.  
+5) Migração v1→v2: mapear `deepestFloor` antigo para `vault`, inicializar coleções vazias, sanitizar ids contra registry carregado.
+
+(2) Casos onde falha  
+- Determinismo quebrado se usar `string.GetHashCode()` no hash do Tide (não confiável entre sessões/runtime).  
+- TOCTOU em meta: `RecordRunEnd()` salva, depois `EvaluateUnlocks()` salva de novo; pode perder `seenJustUnlocked` ou unlock recém-calculado em crash entre chamadas.  
+- `FocusEnemyIndex` “vaza” entre runs/dungeons se não resetar em `StartRun`/`BeginFloor`; em Hollow deveria ser sempre ignorado e botão oculto.  
+- Off-by-one de floorReached: se `CurrentFloor++` em `BeginFloor`, wipe logo ao entrar pode contar floor indevidamente; precisa definição única de “reached”.  
+- Overflow/instabilidade: `RoundToInt(base * Pow(growth, floor-1))` pode estourar em floors altos; clamp obrigatório.  
+- Loader: `Balance/*.csv` fora de `Assets` pode falhar em build/runtime; plano de fallback precisa caminho explícito.  
+- Overengineering: gerar 1 SO por dungeon + registry + fallback runtime já na v1 aumenta superfície de bug para protótipo.
+
+(3) Correção proposta  
+- Simplificar: um `DungeonRegistry` único (JSON/CSV carregado em runtime + opcional bake editor), sem gerar múltiplos SO por dungeon agora.  
+- Implementar hash estável (ex. FNV-1a) para `tideIdx`.  
+- Criar `FinalizeRunTransaction(...)` em `MetaState`: atualiza deepest, unlocks, `seenJustUnlocked`, gold e faz um único `Save()`.  
+- Reset explícito: `FocusEnemyIndex=-1` em `StartRun` e a cada `BeginFloor`.  
+- Definir contrato de floorReached e testar.  
+- Ordem de implementação: (a) modelo/migração save + testes, (b) `CombatResolver` com `DungeonRule`, (c) `RunController` determinístico preview/real, (d) UI, (e) loader CSV.  
+- Regressão: Vault com stats/rule padrão deve reproduzir exatamente comportamento antigo.
+
+
+### === QWEN ===
+
+# Qwen 3.6 Plus
+
+- Modelo: `qwen/qwen3.6-plus`
+
+---
+
+**Abordagem & Riscos de Manutenção**
+- `CsvLoader` com `[InitializeOnLoad]` gerando `.asset` em edit-time é **overengineering e anti-padrão para protótipo**. Cria merge conflicts em Git, quebra CI/CD e duplica a verdade entre CSV e SOs. **Alternativa:** Parser runtime simples que popula `Dictionary<string, DungeonDef>` ou `List`. Mantém CSV como única fonte, zero assets gerados, fácil de iterar.
+- `CombatResolver` receber `focusIdx` por referência e mutar para `-1` em `NoFocus` acopla estado de jogo à regra de dungeon. Passe um `DungeonFocusRule` enum e resolva o target *dentro* do loop, sem alterar `RunController.FocusEnemyIndex`.
+
+**Determinismo & Edge Cases (Tide)**
+- `hash(dungeonId, floor) % enemyCount` é **instável** se `enemyCount` variar entre preview e cálculo real, ou se `GetHashCode()` não for determinístico entre sessões/compilações. Use um hash explícito (ex: `FNV1a` ou `System.Numerics.HashCode`) e calcule `enemyCount` *antes* do hash, garantindo que preview e run compartilhem a mesma função pura. Se `tideIdx >= realCount`, fallback para `0`.
+- `PreviewNextFloor` deve recriar exatos `EnemyStats` e `Tide` sem ler/modificar estado de `RunController`. Isole a lógica em `DungeonProfile.GenerateFloor(floor)`.
+
+**Save Migration & JsonUtility**
+- Shim com listas paralelas (`List<string>` + `List<int>`) é propenso a *index drift*. Prefira: `public class DungeonProgressEntry { public string id; public int maxFloor; }` + `List<DungeonProgressEntry>`. Valide IDs únicos no load; remova duplicatas silenciosamente.
+- Migração v1→v2 está correta, mas adicione `if (version > 2) LogWarning("Future save, graceful fallback")` para evitar crash em betas futuras.
+
+**Ordem de Implementação (Minimiza retrabalho)**
+1. CSV runtime parser + `DungeonDef`/`DungeonProfile` (dados puros)
+2. `MetaState` v2 + wrapper serializável + migration
+3. `RunController.StartRun(dungeon)` + `CombatResolver` com regras injetadas (validar preview ≡ run)
+4. UI Select + fluxo Bank/Wipe → Select
+Essa sequência isola persistência antes de tocar em combate, e evita refazer UI enquanto a estrutura de tuning muda.
+
+**Validação**
+- Nenhuma regressão se `CombatResolver` permanecer pura função e `RunController` apenas orquestrar.
+- `TuningConfig` global deve ser depreciado gradualmente para hero stats; dungeon stats vêm do registry.
+- Mantenha `seed` explícito e não dependa de `Random.state` para simulação.
+
+
+### === GEMINI-FLASH ===
+
+# Gemini 3 Flash
+
+- Modelo: `google/gemini-3-flash-preview`
+
+---
+
+Aqui estão os insights para a feature **Multiple Dungeons**, focando em UX, resiliência de dados e determinismo:
+
+### 1. O "Tide-Desync" no Preview
+O maior risco de determinismo está no `PreviewNextFloor`. Se o `tideIdx` for calculado apenas no `BeginFloor`, o preview pode prever uma vitória baseada em um inimigo comum, mas a realidade da floor apresentar um Tide (com 3x HP) no slot errado, causando um wipe inesperado.
+**O pulo do gato:** O `CombatResolver` não deve apenas receber o `tideIdx`, mas a lógica de seleção do Tide deve ser uma função estática pura baseada *apenas* na Seed da floor. O Preview e o Run Real **precisam** chamar a mesma função `TideCalculator.GetIndex(seed, enemyCount)`.
+
+### 2. O Gargalo do JsonUtility + Collections
+`JsonUtility` não falha silenciosamente com `Dictionary`; ele simplesmente ignora os campos, o que matará o save migration v1 -> v2 (o progresso do Vault será perdido se não houver cuidado).
+**Sugestão de Arquitetura:** Use `[Serializable]` em uma `List<DungeonProgressEntry>`. No `OnAfterDeserialize` (via `ISerializationCallbackReceiver`), popule um Dictionary em runtime para busca O(1). Isso evita o overengineering de bibliotecas externas (Newtonsoft) e mantém a performance no Unity 6.
+
+### 3. Feedback Visual: A "Armadilha do Foco"
+Em *Drowned Crypt*, o multiplicador de +50% de dano pode parecer um bug de balanceamento para o jogador se não houver feedback imediato.
+**Insight de UX:** Não use apenas um tooltip sutil. Quando `focusIdx != tideIdx`, os inimigos devem emitir um feedback visual agressivo (ex: glow vermelho, ícone de espada pulsante sobre a cabeça) no momento em que atacam. O jogador precisa sentir que *ele* causou o buff dos inimigos por uma escolha errada.
+
+### 4. Race Condition: Unlock vs. Navigation
+Há um risco de UI na ordem: `RecordRunEnd` -> `EvaluateUnlocks` -> `ReturnToDungeonSelect`. Se a animação de retorno ocorrer antes do Save persistir, o "New Badge" pode não aparecer ou o card continuar travado.
+**Simplificação:** O `MetaState` deve disparar um `Action OnUnlocksEvaluated`. O `DungeonSelectScreen` só deve dar o "Show" após a confirmação de que o arquivo de save foi escrito em disco (`File.WriteAllText` após o `PlayerPrefs.Save()` se for o caso), garantindo que o estado visual esteja sempre em sync com o disco.
+
+### 5. Ordem de Implementação Proposta
+1. **Model & Migration:** Implementar a estrutura de dados v2 e garantir que o `deepestFloor` antigo migre para `deepestFloorByDungeon["vault"]`.
+2. **Logic Core:** Integrar `DungeonRule` no `CombatResolver` (é o coração funcional).
+3. **CSV Loader:** Implementar por último, usando os SOs criados manualmente como primeiro teste de stress.
+
+
+### === KAT ===
+
+# KAT Coder Pro V2
+
+- Modelo: `kwaipilot/kat-coder-pro-v2`
+
+---
+
+## Análise de Riscos e Sugestões - Round 1
+
+### 🚨 **Riscos Críticos**
+
+**1. Determinismo do Tide Enemy**
+O cálculo `tideIdx = hash(dungeonId, floor) % enemyCount` é problemático porque `enemyCount` varia por dungeon (Hollow tem mais inimigos). Se o hash for baseado apenas em `(dungeonId, floor)`, o índice pode apontar para inimigo que não existe em dungeons com menos inimigos. **Solução**: incluir `dungeon.enemyCountBase` no hash ou usar `(floor * 31 + dungeon.sortIndex) % enemyCount`.
+
+**2. Save Migration com JsonUtility**
+`JsonUtility` não serializa `Dictionary<string,int>` nem `HashSet<string>`. O plano menciona isso mas não detalha o shim. **Sugestão concreta**:
+
+```csharp
+[Serializable]
+public class DungeonProgress { public string id; public int deepest; }
+
+[Serializable] 
+class SaveBundleV2 {
+    public List<DungeonProgress> dungeonProgress = new();
+    public List<string> dungeonsUnlocked = new() { "vault" };
+    // ...
+}
+```
+
+**3. Race Condition em `EvaluateUnlocks()`**
+Se `RecordRunEnd()` chamar `EvaluateUnlocks()` e esta modificar `dungeonsUnlocked` durante o callback `OnRunBanked`, pode haver inconsistência. **Solução**: separar em `RecordRunEnd()` (apenas dados) e `EvaluateUnlocks()` (chamado explicitamente após UI updates).
+
+### 🏗️ **Crítica de Arquitetura**
+
+**Overengineering no CSV Loader**
+Criar SOs em edit-time via `[InitializeOnLoad]` é complexo e frágil. **Simplificação**: ler CSV direto em runtime no `DungeonRegistry.Awake()` (uma vez por sessão). Mantém designer editando CSV e evita sincronia Unity-AssetDatabase.
+
+**Acoplamento RunController ↔ DungeonDefinition**
+`RunController` não deve conhecer `DungeonDefinition` diretamente. **Sugestão**: extrair `IDungeonTuning` interface:
+
+```csharp
+public interface IDungeonTuning {
+    float EnemyHpBase { get; }
+    float EnemyHpGrowth { get; }
+    // ... todos os parâmetros de curva
+}
+```
+
+`RunController` recebe `IDungeonTuning` no `StartRun()`. `DungeonDefinition` implementa a interface.
+
+### 🔧 **Edge Cases Não Cobertos**
+
+- **Party Select após unlock**: se jogador desbloqueia Crypt durante run (clear Vault 20), volta pro Dungeon Select mas o card Crypt pode não estar atualizado até reload da cena.
+- **Focus Button em Hollow**: esconder botão não basta — precisa também ignorar input de focus set via código (algum script pode chamar `SetFocus()` por engano).
+- **Tide Enemy morto antes do focus change**: penalty deve desaparecer imediatamente quando Tide morre, mesmo que `focusIdx` ainda aponte para slot inválido.
+
+### 📋 **Ordem de Implementação Sugerida**
+
+1. **MetaState v2** (save migration primeiro — é o foundation)
+2. **DungeonRegistry + IDungeonTuning** (leitura CSV runtime, sem SO)
+3. **RunController parametrizado** (aceita `IDungeonTuning`)
+4. **CombatResolver com DungeonRule** (struct imutável)
+5. **Dungeon Select UI** (último — depende de tudo acima)
+
+### ✅ **Validação de Não-Regressão**
+
+- **Testes existentes** devem continuar passando se `RunController.StartRun(party)` for mantido como overload que usa `TuningConfig` default.
+- **Combat determinism**: garantir que `PreviewNextFloor()` e `BeginFloor()` usem **exatamente** a mesma seed e parâmetros.
+
+### 💡 **Simplificação Final**
+
+Remover `anchorEnemyHpMultiplier` e `misFocusDamageMultiplier` do CSV por enquanto — usar constants hardcoded (`3.0f`, `1.5f`). São valores de design que não mudam entre dungeons (só Crypt usa) e adicionam complexidade desnecessária no v1.
+
+---
+
+**Próximo passo**: aguardo aprovação para prosseguir com código ou ajustes no plano.
+
+
+### === GPT55 ===
+
+# GPT-5.5 (co-coder)
+
+- Modelo: `openai/gpt-5.5`
+
+---
+
+Principais riscos/ajustes antes de codar:
+
+1. **CSV loader edit-time + runtime fallback pode virar overengineering agora**
+   - Para v1, eu evitaria `[InitializeOnLoad]` se ainda não há pipeline de assets estável. Em Unity, gerar/alterar SO em domain reload pode causar dirty assets inesperados, path issues em CI, e bugs difíceis.
+   - Sugestão: implementar primeiro um loader runtime/editor simples que lê CSV via `File.ReadAllText` em Editor e/ou `Resources/TextAsset` depois. Se o objetivo imediato é prototype, até um `DungeonRegistry` manual + CSV parser testável já reduz risco. O loader automático pode ser fase 2.
+   - Se mantiver SO gerado, garantir validação forte: IDs únicos, sortIndex único/estável, enum parse case-insensitive, defaults para campos vazios, log de erro por linha.
+
+2. **Determinismo Tide precisa ser centralizado**
+   - Não deixar `PreviewNextFloor()` e `BeginFloor()` calcularem Tide separadamente com lógica duplicada.
+   - Criar uma função única, pura:
+```csharp
+public static int GetTideIndex(string dungeonId, int floor, int enemyCount)
+{
+    if (enemyCount <= 0) return -1;
+    unchecked
+    {
+        int hash = 17;
+        foreach (char c in dungeonId)
+            hash = hash * 31 + c;
+        hash = hash * 31 + floor;
+        return Mathf.Abs(hash == int.MinValue ? 0 : hash) % enemyCount;
+    }
+}
+```
+   - Não usar `string.GetHashCode()`: não é garantido estável entre runtimes/processos. Isso quebraria preview/save/replay determinístico.
+
+3. **CombatResolver não deve depender de DungeonDefinition/SO**
+   - Boa ideia usar struct DTO puro (`DungeonRule`). Manter resolver livre de Unity assets.
+   - Cuidado com `focusIdx != tideIdx`: se `focusIdx` aponta inimigo morto ou inválido, deve contar como mis-focus enquanto Tide vivo. Isso bate spec.
+   - Multiplicador por tick deve ser aplicado no momento do ataque inimigo, não mutar `EnemyStats.atk`, senão simulações subsequentes/reuso de lista podem acumular erro.
+
+4. **No-Focus UI e lógica**
+   - Não basta esconder/desabilitar botão. `RunController.SetFocus` deve ignorar chamada se dungeon atual é NoFocus, ou `CombatResolver` deve forçar `-1` sempre. Idealmente ambos: UI para UX, resolver para segurança/determinismo.
+
+5. **Save migration / JsonUtility**
+   - Como `JsonUtility` não serializa Dictionary/HashSet, manter runtime com `Dictionary`, mas bundle com listas.
+   - Tratar duplicatas e IDs desconhecidos na carga. Não deixar CSV removido quebrar save.
+   - `deepestFloor` global deveria virar getter `Max(deepestFloorByDungeon.Values)` ou compat field deprecated. Preservar read site antigo inicialmente reduz regressão.
+
+Exemplo de shape:
+```csharp
+[Serializable]
+public class DungeonProgressSave
+{
+    public string id;
+    public int deepestFloor;
+}
+```
+
+6. **Unlock/New badge race**
+   - `RecordRunEnd` deve atualizar deepest, avaliar unlocks, preencher `seenJustUnlocked`/`newlyUnlockedUnseen` antes de `Save()`.
+   - Nome `seenJustUnlocked` parece ambíguo: se contém vistos, o “New” precisa ser `unlocked && !seen`. Sugiro `seenUnlockedDungeons` ou `unseenNewUnlocks` para evitar bugs invertidos.
+
+7. **Floor reached semantics**
+   - `BeginFloor()` incrementa `CurrentFloor`. Se wipe durante floor 10, isso conta como reached 10. Então `RecordRunEnd(CurrentFloor, gold)` está certo. Não usar “cleared floor”.
+   - Unlock Hollow em `deepest vault >= 10`, Crypt em `>= 20`.
+
+8. **Enemy generation**
+   - `BuildEnemiesForFloor` deve receber/usar dungeon ativo, mas para preview/testes melhor expor:
+```csharp
+public List<EnemyStats> BuildEnemiesForFloor(int floor, DungeonDefinition dungeon)
+```
+   - Evita estado implícito em testes e reduz divergência preview/run.
+
+9. **Ordem sugerida**
+   1. Criar `DungeonDefinition`, `DungeonRegistry`, `FocusRule`, `DungeonRule`.
+   2. Refatorar `RunController`/`CombatResolver` com registry manual/fixtures.
+   3. Migrar `MetaState` v2 + tests manuais de save velho/corrupto.
+   4. Adicionar Dungeon Select UI.
+   5. Só então CSV loader.
+   6. Polir Tide marker/tooltips/new badges.
+
+10. **Regressões prováveis**
+   - Testes antigos de `Resolve(party,enemies,focus,seed)` devem continuar via overload compatível chamando Standard.
+   - `BeginDungeonRun()` único call site precisa ter `selectedDungeon`, senão null/default Vault fallback claro.
+
+
+### === GROK ===
+
+# Grok 4.20
+
+- Modelo: `x-ai/grok-4.20`
+
+---
+
+**RED TEAM REPORT — Multiple Dungeons v1 (Pré-Code Exploit Hunt)**
+
+Como atacante criativo, aqui vão **9 vetores não-óbvios** que o plano atual deixa expostos. Foquei em exploits que QA e devs normais normalmente ignoram.
+
+- **TideIdx Hash Collision + Preview Desync**: Executar `hash(dungeonId, floor) % enemyCount` com `enemyCount` que varia por floor (Hollow swarm). Basta forçar `PreviewNextFloor()` quando `CurrentFloor = 19` (Crypt) e depois iniciar run real com party maior (muda enemyCount). Exploit: TideIdx muda entre preview e run real, quebrando o “PreviewNextFloor deve retornar mesma Tide”. Impacto: jogador planeja foco errado sistematicamente.
+
+- **SaveBundle Version Race on Restart Timing**: Fechar o app (kill via task manager) exatamente entre `RecordRunEnd()` e `Save()` (PlayerPrefs.SetString). No restart, migração v1→v2 roda com `deepestFloorByDungeon` parcialmente escrito. Exploit: injectar manualmente JSON corrupto com `version=1` e `deepestFloorByDungeon` ausente. Impacto: progresso do Vault Floor 25 vira 0 permanentemente (fallback graceful falha silenciosamente).
+
+- **DungeonDefinition SO Reflection Override**: Usar `Reflection` + `AssetDatabase` (ou runtime IL2CPP reflection se build dev) para alterar campos de `DungeonDefinition` carregado pelo CsvLoader em edit-time. Exploit: trocar `misFocusDamageMultiplier` de 1.5 para 0.0 ou `anchorEnemyHpMultiplier` para 0.1 antes de build. Impacto: removes intended difficulty sem tocar CSV, impossível de detectar em playtest normal.
+
+- **Local vs Remote Persistence Desync (Multi-device)**: Jogador joga no PC, limpa Vault Floor 20 (desbloqueia Crypt), não salva imediatamente. Abre no celular (mesma conta via cloud? — PlayerPrefs não sync). Exploit: celular ainda vê só Vault. Depois volta ao PC e força `EvaluateUnlocks()` via console. Impacto: estado inconsistente entre dispositivos, "New" badge nunca some.
+
+- **RunController Memory Edit durante Floor Transition**: Usando Cheat Engine / memory editor, alterar `CurrentFloor` e `FocusEnemyIndex` exatamente no frame entre `BeginFloor()` e `CombatResolver.Resolve()`. Exploit: forçar `focusIdx == tideIdx` mesmo em No-Focus (Hollow). Impacto: bypass completo de regras de focus, runs impossíveis viram triviais.
+
+- **CsvLoader InitializeOnLoad Race vs Manual Edit**: Editor roda `[InitializeOnLoad]` enquanto designer ainda edita `balance_dungeons.csv` no Excel. Loader lê arquivo parcialmente escrito (0 bytes ou linha cortada). Exploit: dungeon `drowned_crypt` carrega com `unlockRule` vazio → sempre unlocked. Impacto: early unlock de conteúdo gated.
+
+- **seenDungeonFocusExplanation Dictionary Injection via Save Edit**: Como JsonUtility não serializa Dictionary, o shim (List) permite duplicatas ou IDs inválidos. Exploit: editar JSON salvo adicionando 50 dungeons falsas no `seenDungeonFocusExplanation`. Impacto: memória inchada + tooltip system nunca mostra explicações novamente (estado “visto” corrompido).
+
+- **PreviewNextFloor Side-Effect Attack**: Chamar `PreviewNextFloor()` repetidamente em loop (via UI script ou console) enquanto em Party Select. Como ele chama `BuildEnemiesForFloor` e `CombatResolver`, pode acionar side-effects ocultos (ex: `Random` seed não resetado corretamente). Exploit: fazer com que primeira floor real já tenha TideIdx pré-calculado de forma previsível para o jogador. Impacto: remove skill de adaptação.
+
+- **DeepestFloorByDungeon Migration Overwrite**: Ao migrar v1→v2, código faz `deepestFloorByDungeon["vault"] = existing global deepestFloor`. Se jogador já tinha limpado Hollow Floor 5 em teste interno (estado inválido), migração ignora e reseta. Exploit: tester vira “alpha progress” em produção via save edit. Impacto: dados de balance errados.
+
+- **Forced-Focus MisFocus Penalty Window Exploit (Timing)**: No `CombatResolver`, o multiplicador +50% é aplicado por tick. Fechar e reabrir app exatamente após um tick onde Tide morreu mas antes do próximo tick. Exploit: estado “Tide vivo” persiste incorretamente no save implícito do RunState. Impacto: penalty fica ativo eternamente na floor ou nunca ativa.
+
+**Recomendações rápidas de mitigação (RED TEAM):**
+- Tornar `tideIdx` parte do `FloorSeed` explícito, não derivado em runtime.
+- Usar `BinaryFormatter` ou `Newtonsoft.Json` para save (evitar shim frágil).
+- Fazer `DungeonRule` imutável + struct com hash para garantir determinismo.
+- Adicionar checksum no SaveBundle.
+
+Esses vetores são exatamente o tipo de coisa que “parece seguro no spec” mas explode em produção. O plano atual está **muito vulnerável** a memory editing, save tampering e timing attacks.
+

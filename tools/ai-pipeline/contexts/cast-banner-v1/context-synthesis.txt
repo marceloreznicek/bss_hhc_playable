@@ -1,0 +1,432 @@
+TAREFA: você é Kimi K2.6 sintetizador. As 8 IAs do precode revisaram o plano de implementação do feature 'Cast Banner + 5-Hero Ability Activation' do DiverDungeon (Unity 6, C#, turn-based deterministic combat resolver). Consolide em um plano único e acionável seguindo o formato obrigatório de 4 seções (Causa raiz / Plano priorizado / Conflitos / Convergências).
+
+════════════════════════════════════════════════════════════════
+RESUMO DA TAREFA REVISADA
+════════════════════════════════════════════════════════════════
+
+Implementar 5 abilities (Knight=bulwark, Rogue=hemorrhage, Mage=arcane_bolt, Cleric=mending_light, Ranger=mark_for_death) ativas no live combat (UIController.RunLiveCombat) + Banner UI (portrait + display name, 1s real-time pause, queue por slot order). CombatResolver.cs JÁ tem ResolvePendingCasts/CastAbility/TickAndPruneStatuses. RunLiveCombat NÃO. CSV-driven hero ability data para escalar a >5 heroes sem code change.
+
+Decisões em aberto: D1 (inline cast logic vs consume resolver log), D3 (CSV format — overlay vs full migration), gap de status-tick em RunLiveCombat.
+
+════════════════════════════════════════════════════════════════
+PARECERES BRUTOS DAS 8 IAs
+════════════════════════════════════════════════════════════════
+
+──── PARECER: opus ────
+# Claude Opus 4.7
+
+- Modelo: `anthropic/claude-opus-4.7`
+
+---
+
+# Pre-Code Review: Cast Banner + 5-Hero Ability Activation
+
+## §1. Determinism risks
+
+**Good news:** `ResolvePendingCasts` in `CombatResolver.cs` is pure state — no `rng.Next()` calls inside it. The enemy-targeting rng remains synchronized with `RunLiveCombat`'s `System.Random(floor*1000 + heroes.Count)`. Confirmed safe.
+
+**Risks to flag:**
+- `HeroStats` is a **struct**. In `RunLiveCombat`, the existing pattern `var h = heroes[i]; h.mana = ...; heroes[i] = h;` is correct. When you add inline cast handling, ensure you re-fetch after `heroes[i] = ...` assignments — any closure over `heroes[hi]` inside a coroutine that yields will capture a stale copy. Audit every `yield return` between mana write and cast check.
+- `AbilityRegistry.Get(abilityId)` — confirm it uses an ordered lookup (Dictionary is fine for single-key `Get`, but any iteration over its values must be avoided in the cast path).
+- `ComputeMagnitude` uses `long` fixed-point (good). No floats in cast math. ✓
+- **One latent bug:** `RunLiveCombat` does NOT currently call `ResolvePendingCasts` on floor-start. Resolver DOES (honors `startingMana >= maxMana`). This is a divergence vector today — add it.
+
+## §2. RunLiveCombat structural change
+
+**Vote: D1.A (inline), with one caveat.** D1.B (consume log) is architecturally cleaner but requires reconciling animation pacing with log entries that have no inherent time (the resolver emits events, not durations). You'd end up inventing a second playback layer. Given the resolver is locked and small, duplicating ~40 lines of cast orchestration is lower risk.
+
+**Caveat / mitigation for drift:** extract the cast-resolution body into a shared static helper `CombatResolver.TryCastForHero(int hi, ref List<HeroStats>, ref List<EnemyStats>, ...)` that BOTH paths call. That kills the two-copies problem without restructuring `RunLiveCombat`. Strongly recommend doing this — it's ~15 lines of refactor and eliminates the principal D1.A downside.
+
+**§2 call sites in `RunLiveCombat` (UIController.cs ~1607–1808):**
+1. After floor-start mana reset (~line 1618) — add `ResolvePendingCasts`.
+2. After hero attack mana gain (after line 1660, before `yield return PlayAttack`).
+3. After enemy attack mana gain (after line 1750, before `yield return PlayAttack`).
+4. End-of-round — **currently absent entirely**.
+
+**§2 — status-tick gap (critical):** `RunLiveCombat` has NO end-of-round status processing. The resolver does (`TickAndPruneStatuses` + `DecrementManaLocks`). Without this in the live path:
+- `bulwark` shield never decays on screen → Knight appears invincible for 10 ticks but resolver says shield is gone.
+- `hemorrhage` DoT ticks never apply live → enemy HP bars freeze while resolver drains them.
+- `mark_for_death` DEF debuff never expires live.
+
+**This is a BLOCKER for 3 of the 5 abilities shipping in this feature.** `arcane_bolt` (burst) and `mending_light` (burst) work without status ticks; the other three don't. Recommendation: scope in end-of-round status processing for THIS feature. Flag to the user — the spec undershot.
+
+## §3. Banner UI
+
+- `WaitForSecondsRealtime(1.0f)` ✓ correct.
+- **Input gating:** `raycastTarget=false` on banner children doesn't block `combatPanel`. Set a bool `isBannerPlaying` and gate focus/descend button handlers on it, OR add a transparent full-screen `GraphicRaycaster`-absorbing panel under the banner.
+- Portrait wiring: `MetaState.Instance.GetPortrait(run.PartyData[casterIdx].id)` — but `run.Party` is `List<HeroStats>` (no `id` field on struct). You need a parallel `PartyIds` or `PartyData` list. Confirm this exists; if not, add it when plumbing party. **Flag this — easy to miss.**
+- Fallback for null portrait: colored block using `HeroData.color`. Check `MetaState.Instance.GetHeroData(id)?.color`.
+
+## §4. Hero ability data (D3)
+
+**Vote: Option (B) for v1.** (C) is tempting but doubles the touch surface and risks breaking `SeedDefaultRoster` stability. (B) is the minimum change that satisfies "future-proof" for abilities specifically — adding hero #6 = one CSV row + one registry entry, zero code.
+
+**However, register (C) as an explicit follow-up** in the spec — once we go to 14 heroes, having base stats in CSV will matter.
+
+**Failure modes to enforce:**
+- Missing CSV → log error, heroes get `maxMana=0` (no ability). Don't crash.
+- `heroId` in CSV not in roster → warn, skip.
+- Malformed row → war
+
+
+──── PARECER: sonnet ────
+# Claude Sonnet 4.6
+
+- Modelo: `anthropic/claude-sonnet-4-6`
+
+---
+
+# SECURITY REVIEW — Cast Banner + 5-Hero Ability Activation
+**Role: Security / Anti-Cheat / Exploit Surface**
+*DiverDungeon · Unity 6 · Mobile · Pre-Code*
+
+---
+
+## Threat Model Framing
+
+This feature introduces two new attack surfaces: **(1) mana/cast state executed locally in `RunLiveCombat`** and **(2) hero ability data loaded from CSV at runtime**. Neither triggers a server call. The resolver is pure-local. That is the foundational risk this review addresses.
+
+---
+
+## VECTOR 1 — Client Is the Sole Source of Truth for Cast Outcomes
+
+**Severity: HIGH (existing architecture risk, not introduced by this feature — but this feature widens it)**
+
+`CombatResolver.Resolve()` and `RunLiveCombat` both run entirely on-device. Cast effects (Shield, DoT, Heal, Debuff) are applied locally. `run.ApplyFloorOutcome(hpAfter, outcome)` writes the post-floor HP state which feeds into subsequent floors, `PreviewNextFloor`, and ultimately progression gating.
+
+**GameGuardian / IL2CppDumper attack:**
+- Dump `HeroStats` struct layout → patch `mana` field to equal `maxMana` at any moment → hero casts every turn.
+- Patch `HeroStats.manaPerAttack` or `manaPerHitCap` after roster load → infinite mana generation.
+- Patch `AbilityDef.magnitudeCoeffMilli` (loaded from CSV into `AbilityRegistry` in memory) → `bulwark` shield = MaxHp × 10,000 instead of × 0.2.
+- Freeze `enemies[*].hp` to 0 after cast → instant floor clear.
+
+**New surface this feature adds:**
+- `balance_heroes.csv` (D3 Option B) is loaded at runtime into `HeroData` fields. A rooted device can swap this file before launch, setting `manaPerAttack=9999` or `startingMana=maxMana` for all heroes → cast fires on turn 1 every floor.
+- `balance_abilities.csv` already exists and is the same risk for `magnitudeCoeffMilli`.
+
+**Mitigations:**
+1. **Checksum both CSV files at load time.** Store an expected SHA-256 (or CRC32 is fine for casual tampering) baked into the build. Log a warning + revert to embedded defaults if mismatch. This does not stop a determined attacker with a recompiled APK, but stops file-swap cheating on unrooted devices.
+2. **Embed hardcoded fallback defaults** for all 5 heroes' mana profiles in `MetaState.SeedDefaultRoster` so that if `balance_heroes.csv` fails integrity check, you silently fall back rather than crashing or accepting tampered values.
+3. **Clamp all CSV-sourced values at load time** in `HeroData` (many already are in `ToStats()`): `manaPerAttack ≤ maxMana`, `magnitudeCoeffMilli ≤ reasonable_cap` (e.g., 10000 = 10×). Flag to designers if a row exceeds the cap — it's probably a typo anyway.
+
+---
+
+## VECTOR 2 — No Server Validation of Floor Outcomes
+
+**Severity: MEDIUM (architectural, not new to this feature)**
+
+`FloorOutcome.Cleared` / `FloorOutcome.Wiped` and the resulting `hpAfter` array are produced entirely client-side. A memory editor can:
+- Write `FloorOutcome.Cleared` directly to the `run` object while a Wiped state is resolving.
+- Edit `hpAfter[i]` to restore HP between floors (trivial with GameGuardian struct search).
+
+**This feature does not fix this and does not make it worse**, but the addition of cast effects (especially Shield reducing incoming damage, Heal restoring HP) makes the floor outcome more variable and harder to validate heuristically server-side if server validation is ever added later.
+
+**Mitigation for future-proofing:** design `run.ApplyFloorOutcome` to accept the full `CombatResult` (or a signed hash thereof) rather than raw `int[]`. This is a larger architectural change — flag it as tech debt for the server integration milestone, not a blocker for v1.
+
+---
+
+## VECTOR 3 — `balance_heroes.csv` (D3-B) Adds a New Unvalidated Code Path
+
+**Severity: MEDIUM**
+
+The proposed D3-B approach loads a CSV from `StreamingAssets/` or `Resources/` and overlays mana/ability fields onto `HeroData` objects after `SeedDefaultRoster` runs. Specific risks:
+
+| Risk | Detail |
+|------|---------|
+| File not found | If CSV is absent, heroes silently have `maxMana=0` → no abilities. Not a security risk but a logic failure. |
+| HeroId in CSV not in registry | Orphan rows are ignored. An attacker cannot inject a new hero via CSV alone (good). |
+| `abilityId` in CSV not in `AbilityRegistry` | At cast time, `AbilityRegistry.Get(abilityId)` returns null → NullReferenceException in `CastAbility`. Need null-guard (the spec's "Unknown abilityId → displayName=???" path covers the UI but `CombatResolver.CastAbility` needs the same guard). |
+| `startingMana > maxMana` | `ToStats()` already clamps. Confirm the CSV overlay path calls `ToStats()` or re-applies the same clamp — if the overlay writes directly to `HeroData` fields and `ToStats()` is called later, order matters. |
+
+**Action:** Add a `ValidateHeroAbilityRow()` method called at CSV load time that logs and rejects any row where `manaPerAttack > maxMana` or `startingMana > maxMana`. Do not silently accept and clamp — make the designer-facing error loud.
+
+---
+
+## VECTOR 4 — Multi-Cast Queue as a DoS / State Corruption Path
+
+**Severity: LOW (internal, not player-exploitable)**
+
+The spec describes banner queue drain (§D6) as in-memory transient with no save-state capture. However:
+
+- If `ShowCastBanner` is a coroutine and the banner coroutine is stopped externally (e.g., `StopAllCoroutines()` called from a disconnect handler or scene reload), the cast *effects* may have already been applied (D5-A: apply at banner-start) while the subsequent `ResolvePendingCasts` loop has not completed. This leaves hero statuses (Shield, DoT) in a half-applied state.
+- An attacker cannot exploit this directly, but a crash-loop exploit (trigger banner → force app to background → OS kills process → relaunch) could leave `run` in a state where a cast fired but mana was not zeroed, allowing a re-cast.
+
+**Mitigation:** `mana = 0` and `manaLockTicksRemaining = manaLockTicks` **must be set atomically before `ShowCastBanner` is yielded**, not after. Confirm `RunLiveCombat` does: (1) apply cast effect, (2) zero mana, (3) set lock, (4) *then* yield banner. The resolver already does this (`h.mana = 
+
+
+──── PARECER: gpt53-codex ────
+# GPT-5.3 Codex
+
+- Modelo: `openai/gpt-5.3-codex`
+
+---
+
+(1) análise passo-a-passo da lógica  
+1) Determinismo: hoje há dois “simuladores” (`CombatResolver.Resolve` vs `UIController.RunLiveCombat`, `UIController.cs:1607+`). Se seguir D1.A (duplicar casts no UI), você cria TOCTOU lógico: preview calcula um estado, live reimplementa outro; qualquer ordem diferente (ex.: cast antes/depois de checar fim de combate) diverge byte a byte.  
+2) RNG: confirmado, `ResolvePendingCasts/CastAbility` não usa RNG (só estado), então adicionar casts não muda sequência de `System.Random(seed)` dos ataques.  
+3) Ticks/status: o live path ainda não executa `TickAndPruneStatuses` + `DecrementManaLocks` no fim do round (já existe no resolver). Isso já quebra paridade mesmo antes do banner.  
+4) Banner: `WaitForSecondsRealtime(1.0f)` é correto (spec lock). Aplicar efeito no início do banner (D5.A) preserva coerência visual; o gate de “fim de luta” deve ocorrer após drenar fila de banners.  
+5) Extensibilidade: “sem code change para herói #6” exige dados fora de `SeedDefaultRoster` (`MetaState.cs:59-78`). D3.B atende v1 com menor risco.
+
+(2) casos onde falha  
+- Falha crítica de sync: D1.A sem portar status tick/mana lock/fallbacks de target idênticos ao resolver => HP/status/mana divergem de `PreviewNextFloor`.  
+- Floor start cast: live não chama `ResolvePendingCasts` após setar `startingMana`; herói futuro com `startingMana>=maxMana` não casta no live.  
+- Input race: durante banner, botões de foco/descida podem continuar ativos se não bloquear interação no `combatPanel`.  
+- Dados: `balance_abilities.csv` precisa mesmo incluir `arcane_bolt`,`hemorrhage`,`mark_for_death`; `abilityId` desconhecido deve ainda mostrar banner (“???”).  
+- CSV inválido: `startingMana>maxMana` hoje clampa em `HeroData.ToStats()`; isso mascara erro de tuning.
+
+(3) correção proposta  
+- Voto D1: **B (log-driven)**. Rodar `CombatResolver.Resolve(...)` no início do floor e animar `TickEvent`; elimina drift e já herda status/cast/mana lock corretos.  
+- Se insistir em A, tratar como pré-requisito: portar **todo** ciclo do resolver (incluindo fim de round) — escopo maior.  
+- Voto D3: **B agora**, com `balance_heroes.csv` (heroId,...,abilityId). Sem linha => defaults atuais; linha para herói não semeado => warning forte. `abilityId` vazio = sem habilidade (não usar “0” para string).  
+- Banner: fila FIFO por slot do party; bloquear inputs enquanto fila ativa; fallback de portrait por bloco colorido; sempre completar 1.0s mesmo se combate terminou.  
+- Teste de aceitação: comparação byte-identical de `heroHpAfter/outcome` preview vs live para seed fixa.
+
+**BLOCK**: não implementar enquanto não fechar D1 (preferir B) ou, no mínimo, aceitar explicitamente o aumento de escopo para paridade completa no caminho A.
+
+
+──── PARECER: qwen ────
+# Qwen 3.6 Plus
+
+- Modelo: `qwen/qwen3.6-plus`
+
+---
+
+**§1 Determinismo:** Seguro se o live path mantiver cópias locais de structs e não consumir RNG extra. Mutações (`heroes[i] = newStruct`) devem ser atômicas para evitar leitura de estado intermediário.
+
+**D1 (Inline vs Log):** **Voto D1.A**. Consumir o log do resolver (B) acopla playback a coroutines, introduzindo fragilidade no pacing de animação. *Risco:* duplicação inevitável de `ResolvePendingCasts` e drift de lógica. *Alternativa:* extraia `ApplyCastEffect()` e `ComputeManaGain()` para uma classe helper estática (`SharedCombatOps`) consumida por `Resolve` e `RunLiveCombat`. Mantém single-source sem reescrever o loop live.
+
+**D3 (Dados/Heróis):** **Voto B (CSV overlay)**. Refatorar `SeedDefaultRoster` totalmente (C) é overkill agora. B permite adicionar herói #6 via linha CSV, atendendo a constraint. *Risco:* falha silenciosa se `abilityId` ou `maxMana` estiverem ausentes. *Mitigação:* load com `TryParse`, fallback `maxMana=0, abilityId=""` e `Debug.Assert` em editor. Use string vazia como sentinela, não `0`.
+
+**§2 Status Tick & §5b:** A ausência de `TickAndPruneStatuses` em `RunLiveCombat` é **pré-requisito implícito**. Implementar casts sem ticks de DoT/Shield quebrará a paridade visual e matemática de HP instantaneamente. Deve ser incluído neste escopo. §5(b) é seguro: a verificação `hp<=0` no topo de `ResolvePendingCasts` impere que heróis mortos disparem casts; autodano é resolvido no próximo atomic action.
+
+**§3/5 (UI/Edge):** Banner deve desativar `Physics2D.raycastTarget` ou `interactable=false` em botões subjacentes durante a fila. 1s real a 4× speed é aceitável (spec locked). Falta de portrait → fallback `Image.color` + `rawImage` genérico.
+
+**Veredito:** **BLOCK** até formalizar o helper compartilhado de efeitos e portar o tick de status para `RunLiveCombat`; caso contrário, duplicação causará regressão de balanceamento e quebra de paridade determinística.
+
+
+──── PARECER: gemini-flash ────
+# Gemini 3 Flash
+
+- Modelo: `google/gemini-3-flash-preview`
+
+---
+
+Aqui estão os insights críticos para a implementação da v1 atendendo ao requisito de escalabilidade:
+
+1.  **D3: Veredito de Extensibilidade (Voto: Opção C).** Para garantir que o herói #6 ao #14 não exija código, a Opção B (overlay) é um "puxadinho" perigoso. Implemente a **Opção C** agora: mova todos os campos de `BuildHero` (HP, Atk, Def) para o `balance_heroes.csv`. O `MetaState.cs` deve apenas iterar o CSV e inflar a lista de `HeroData`. Se o herói #6 for adicionado ao CSV e tiver um `id` correspondente no `HeroClassRegistry`, ele deve funcionar instantaneamente sem tocar em C#.
+
+2.  **D1: Veredito de Estrutura (Voto: Opção B).** A divergência entre `CombatResolver` e `UIController` é iminente. Atualmente, `UIController` **não processa status (DoTs/Shields)**, o que tornaria habilidades como `bulwark` (Shield) e `hemorrhage` (DoT) invisíveis ou quebradas na UI. **Ação:** Refatore `RunLiveCombat` para consumir o `TickEvent` log do `CombatResolver`. Isso garante determinismo absoluto e evita duplicar a lógica de mana/cast/status.
+
+3.  **Risco de Determinismo (§1/§5):** O log de `TickEvent` precisa capturar a "intenção" completa. Se `ResolvePendingCasts` resetar a mana no resolver mas a animação na UI atrasar, o próximo frame da UI pode tentar disparar o banner novamente se ler o estado local. **Solução:** O `CombatResolver` deve retornar uma `Queue<TickEvent>`. O loop da UI apenas "consome" até o próximo evento visual (Ataque ou Cast), aguarda a animação (ou banner de 1s), e segue.
+
+4.  **UX vs Escalonamento (§5.e):** Em velocidades 4x, uma fila de 5 banners (5 segundos de pausa total) parecerá um travamento do jogo. **O pulo do gato:** Implemente um "Banner Grouping". Se >1 herói conjurar no mesmo tick, mostre um banner único com múltiplos retratos ou reduza o tempo de `Hold` para 0.4s por herói adicional na fila.
+
+5.  **Edge Case — O Cast Suicida (§5.b):** Se um cast matar o próprio conjurador (via mecânica futura ou status), o `UIController` deve garantir que a animação de morte ocorra *após* o banner, mas o estado no `CombatResolver` já deve ter limpado o herói para evitar que ele aja novamente no mesmo turno.
+
+**Veredito: BLOCK.** 
+A disparidade de lógica de Status entre o Resolver e a UI (ponto 2) fará com que os efeitos das novas habilidades (Shield/DoT) não funcionem visualmente na UI, mesmo que o cálculo esteja correto. Corrija o contrato de sincronização de Status/Ticks antes de codar os Banners.
+
+
+──── PARECER: kat ────
+# KAT Coder Pro V2
+
+- Modelo: `kwaipilot/kat-coder-pro-v2`
+
+---
+
+### §1. Riscos de Determinismo
+**Problema crítico:** `RunLiveCombat` atual já diverge do resolver por **não processar statuses no fim do round** (linhas 1607-1808). Se um herói tem DoT (`hemorrhage` do Rogue) ou buff (`bulwark` do Knight), a UI não aplica os efeitos de tick, então os HPs/escudos na tela ficarão errados em relação ao `PreviewNextFloor`. Isso quebra o pilar de determinismo visual.
+
+**Solução obrigatória:** Antes de implementar casts, `RunLiveCombat` precisa replicar `TickAndPruneStatuses` e `DecrementManaLocks` do resolver. Caso contrário, mesmo com casts, o estado visual divergirá após o primeiro round com statuses ativos.
+
+**Outros riscos:**
+- `System.Random` no `RunLiveCombat` (linha 1613) usa mesma seed (`floor * 1000 + heroes.Count`) que `PreviewNextFloor` — OK.
+- `ResolvePendingCasts` no resolver **não consome RNG** (é puro estado), então adicionar chamadas equivalentes na UI não introduz não-determinismo.
+- Evitar `Time.time` ou `Time.deltaTime` na lógica de cast — usar apenas `WaitForSecondsRealtime` para banners (já correto no spec).
+
+---
+
+### §2. Mudança Estrutural no RunLiveCombat
+**Voto claro: Opção D1.A (inline cast logic)**, mas com ressalvas.
+
+**Por quê?** 
+- `RunLiveCombat` já replica manualmente ganho de mana (linhas 1654-1660, 1738-1750). Adicionar `ResolvePendingCasts` inline é consistente com a arquitetura atual.
+- Opção D1.B (consumir log do resolver) exigiria refactor massivo: o resolver roda uma vez no início, mas `RunLiveCombat` precisa de animações sincronizadas com eventos. Manter dois loops (resolver + animação) seria complexo.
+
+**Onde inserir chamadas:**
+1. **Após ataque do herói** (linha ~1660): já existe ganho de mana. Inserir `ResolvePendingCasts()` após atualizar mana.
+2. **Após ataque do inimigo** (linha ~1750): já existe ganho de mana por hit. Inserir `ResolvePendingCasts()` após atualizar mana.
+3. **Fim do round** (após loop de inimigos, antes de `while` reiniciar): **FALTANDO** — adicionar:
+   ```csharp
+   // Tick statuses (DoT, shields, buffs)
+   TickAndPruneStatuses(heroes, enemies);
+   DecrementManaLocks(heroes);
+   ResolvePendingCasts(heroes, enemies, ...);
+   ```
+
+**Atenção:** `TickAndPruneStatuses` e `DecrementManaLocks` precisam ser implementados na UI. São ~50 linhas de código espelhado do resolver. **Isso é pré-requisito para casts funcionarem corretamente.**
+
+---
+
+### §3. UI do Banner de Cast
+**Correto:** `WaitForSecondsRealtime(1.0f)` garante 1s real independente de `Time.timeScale`.
+
+**Problema de input:** Durante o banner, botões de foco/descida no `combatPanel` continuam ativos. **Solução:** desabilitar `combatPanel` (ou seus botões) no início do banner e reabilitar após a fila de banners drenar.
+
+**Implementação sugerida:**
+```csharp
+IEnumerator ShowCastBanner(int heroSlotIndex, string abilityId) {
+    castBannerRoot.gameObject.SetActive(true);
+    // Preencher sprite (MetaState.Instance.GetPortrait(run.PartyData[heroSlotIndex].id))
+    // Preencher texto (AbilityRegistry.Get(abilityId).displayName)
+    // Animação scale/fade
+    yield return new WaitForSecondsRealtime(1.0f);
+    castBannerRoot.gameObject.SetActive(false);
+}
+```
+
+**Fila multi-cast:** após cada ação atômica, coletar heróis com `mana >= maxMana` em ordem de slot (0..N-1) e yieldar `ShowCastBanner` sequencialmente.
+
+---
+
+### §4. Dados de Habilidade dos Heróis (Extensibilidade)
+**Voto: Opção B (CSV separado `balance_heroes.csv`)** para v1.
+
+**Por quê?**
+- Menor mudança: overlay nos heróis já seedados em `MetaState.SeedDefaultRoster` (linhas 59-78).
+- Adicionar herói #6 = apenas nova linha no CSV, sem tocar em código.
+- Opção C (substituir `BuildHero`) é mais limpa a longo prazo, mas exige migrar todos os 14 heróis para CSV agora — risco maior.
+
+**Estrutura CSV sugerida:**
+```csv
+heroId,maxMana,startingMana,manaPerAttack,manaPerHit,manaPerHitCap,manaLockTicks,abilityId
+1,40,0,5,10,15,0,bulwark
+2,60,0,12,8,15,0,hemorrhage
+3,110,0,12,6,12,0,arcane_bolt
+4,80,20,10,20,25,0,mending_light
+5,70,10,12,8,15,0,mark_for_death
+```
+
+**Sentinela:** `maxMana=0` já indica "sem habilidade" (convenção existente em `HeroData`). `abilityId` vazio é redundante, mas pode ser usado para validação.
+
+**Falhas a tratar:**
+- CSV ausente ou mal formatado: log warning, herói fica sem habilidade (maxMana=0).
+- `heroId` no CSV não encontrado no roster: ignorar linha com warning.
+- `startingMana > maxMana`: `ToStats()` já clampa (linha 32 de `HeroData.cs`), mas deveria hard-fail em editor? **Sugestão:** validação no `MetaState` ao carregar CSV, com `Debug.LogError`.
+
+---
+
+### §5. Casos de Borda
+**(a) Herói com mana cheia no início:** Resolver chama `ResolvePendingCasts` no `on_floor_start`. `RunLiveCombat` **não chama** — precisa adicionar após reset de mana (linha ~1620).
+
+**(b) Auto-dano que mata o caster:** Resolver aplica efeito antes de checar morte (`CastAbility` aplica, depois zera mana). Se herói morrer por auto-dano, ele ainda está vivo durante
+
+
+──── PARECER: gpt55 ────
+# GPT-5.5 (co-coder)
+
+- Modelo: `openai/gpt-5.5`
+
+---
+
+§1 Determinismo  
+- O maior risco é D1.A: duplicar `CombatResolver.ResolvePendingCasts/CastAbility` em `UIController.RunLiveCombat` cria drift inevitável com `PreviewNextFloor()` (`RunController.cs:248`). Casts não usam RNG; confirmar que a cópia UI também não deve tocar `rng`.  
+- `TickEvent.tick++` no resolver é irrelevante para UI; live não precisa tick se continuar inline.  
+- Não usar `Time.*`, `UnityEngine.Random`, LINQ/dicionário em target selection/effects. Banner pode usar `unscaledDeltaTime`/`WaitForSecondsRealtime` porque é presentation-only e deve ocorrer depois do estado já mutado.  
+- Cuidado com `HeroStats` struct: sempre copiar-mutuar-reatribuir `heroes[i] = h`, como já fazem em `UIController.cs:1654-1660/1738-1750`.
+
+§2 RunLiveCombat  
+- Voto D1.B como arquitetura correta: consumir log do resolver é single source of truth. Porém é mudança grande. Para v1 curta, D1.A é aceitável só se a lógica comum for extraída do resolver para método compartilhado, não copiada. Ideal: tornar cast/status helpers internos/públicos determinísticos e usados por ambos.  
+- Chamadas necessárias em `UIController.cs`:  
+  1. após reset de mana no floor start: `ResolvePendingCastsLive(...)`;  
+  2. após dano + mana de ataque, antes de checar fim;  
+  3. após dano + mana de hit;  
+  4. fim de round: `TickAndPruneStatuses`, `DecrementManaLocks`, depois casts.  
+- Bloqueio técnico: live hoje não processa status tick/Shield/DoT/StatBuff. Como `hemorrhage`, `mark_for_death`, `bulwark` dependem disso, “só adicionar banner” deixa preview e tela divergentes. Isto está no escopo desta feature ou deve virar pré-requisito.
+
+§3 Banner UI  
+- `WaitForSecondsRealtime(1.0f)` correto.  
+- Desabilitar input durante fila de banners ou colocar overlay capturando raycast; `raycastTarget=false` nos filhos não bloqueia botões do `combatPanel`.  
+- Passe portrait via hero id, não slot persistente frágil: `run.PartyData[casterIdx].id` / equivalente. Unknown ability: `AbilityRegistry.Get` precisa fallback sem exception.
+
+§4 Dados/heróis  
+- Voto D3.B para v1: `Balance/balance_heroes.csv` overlay após `SeedDefaultRoster()`; adicionar herói #6 exige só row + registry/prefab, não código de mana. D3.A viola requisito. D3.C é melhor final, mas maior migração.  
+- Validar: CSV ausente = log warning e sem habilidades; row heroId inexistente = warning; row duplicada = erro/warning determinístico; abilityId vazio + maxMana 0 = sem habilidade. Use `0` para mana e `abilityId=""` explícito.
+
+§5 Edge cases  
+- Floor-start cast falta em live.  
+- Self-damage KO: após cast, reset/lock só se o resolver já faz isso; UI deve espelhar. Se caster morre, não pode atacar depois; banner ainda termina.  
+- AoE clear: aplicar no banner-start, drenar fila, só então settle.  
+- Multi-cast em slot order; 4× speed pode virar gargalo UX, mas spec trava 1s.  
+- Missing portrait: bloco com cor do herói/nome.  
+- CSV precisa incluir `arcane_bolt`, `hemorrhage`, `mark_for_death`; conferir `mending_light/bulwark`.  
+- `startingMana > maxMana`: hoje clampa em `HeroData.ToStats()`; eu trocaria para warning forte, não hard-fail em build.
+
+§6 Performance  
+- Resolver segue barato em F50/20 inimigos; casts/status lists são pequenos. Não instanciar banner por cast.
+
+§7 Testes  
+- Determinismo: duas chamadas `CombatResolver.Resolve` mesmo seed byte-idênticas; live final HP deve igualar preview em party Knight/Cleric/Mage/Ranger.  
+- Testar floor-start full mana, AoE lethal, missing portrait, unknown ability, 2 casts no mesmo boundary, 2×/4× banner 1s.
+
+§8 Unknowns  
+- Contradição principal: live sem status processing, mas v1 abilities exigem status.  
+- Hero #6 quebra se mana/ability forem hardcoded em `SeedDefaultRoster`.
+
+BUILD somente se Claude extrair/compartilhar lógica determinística de casts/status ou aceitar implementar o espelho completo agora; caso contrário BLOCK por divergência live vs resolver.
+
+
+──── PARECER: grok ────
+# Grok 4.20
+
+- Modelo: `x-ai/grok-4.20`
+
+---
+
+**RED TEAM PRE-CODE REVIEW — EXPLOIT VECTORS (Attacker Lens)**
+
+- **Exploit: Local vs Resolver Mana State Desync on App Close**  
+  Execute: Force-quit Unity app (or kill process) during `WaitForSecondsRealtime(1.0f)` inside multi-cast queue in `UIController.RunLiveCombat` (after line ~1660 or ~1745). Restart and reload save.  
+  Impact: Save captured only pre-banner mana; live state had already applied `mana = 0` + cast effect in resolver path but not persisted. `PreviewNextFloor` now diverges from continued live run. Persistent desync on resume. (D6 explicitly accepts this risk — weaponize it.)
+
+- **Exploit: Cast Banner Queue Replay Attack via Save/Load Timing**  
+  Execute: Trigger 3-hero multi-cast (Knight+Rogue+Cleric in slot order), close app after first banner finishes (0.999s realtime) but before second. On reload, `RunLiveCombat` restarts from last saved `HeroStats` (post-first-cast). Call `ResolvePendingCasts` again on reload.  
+  Impact: Duplicate banner + duplicate cast effect applied (e.g. double Bulwark shield or double heal). Breaks determinism; resolver log would have only one `TickEventKind.Cast`. Multi-device save sync would propagate the double-apply.
+
+- **Exploit: ID Injection via balance_heroes.csv (D3 Option B/C)**  
+  Execute: Add row with `heroId=999`, `abilityId=arcane_bolt`, extreme mana values. Use reflection or memory edit on `MetaState.roster` post-`SeedDefaultRoster` + CSV overlay (before `ToStats()`). Or edit CSV at runtime via file-write if dev build.  
+  Impact: Bypasses `HeroClassRegistry` (only 5 entries). `GetPortrait(999)` returns null → fallback block but cast still fires with full magnitude. Scales to admin heroes without code change. Violates "future-proof without code change" by allowing unregistered heroIds.
+
+- **Exploit: Race Condition — SetValueAsync-like Local Mutation vs ResolvePendingCasts**  
+  Execute: In `RunLiveCombat` hero loop (lines 1654–1660), mutate `heroes[hi].mana` directly, then yield `PlayAttack()`. During the yield, external system (e.g. ad-reward callback or cloud save sync) calls `run.Party[i]` mutation. Then resume and call new `ResolvePendingCasts` on stale list copy.  
+  Impact: Live UI applies cast using dirty mana value; `CombatResolver.Resolve` in `PreviewNextFloor` uses clean state. Determinism broken. Classic local-remote persistence race (even without real Firebase).
+
+- **Exploit: Reflection on HeroStats Struct Mutation Order**  
+  Execute: Use `System.Reflection` (or Harmony if moddable) to swap field access order inside `ResolvePendingCasts` copy in live path vs resolver. Specifically reorder `manaLockTicksRemaining`, `mana`, `hp` reads before `CastAbility`. Trigger with Cleric at startingMana edge.  
+  Impact: Live combat applies mending_light before mana reset or lock; resolver applies in struct-copy order defined in `CombatResolver.cs: ResolvePendingCasts`. `CombatResult` diverges. Non-obvious because structs are value types — copy order matters.
+
+- **Exploit: Memory Edit on TickEvent Log During Preview**  
+  Execute: While `PreviewNextFloor` runs `CombatResolver.Resolve`, attach debugger/memory editor, change a `TickEventKind.Cast` magnitude or actor from "Hero2" to "Hero5". Let `RunLiveCombat` consume log (if D1.B chosen).  
+  Impact: UI shows banner for Ranger mark_for_death but resolver had applied Mage arcane_bolt. Visual desync + incorrect live HP bars. Since banner is "presentation-only", attacker makes player think wrong ability fired. Scales to fake admin abilities.
+
+- **Exploit: Coroutine Closure Capture on Banner Queue**  
+  Execute: In `ShowCastBanner` coroutine, capture `casterIdx` and `abilityId` by reference in a closure used by `OnBannerComplete` callback. Trigger multi-cast queue, then during 1s realtime wait change `run.Party[casterIdx]` via another system (focus change).  
+  Impact: Later banners in queue fire with wrong portrait or ability name. If banner applies effect at start (D5.A), wrong hero receives heal/shield. Classic Unity coroutine capture bug amplified by realtime pause.
+
+- **Exploit: Deterministic RNG Seed Collision on New Hero Addition**  
+  Execute: Add hero #6 via CSV (D3.B). New `heroes.Count` changes seed calculation (`floor*1000 + heroes.Count`). Old saves with 5 heroes now replay with different `System.Random` sequence even if `ResolvePendingCasts` itself is pure.  
+  Impact: `PreviewNextFloor` for old save data produces different enemy targeting than live run after upgrade. Not byte-identical anymore. Violates pillar 2 for existing players when adding characters "without code change".
+
+- **Exploit: Banner Real-time Pause + Speed Multiplier Timing Attack**  
+  Execute: Set speed to 4×. Trigger cast that would end combat (AoE clear). During the forced 1.0s `WaitForSecondsRealtime`, player taps descend or force-closes. On next launch, `isPlayingFloor` flag race with save serialization.  
+  Impact: Combat "ends" in resolver but live coroutine is still draining banner queue. Post-resume state shows victory screen + lingering banner or vice-versa. At high speed the banner becomes 80% of perceived combat time — social engineering vector ("why is the game frozen?").
+
+- **Exploit: AbilityRegistry Dictionary Iteration Order + Missing CSV Row**  
+  Execute: `arcane_bolt` row missing from `balance_abilities.csv` (spec calls it out). `AbilityRegistry.Get` falls back to default or throws. In `CastAbility`, `switch` on `targetType` from malformed def uses `FirstAliveEnemy` fallback. Iterate `AbilityRegistry` dictionary in live path vs resolver (non-deterministic order if not OrderedDictionary).  
+  Impact: Live banner shows "???" and applies wrong effect (e.g. mending_light logic on Mage). `CombatResult` from resolver has different `TickEvent` sequence. Silent failure mode turned into desync exploit.
+
+**BUILD or BLOCK verdict: BLOCK**  
+These vectors show that choosing D1.A (inline) + D3.B (CSV overlay) without addressing persistence races, struct mutation ordering, and save-during-banner creates non-obvious desyncs that break the core determinism pillar. Need explicit save format for in-flight banner queue + full status tick parity in live path first.
+
+

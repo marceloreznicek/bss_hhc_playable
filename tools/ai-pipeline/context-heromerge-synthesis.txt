@@ -1,0 +1,1063 @@
+# SÍNTESE — HeroMerge precode (Kimi K2.6)
+
+Você é o Kimi K2.6. Sua tarefa é consolidar 8 pareceres de IAs sobre o plano de implementação do **HeroMerge** (playable merge × auto-battler em HTML/JS vanilla, ~310 LoC sobre o motor existente do HeroSwarm v2).
+
+**Formato de resposta OBRIGATÓRIO — 4 seções:**
+
+1. **CAUSA RAIZ** — qual é o risco #1 que pode quebrar o playable se não for endereçado.
+2. **PLANO PRIORIZADO** — lista numerada de mudanças concretas no código, em ordem de execução, com snippet ou pseudo-código quando relevante. Foque em mudanças que TODAS ou QUASE TODAS as IAs convergiram.
+3. **CONFLITOS ENTRE IAs** — pontos onde IAs deram opiniões opostas; sua decisão técnica para cada conflito.
+4. **CONVERGÊNCIAS** — pontos onde 5+ IAs concordaram; isso vira regra dura para a implementação.
+
+**Restrições:** mudança mínima, ES5-ish JS, sem novas dependências, deve caber em ~310 LoC novos. Não invente features fora do GDD v0.1.
+
+---
+
+## CONTEXTO ORIGINAL DO PRECODE
+
+# PRÉ-CODE — HeroMerge playable (merge × auto-battler)
+
+## TAREFA
+
+Estamos prestes a implementar **HeroMerge**, um playable de anúncio (HTML5
+single-file, formato 1080×1920 portrait) construído sobre o motor existente
+do **HeroSwarm v2**. O HeroSwarm v2 já foi shippado e funciona — vamos clonar
+sua master HTML e modificar.
+
+Vocês são 8 IAs especialistas. **Antes de qualquer linha de código**, revisem
+o plano abaixo e apontem:
+- Edge cases que vão quebrar o jogo
+- Race conditions na interação drag-merge
+- Problemas de UX na mecânica magnética
+- Riscos de regressão no motor reusado
+- Bugs prováveis no animation timing
+- Soluções alternativas que considerem melhores
+
+Não inventem features fora do escopo do GDD v0.1. **Mudança mínima, máxima
+clareza.** O playable inteiro precisa caber em ~310 LoC novos.
+
+---
+
+## CONTEXTO DO MOTOR (HeroSwarm v2 — JÁ EXISTENTE, será reusado)
+
+Stack: HTML/CSS/JS vanilla, 1 arquivo (~4 MB com sprites embed em base64),
+sem build pipeline além de um pequeno bundler Node. ES5-ish (var,
+function expressions). Sem módulos. Sem frameworks.
+
+### Sistema de actors (top-down)
+
+```js
+// Cada actor é um <div class="actor"> com sprite, hp-bar, posicionado por translate3d.
+// applyActorTransform: position via translate3d(x, y, 0); z-index = floor(y) para profundidade top-down.
+// .actor.dying anima fade-out (0.42s).
+
+function createActor(typeKey, registry, x, y) {
+  // Cria o DOM, adiciona ao #lane, retorna o objeto JS com {id, x, y, hp, dmg, ...}
+}
+
+function moveActors(dt) {
+  // Para cada player unit: anda em direção ao target (closest enemy)
+  // Para cada enemy com speed > 0: anda em direção ao closest player
+  // Clamp y em [FIELD_PAD_TOP=410, FIELD_PAD_BOTTOM=700] (bottom half)
+}
+
+function resolveStacking() {
+  // Rigid-body: player↔player split 50/50, player↔enemy one-way push
+}
+
+function tickTackles(dt) {
+  // Lunge animation + dano via TACKLE_INTERVAL (0.6s)
+}
+```
+
+### Stats das unidades (já balanceados em HeroSwarm)
+
+```js
+var UNIT_TYPES = {
+  hero:   { side:'player', w:78,  h:108, hp:5,  dmg:1, speed:110 },
+  ogre:   { side:'player', w:96,  h:120, hp:10, dmg:3, speed:70  },
+  knight: { side:'player', w:110, h:138, hp:20, dmg:6, speed:100 }
+};
+var ENEMY_TYPES = {
+  goblin:   { hp:4,   dmg:2, speed:0, aoe:false, w:84  },
+  brute:    { hp:35,  dmg:4, speed:0, aoe:true,  w:168 },
+  skeleton: { hp:6,   dmg:2, speed:0, aoe:false, w:92  },
+  captain:  { hp:9,   dmg:3, speed:0, aoe:false, w:112 },
+  troll:    { hp:45,  dmg:5, speed:0, aoe:true,  w:188 },
+  dragon:   { hp:120, dmg:6, speed:0, aoe:true,  w:342 }  // Demon Lord
+};
+```
+
+### Spawn / waves (sistema atual no HeroSwarm)
+
+```js
+// Player spawn (atual): tap card → spawnUnit(typeKey) → cria actor em (x:-60, y:CENTER_Y±SPAWN_DELTA_Y)
+// SPAWN_COOLDOWN = { hero: 750, ogre: 2000, knight: 3000 } ms
+// WAVES[1] = 20 enemies pre-placed; WAVES[2] = 20 enemies; LEVEL3_MOBS = 30 + Demon Lord
+
+function spawnUnit(typeKey) {
+  if (!STATE.gameActive) return;
+  var y = CENTER_Y + (Math.random() * 2 - 1) * SPAWN_DELTA_Y;
+  var a = createActor(typeKey, UNIT_TYPES, SPAWN_X_PLAYER, y);
+  STATE.units.push(a);
+  playSFX('spawn');
+  return a;
+}
+
+function spawnEnemy(typeKey, x, y) {
+  if (!STATE.gameActive) return;
+  var a = createActor(typeKey, ENEMY_TYPES, x, bottomHalfY(y));
+  STATE.enemies.push(a);
+  return a;
+}
+
+// FIELD_PAD_TOP=410, FIELD_PAD_BOTTOM=700, CENTER_Y=555 — combat band = bottom half
+```
+
+### Tutorial (atual)
+
+```js
+function showGuideHand(gameX, gameY) { /* posiciona <div id="guide-hand"> com sprite SPRITES.hand */ }
+function showTutBubble(text, gameX, gameY, opts) { /* fala-balão */ }
+// TUT_POS tem heroBtn, ogreBtn, knightBtn (apontam pro botão SUMMON de cada card)
+```
+
+### Layout DOM atual (vai mudar)
+
+```html
+<div id="game">
+  <div id="banner-strip">KILL THE HORDE</div>
+  <div id="battlefield" class="level-1">
+    <div id="lane"></div>            <!-- actors vivem aqui -->
+  </div>
+  <div id="wave-info">Level 1 — Kills 0/20</div>
+
+  <!-- 3 cards (HeroSwarm v2) — vão SAIR -->
+  <div id="card-hero">    <div id="btn-spawn-hero">SUMMON</div>   ... </div>
+  <div id="card-ogre">    <div id="btn-spawn-ogre">SUMMON</div>   ... </div>
+  <div id="card-knight">  <div id="btn-spawn-knight">SUMMON</div> ... </div>
+
+  <div id="endcard"> ... </div>
+</div>
+```
+
+---
+
+## GDD CONSOLIDADO (HeroMerge v0.1)
+
+### Conceito (1 parágrafo)
+
+Tap **SUMMON** dropa Recruits Tier-1 no campo. **Drag** uma unit em cima de
+outra do mesmo tier → mescla em tier maior. Ao tocar uma unit, todas do
+mesmo tier num raio de ~350px são puxadas magneticamente em direção ao dedo.
+Ao soltar (ou após 0.6s parado), o cluster funde em UMA unit do próximo
+tier no ponto da soltada. Combate auto. Sobreviver as 3 waves do HeroSwarm
+e matar o Demon Lord = vitória.
+
+### Ladder de tiers (5 níveis, reusa sprites do HeroSwarm)
+
+| Tier | Nome | Sprite | HP | DMG | Speed |
+|---|---|---|---|---|---|
+| 1 | Recruit    | hero    (intro-hero.png)  | 5   | 1  | 110 |
+| 2 | Lumberjack | ogre    (lenhador.png)    | 10  | 3  | 70  |
+| 3 | Knight     | knight  (igris.png)       | 20  | 6  | 100 |
+| 4 | Brute      | brute   (juggermon2.png)  | 35  | 4  | 60  |
+| 5 | Champion   | dragon  (overlord.png)    | 120 | 6  | 80  |
+
+(Stats vêm direto das tabelas existentes — apenas reuso.)
+
+### Mecânica magnética — comportamento exato
+
+- Player toca uma unit → guarda `STATE.heldActor`
+- Cada frame: outras units do MESMO tier dentro do raio R=350px lerpam em
+  direção ao `heldActor` na velocidade ~600 px/s (ease-out)
+- `heldActor` segue o dedo (pointer x/y → game coords)
+- Ao soltar (pointerup) OU após 600ms de hold-still:
+  - Identifica o cluster: heldActor + todas units do mesmo tier dentro de
+    R_MERGE=80px da posição do dedo
+  - Se cluster.length >= 2: despawn todas + spawn 1 unit do próximo tier no
+    ponto do dedo + flash + SFX
+  - Se cluster.length < 2: heldActor volta pro lugar (cancelar)
+
+### SUMMON button (substitui as 3 cards)
+
+- 1 botão grande na parte de baixo da tela
+- Cooldown ~700ms (estado visual: cd-sweep + cd-text)
+- Spawna 1 Recruit (Tier 1) em posição aleatória dentro do bottom half
+  do battlefield (mesmo `bottomHalfY` usado pra enemies)
+- Pode ser tapado a qualquer momento, mesmo durante drag-merge
+
+### Tutorial (3 passos)
+
+1. **0–3s**: bubble "TAP SUMMON!" + guide hand pulsa no botão
+2. **Após 2 Recruits estarem vivos**: bubble "DRAG TO MERGE!" + guide hand
+   demonstra um drag de Recruit pra Recruit (a animação magnética faz o
+   ensino acontecer visualmente)
+3. **Após 1ª merge feita**: tutorial off
+
+### Win / fail / endcard
+
+Inalterados do HeroSwarm v2 (Demon Lord killed = win, Fire Breath = fail,
+endcard = mesmo intro-hero portrait + "PLAY NOW TO BUILD YOUR ARMY").
+
+---
+
+## PLANO DE IMPLEMENTAÇÃO PROPOSTO (~310 LoC novos)
+
+### 1. UI — substituir 3 cards por 1 botão SUMMON (~30 LoC)
+
+**Remover** do DOM: `#card-hero`, `#card-ogre`, `#card-knight` e seus
+listeners. **Adicionar**:
+
+```html
+<div id="summon-area">
+  <div id="btn-summon">SUMMON
+    <div class="cd-sweep"></div>
+    <div class="cd-text"></div>
+  </div>
+</div>
+```
+
+CSS: tamanho ~520×170px, mesmo gradient verde do endcard-btn, centralizado
+horizontalmente abaixo do `#wave-info`. Reusa `.cd-sweep` e `.cd-text` da
+HeroSwarm.
+
+JS: `document.getElementById('btn-summon').addEventListener('click', onSummonTap);`
+com cooldown de 700ms via `STATE.cooldownUntil.summon`.
+
+### 2. Spawn no bottom half com posição aleatória (~15 LoC)
+
+```js
+function onSummonTap() {
+  if (!STATE.gameActive) return;
+  var now = performance.now();
+  if (now < STATE.cooldownUntil.summon) { playSFX('locked'); return; }
+  var x = 200 + Math.random() * (LANE_W - 400);  // evita beiradas
+  var y = FIELD_PAD_TOP + Math.random() * (FIELD_PAD_BOTTOM - FIELD_PAD_TOP);
+  var recruit = createActor('hero', UNIT_TYPES, x, y);
+  recruit.tier = 1;       // ← NOVO campo no actor
+  STATE.units.push(recruit);
+  playSFX('spawn');
+  STATE.cooldownUntil.summon = now + 700;
+}
+```
+
+### 3. Sistema de tiers (~20 LoC)
+
+```js
+var TIER_TYPE = ['hero', 'ogre', 'knight', 'brute', 'dragon']; // index 0 = tier 1
+
+// No createActor: setar a.tier (default por sprite key)
+// No spawnEnemy: enemies têm tier = -1 (não merge)
+```
+
+### 4. Drag-to-merge — pointer events (~80 LoC)
+
+```js
+var STATE = { ...
+  heldActor: null,
+  pointerX: 0, pointerY: 0,
+  holdStartedAt: 0,
+};
+
+document.getElementById('lane').addEventListener('pointerdown', function(e) {
+  var hit = findActorAt(toGameCoords(e));
+  if (!hit || hit.tier == null || hit.tier >= 5) return;
+  STATE.heldActor = hit;
+  STATE.pointerX = toGameCoords(e).x;
+  STATE.pointerY = toGameCoords(e).y;
+  STATE.holdStartedAt = performance.now();
+  hit.state = 'held';
+});
+
+document.addEventListener('pointermove', function(e) {
+  if (!STATE.heldActor) return;
+  var p = toGameCoords(e);
+  STATE.pointerX = p.x; STATE.pointerY = p.y;
+  STATE.heldActor.x = p.x; STATE.heldActor.y = p.y;
+  STATE.holdStartedAt = performance.now();  // reset auto-fire
+});
+
+document.addEventListener('pointerup', function() {
+  if (!STATE.heldActor) return;
+  resolveMergeAtPointer();
+  STATE.heldActor = null;
+});
+```
+
+### 5. Atração magnética (~50 LoC, no game loop)
+
+```js
+function tickMagnetic(dt) {
+  var h = STATE.heldActor;
+  if (!h) return;
+  var R = 350, R2 = R * R;
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.tier !== h.tier || u.dead) continue;
+    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
+    var d2 = dx*dx + dy*dy;
+    if (d2 > R2) continue;
+    var d = Math.sqrt(d2);
+    if (d < 1) continue;
+    var pull = Math.min(600 * dt, d);  // px/s, never overshoot
+    u.x += (dx / d) * pull;
+    u.y += (dy / d) * pull;
+    applyActorTransform(u);
+  }
+  // Auto-fire merge if held still for >600ms
+  if (performance.now() - STATE.holdStartedAt > 600) {
+    resolveMergeAtPointer();
+    STATE.heldActor = null;
+  }
+}
+```
+
+### 6. Merge resolution (~40 LoC)
+
+```js
+function resolveMergeAtPointer() {
+  var h = STATE.heldActor;
+  if (!h) return;
+  var R_MERGE = 80, R2 = R_MERGE * R_MERGE;
+  var cluster = [h];
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.tier !== h.tier || u.dead) continue;
+    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
+    if (dx*dx + dy*dy < R2) cluster.push(u);
+  }
+  if (cluster.length < 2) {
+    h.state = 'idle';
+    return;  // cancelado, fica onde está
+  }
+  // Despawn cluster
+  cluster.forEach(function(u) { u.dead = true; u.dom.remove(); });
+  STATE.units = STATE.units.filter(function(u) { return !u.dead; });
+  // Spawn next tier no ponto do dedo
+  var nextKey = TIER_TYPE[h.tier];  // tier 1 → index 1 → ogre
+  if (!nextKey) return;             // já tava no tier 5
+  var newU = createActor(nextKey, UNIT_TYPES, STATE.pointerX, STATE.pointerY);
+  newU.tier = h.tier + 1;
+  STATE.units.push(newU);
+  playSFX('unlock');  // power up sound
+  // TODO: flash visual no spawn point (CSS .merge-flash)
+}
+```
+
+### 7. Tutorial swap (~40 LoC) + remover lógica antiga
+
+Substituir `tutorialOnIntroClose` / `tutGoTo` para usar 3 passos novos:
+- Step 1: TAP SUMMON
+- Step 2 (após 2 Recruits): DRAG TO MERGE
+- Step 3 (após 1ª merge): off
+
+### 8. Layout edits (~20 LoC HTML/CSS)
+
+Remover blocks `#card-hero`, `#card-ogre`, `#card-knight`. Adicionar
+`#summon-area`. Ajustar `#wave-info` margin-bottom.
+
+---
+
+## ESCOPO EXPLICITAMENTE FORA
+
+- Múltiplas famílias de unidades (só um ladder).
+- Economia/coins.
+- Skill ativa do Champion (só usa o AoE existente).
+- Som de "magnetic woosh" novo (reusa `power up_01.mp3`).
+
+---
+
+## REVISÕES SOLICITADAS (cada IA no seu nicho)
+
+- **Claude Opus 4.7**: edge cases invisíveis (ex: clicar em unit já em
+  combate, drag sai do battlefield, race entre auto-fire e pointerup, etc).
+- **Claude Sonnet 4.6**: audite exploits / quebras visuais (ex: spam SUMMON
+  estoura 100 units, magnetic puxa unit que tá morrendo, drag durante level
+  transition, etc).
+- **GPT-5.3 Codex**: race conditions (game loop @ 60fps vs pointer events,
+  pointerup durante merge animation, dt variável).
+- **GPT-5.5**: proponha o snippet final correto pra cada bloco que parece
+  problemático, em JS ES5-ish (var, function).
+- **KAT Coder Pro V2**: TL;DR JS/DOM-specific (touch events em mobile,
+  pointer-events: none nos sprites, will-change pra performance).
+- **Gemini 3 Flash**: explique POR QUE a mecânica magnética pode falhar e
+  dê alternativas (ex: pinch animation, single-tap merge, queue de cliques).
+- **Qwen 3.6 Plus**: o que as outras IAs estão ignorando? (ex: game loop
+  ainda chama moveActors no held actor, hp-bar segue o drag, z-index do
+  drag, sprites visualScale 1.89× = hit area).
+- **Grok 4.20**: como um atacante criativo quebra isso? (ex: drag pra fora
+  da viewport, unit morre durante cluster, multiplos pointers/multitouch,
+  level transition durante hold).
+
+Foco em **prevenir bugs antes de codar**, não em refatorar o motor.
+
+---
+## 8 PARECERES DAS IAs (round 1)
+
+### === opus ===
+# Claude Opus 4.7
+
+- Modelo: `anthropic/claude-opus-4.7`
+
+---
+
+# Revisão Claude Opus 4.7 — HeroMerge Pré-Code
+
+## 🔴 BUGS CRÍTICOS (quebram o jogo)
+
+### 1. Auto-fire vs pointerup — double-merge / crash
+Em `tickMagnetic`, se `holdStartedAt` expira **no mesmo frame** do pointerup, `resolveMergeAtPointer()` roda 2× e `STATE.heldActor` já é null na segunda. Pior: cluster pode tentar despawnar actors já removidos.
+**Fix**: guarda `if (!STATE.heldActor) return;` no início de `resolveMergeAtPointer`, e limpa `holdStartedAt = 0` após resolver.
+
+### 2. `moveActors` continua movendo o heldActor
+O game loop mantém `moveActors(dt)` rodando. O heldActor vai ser puxado pelo AI enquanto o pointer-move seta `x/y` — briga entre target-seek e dedo, gerando jitter.
+**Fix**: em `moveActors`, `if (u === STATE.heldActor || u.state === 'held') continue;`
+
+### 3. `tickTackles` + dano no heldActor
+Unit segurada ainda recebe dano/lunge. Pior: pode **morrer durante o drag** → `h.dead=true`, mas `STATE.heldActor` ainda aponta pra ela. Pointermove continua atualizando `h.x/y` em actor morto/removido do DOM.
+**Fix**: watcher em `tickTackles` e no damage resolver: se `actor === STATE.heldActor` e `hp<=0`, force clear `STATE.heldActor = null` + cancel state.
+
+### 4. `createActor` pode não inicializar `tier`
+Enemies passam por `createActor(typeKey, ENEMY_TYPES, ...)` — proposta diz "tier=-1 para enemies", mas o código mostrado em (2) só seta `recruit.tier=1` depois do createActor. Se o merge spawn esquecer de setar tier ANTES do próximo frame de `tickMagnetic`, a nova unit é puxada com `tier=undefined`.
+**Fix**: centralizar `a.tier = computeTier(typeKey, registry)` DENTRO de createActor.
+
+### 5. Cluster inclui units fora do cone visual / atrás do dedo
+`resolveMergeAtPointer` usa R_MERGE=80 do pointer, mas units magnéticas podem estar a 100-300px ainda voando em direção ao dedo. Jogador vê 4 units "quase lá" e merge só pega 2 → sensação de bug.
+**Fix sugerido**: ou (a) aumentar R_MERGE pra 150, ou (b) no auto-fire, esperar cluster stabilizar (todas units dentro de R_MERGE) antes de disparar.
+
+## 🟡 EDGE CASES
+
+6. **Level transition durante hold**: `STATE.gameActive=false` mas `heldActor` persiste. Se wave 2 resetar `STATE.units`, heldActor aponta pra objeto órfão. → Force `STATE.heldActor=null` em todo transition hook.
+
+7. **Tier 5 no heldActor**: guard `hit.tier >= 5` impede pickup, mas não impede que uma Tier 5 seja **puxada magneticamente** por outra sendo held? Não — guard por `u.tier !== h.tier` cobre, ok. Mas confirme que não há ladder tier 5→6.
+
+8. **`findActorAt` não mostrado**: precisa iterar units+enemies? Só units com `tier!=null`. Defina hit priority (topmost z-index / últimos em array).
+
+9. **Drag fora do battlefield**: pointer pode ir pra cima do wave-info/summon. Clampe `pointerX/Y` aos bounds de FIELD antes de usar em magnetic/merge.
+
+10. **Multi-touch**: segundo dedo dispara outro pointerdown → sobrescreve `heldActor`, primeiro dedo fica zumbi. Use `pointerId` lock.
+
+## ✅ Validação PvP
+N/A neste playable (PvE auto-battler).
+
+### === sonnet ===
+# Claude Sonnet 4.6
+
+- Modelo: `anthropic/claude-sonnet-4-6`
+
+---
+
+# Auditoria de Segurança — HeroMerge Playable
+
+**Papel: SEGURANÇA | Vetor de ataque em HTML5/JS client-side sem servidor**
+
+---
+
+## Contexto crítico
+
+Este é um **playable de anúncio HTML5** — single-file, sem backend, sem IAP real, sem Firebase. O modelo de ameaça é completamente diferente do jogo Unity mobile. Não há receipts, rubies persistidos ou torneios. Redireciono o foco para os vetores reais deste ambiente.
+
+---
+
+## Vetores de Ataque Relevantes
+
+### 1. Spam de SUMMON via console / automação
+
+**Vetor:** `STATE.cooldownUntil.summon` é uma variável JS exposta globalmente. No browser, qualquer usuário abre DevTools e executa:
+```js
+STATE.cooldownUntil.summon = 0;
+// Loop:
+setInterval(() => { STATE.cooldownUntil.summon = 0; onSummonTap(); }, 10);
+```
+**Resultado:** 500+ units no DOM em segundos → travamento/crash do browser. Para um *playable de anúncio*, isso afeta a **métrica de engajamento** (sessão longa/anômala) e pode crashar o iframe do ad network, gerando chargeback de impressão.
+
+**Mitigação:** Cap hard no servidor não existe aqui, então use cap local intocável:
+```js
+var MAX_PLAYER_UNITS = 20; // constante fora do STATE
+if (STATE.units.length >= MAX_PLAYER_UNITS) return;
+```
+
+---
+
+### 2. Multitouch / ponteiros múltiplos quebram `STATE.heldActor`
+
+**Vetor:** Dois dedos simultâneos no mobile. `pointerdown` dispara duas vezes — o segundo sobrescreve `STATE.heldActor` sem liberar o primeiro. O ator original fica "fantasma": removido do controle do loop mas sem `pointerup` para resolver o merge.
+
+**Resultado:** Unit presa em estado `'held'` indefinidamente, immune a `moveActors` e `resolveStacking`, mas ainda colidindo. Com `dead = false`, nunca é removida do `STATE.units`.
+
+**Mitigação:**
+```js
+// No pointerdown:
+if (STATE.heldActor) return; // rejeita segundo ponteiro
+// Ou rastrear pointerId:
+STATE.heldPointerId = e.pointerId;
+// No pointermove/pointerup: ignorar se e.pointerId !== STATE.heldPointerId
+```
+
+---
+
+### 3. Unit morre durante drag — estado zumbi
+
+**Vetor:** `heldActor` recebe dano fatal de um enemy enquanto está sendo arrastado. `tickTackles` marca `u.dead = true` e chama `u.dom.remove()`. O `STATE.heldActor` ainda aponta para o objeto JS com `dead = true` e DOM removido.
+
+**Resultado:** `resolveMergeAtPointer` executa no `pointerup`, tenta acessar `h.dom` (null) e `cluster` inclui o morto → `TypeError` + possível spawn de unit do próximo tier **de graça** (merge de 1 unit morta).
+
+**Mitigação:**
+```js
+function resolveMergeAtPointer() {
+  var h = STATE.heldActor;
+  if (!h || h.dead) { STATE.heldActor = null; return; } // guard obrigatório
+  // ...
+  cluster.forEach(function(u) {
+    if (!u.dead) { u.dead = true; u.dom.remove(); } // idempotente
+  });
+}
+```
+
+---
+
+### 4. Auto-fire + pointerup — merge duplo
+
+**Vetor (race condition de segurança):** O timer de 600ms de hold-still dispara `resolveMergeAtPointer()` no mesmo frame que `pointerup` também a chama. Dois merges executam sobre o mesmo cluster.
+
+**Resultado:** O cluster é despawnado duas vezes (segunda iteração filtra units já `dead`, OK), mas **duas units do próximo tier são criadas** no mesmo ponto — duplicação gratuita de unidades.
+
+**Mitigação:** Flag de guarda:
+```js
+function resolveMergeAtPointer() {
+  if (STATE.mergeInProgress) return;
+  STATE.mergeInProgress = true;
+  // ... lógica ...
+  STATE.mergeInProgress = false;
+  STATE.heldActor = null;
+}
+// No auto-fire E no pointerup: chamar resolveMergeAtPointer() → internamente idempotente
+```
+
+---
+
+### 5. Drag fora do viewport — coord injection
+
+**Vetor:** `toGameCoords(e)` com `e.clientX` negativo ou > viewport. `STATE.pointerX` pode ser `-9999`. A unit spawna fora do campo visível mas permanece em `STATE.units`, participando de combate invisível e sendo contada em merges.
+
+**Mitigação:**
+```js
+function clampToField(x, y) {
+  return {
+    x: Math.max(0, Math.min(LANE_W, x)),
+    y: Math.max(FIELD_PAD_TOP, Math.min(FIELD_PAD_BOTTOM, y))
+  };
+}
+// Aplicar no pointerup antes de resolveMergeAtPointer
+```
+
+---
+
+## Resumo de Prioridade
+
+| # | Vetor | Impacto | Complexidade Fix |
+|---|---|---|---|
+| 1 | Spawn spam (DevTools) | Crash do playable/ad | Baixa (1 linha) |
+| 2 | Multitouch heldActor | Estado fantasma | Baixa |
+| 3 | Unit morre durante drag | Merge gratuito | Baixa |
+| 4 | Auto-fire + pointerup duplo | Duplicação de tier | Média |
+| 5 | Drag fora do viewport | Unit invisível | Baixa |
+
+**Todos os 5 fixes cabem em <20 LoC adicionais.** Prioridade 3 e 4 são os únicos que afetam a integridade da mecânica principal de merge.
+
+### === gpt53-codex ===
+# GPT-5.3 Codex
+
+- Modelo: `openai/gpt-5.3-codex`
+
+---
+
+(1) análise passo-a-passo da lógica  
+1) Hoje há dois “threads” lógicos: loop (`moveActors/resolveStacking/tickTackles/tickMagnetic`) e eventos de ponteiro (`pointerdown/move/up`). Isso cria TOCTOU: você lê `STATE.heldActor` num evento, mas o loop pode matar/remover esse actor antes de `resolveMergeAtPointer`.  
+2) `holdStartedAt` é resetado em todo `pointermove`; logo auto-fire só dispara se dedo ficar absolutamente parado (ok), mas ruído de touch pode impedir merge para sempre.  
+3) `resolveMergeAtPointer` remove DOM e filtra `STATE.units`; se isso ocorrer no meio de um frame que já está iterando `STATE.units` em `moveActors`, pode pular elementos/usar referência morta.  
+4) `heldActor` continua passando por IA de movimento/stacking/tackle, então ele “briga” com o dedo (jitter).  
+5) `pointerup` e auto-fire podem chamar merge no mesmo frame (duplo spawn) se não houver trava transacional.  
+6) `nextKey = TIER_TYPE[h.tier]` depende de `h.tier` estável; se `h` morreu/promovido entre leitura e uso, promoção errada.  
+7) `createActor(nextKey, UNIT_TYPES,...)` com `brute/dragon` quebra porque não existem em `UNIT_TYPES` (só em `ENEMY_TYPES`).  
+8) Multi-touch: sem `pointerId` ativo, um dedo segura e outro move/solta, causando teleporte/merge indevido.  
+
+(2) casos onde falha  
+- Unit morre por dano enquanto segurada: `heldActor.dom.remove()` já feito por combate; depois `pointerup` tenta merge com objeto morto.  
+- Drag fora battlefield/viewport: spawn/merge em coordenada inválida; pode sair da banda [410..700], quebrando pathing/z-index.  
+- Transição de wave/endcard durante hold: merge ainda executa e cria unit após `gameActive=false`.  
+- Spam summon durante drag: cluster inclui unidades recém-spawnadas “dentro” do raio sem feedback, sensação de merge aleatório.  
+- dt alto (frame drop): `pull = 600*dt` puxa demais em um frame, colapsa stack e pode atravessar inimigos.  
+
+(3) correção proposta  
+- Introduzir transação simples: `STATE.mergeLock` + `STATE.pendingMerge` (só resolve no início do tick, nunca dentro de evento).  
+- Guardas em toda entrada: `if (!gameActive || mergeLock) return;` e validar `heldActor && !heldActor.dead && heldActor.dom`.  
+- Congelar actor segurado: flag `isHeld`; excluir de `moveActors/resolveStacking/tickTackles`.  
+- Capturar `activePointerId`; ignorar demais ponteiros; usar `setPointerCapture`.  
+- Clamp de `pointerX/Y` à arena antes de mover/merge.  
+- Debounce de auto-fire: timestamp + `mergeConsumed` para impedir dupla execução no mesmo hold.  
+- Definir tabela única de stats por tier (incluindo brute/dragon lado player) para evitar lookup inválido.  
+- Operar remoções via fila (`toDespawn`) aplicada pós-iteradores do frame.
+
+### === gpt55 ===
+# GPT-5.5 (co-coder)
+
+- Modelo: `openai/gpt-5.5`
+
+---
+
+Principais pontos que eu ajustaria antes de codar, mantendo escopo mínimo:
+
+### 1. `UNIT_TYPES` não contém `brute`/`dragon`
+
+Plano usa:
+
+```js
+createActor(nextKey, UNIT_TYPES, ...)
+```
+
+Mas `brute` e `dragon` estão em `ENEMY_TYPES`. Se não ajustar, tier 4/5 quebra ou cria actor sem side player. Melhor criar registry único para merge:
+
+```js
+var MERGE_UNIT_TYPES = {
+  hero:   UNIT_TYPES.hero,
+  ogre:   UNIT_TYPES.ogre,
+  knight: UNIT_TYPES.knight,
+  brute: {
+    side:'player', w:168, h:120, hp:35, dmg:4, speed:60, aoe:true
+  },
+  dragon: {
+    side:'player', w:342, h:180, hp:120, dmg:6, speed:80, aoe:true
+  }
+};
+
+var TIER_TYPE = ['hero', 'ogre', 'knight', 'brute', 'dragon'];
+```
+
+E usar `MERGE_UNIT_TYPES` para player units novas.
+
+---
+
+### 2. Held actor precisa ser ignorado pelo motor de movimento/combat push
+
+Se `moveActors`, `resolveStacking` e `tickTackles` continuarem tratando o held actor como normal, ele vai “brigar” contra o dedo, atacar durante drag ou ser empurrado.
+
+Mudança mínima:
+
+```js
+function isActorControllable(u) {
+  return u && !u.dead && u !== STATE.heldActor && u.state !== 'held';
+}
+```
+
+Dentro dos loops existentes:
+
+```js
+if (!isActorControllable(u)) continue;
+```
+
+Aplicar principalmente em `moveActors`, `resolveStacking` e, se necessário, `tickTackles`.
+
+---
+
+### 3. Multitouch/race pointerup vs auto-merge
+
+Guardar `pointerId` e flag de merge evita double-resolve.
+
+```js
+STATE.heldPointerId = null;
+STATE.mergeResolving = false;
+STATE.holdStillSince = 0;
+STATE.lastPX = 0;
+STATE.lastPY = 0;
+STATE.mergeCount = 0;
+```
+
+Pointer handlers:
+
+```js
+function onLanePointerDown(e) {
+  if (!STATE.gameActive || STATE.heldActor) return;
+
+  var p = toGameCoords(e);
+  var hit = findActorAt(p.x, p.y);
+  if (!hit || hit.dead || hit.tier == null || hit.tier >= 5) return;
+
+  STATE.heldActor = hit;
+  STATE.heldPointerId = e.pointerId;
+  STATE.pointerX = p.x;
+  STATE.pointerY = p.y;
+  STATE.lastPX = p.x;
+  STATE.lastPY = p.y;
+  STATE.holdStartedAt = performance.now();
+  STATE.holdStillSince = performance.now();
+
+  hit.state = 'held';
+  hit.dragHomeX = hit.x;
+  hit.dragHomeY = hit.y;
+  if (hit.dom && hit.dom.setPointerCapture) hit.dom.setPointerCapture(e.pointerId);
+  e.preventDefault();
+}
+
+function onPointerMove(e) {
+  if (!STATE.heldActor || e.pointerId !== STATE.heldPointerId) return;
+
+  var p = toGameCoords(e);
+  p.x = Math.max(0, Math.min(LANE_W, p.x));
+  p.y = Math.max(FIELD_PAD_TOP, Math.min(FIELD_PAD_BOTTOM, p.y));
+
+  var dx = p.x - STATE.lastPX;
+  var dy = p.y - STATE.lastPY;
+  if (dx * dx + dy * dy > 36) {
+    STATE.holdStillSince = performance.now();
+  }
+
+  STATE.pointerX = p.x;
+  STATE.pointerY = p.y;
+  STATE.lastPX = p.x;
+  STATE.lastPY = p.y;
+
+  STATE.heldActor.x = p.x;
+  STATE.heldActor.y = p.y;
+  applyActorTransform(STATE.heldActor);
+  e.preventDefault();
+}
+
+function onPointerUp(e) {
+  if (!STATE.heldActor || e.pointerId !== STATE.heldPointerId) return;
+  resolveMergeAtPointer();
+  e.preventDefault();
+}
+```
+
+---
+
+### 4. Auto-fire deve usar “parado”, não tempo desde último move bruto
+
+No plano, qualquer micro `pointermove` reseta sempre, em mobile pode nunca disparar. Melhor tolerância de 6px:
+
+```js
+function tickMagnetic(dt) {
+  var h = STATE.heldActor;
+  if (!h || h.dead || !STATE.gameActive) return;
+
+  var R = 350;
+  var R2 = R * R;
+  var stepMax = 600 * dt;
+
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.dead || u.dying || u.tier !== h.tier) continue;
+
+    var dx = STATE.pointerX - u.x;
+    var dy = STATE.pointerY - u.y;
+    var d2 = dx * dx + dy * dy;
+    if (d2 > R2 || d2 < 1) continue;
+
+    var d = Math.sqrt(d2);
+    var pull = Math.min(stepMax, d);
+    u.x += dx / d * pull;
+    u.y += dy / d * pull;
+    u.y = Math.max(FIELD_PAD_TOP, Math.min(FIELD_PAD_BOTTOM, u.y));
+    applyActorTransform(u);
+  }
+
+  if (performance.now() - STATE.holdStillSince > 600) {
+    resolveMergeAtPointer();
+  }
+}
+```
+
+---
+
+### 5. Merge resolution robusto
+
+Evitar tier 5, dead durante hold, double-call, game inactive, pointerup depois do auto-fire.
+
+```js
+function clearHeld() {
+  if (STATE.heldActor) STATE.heldActor.state = 'idle';
+  STATE.heldActor = null;
+  STATE.heldPointerId = null;
+  STATE.mergeResolving = false;
+}
+
+function resolveMergeAtPointer() {
+  var h = STATE.heldActor;
+  if (!h || STATE.mergeResolving) return;
+  STATE.mergeResolving = true;
+
+  if (!STATE.gameActive || h.dead || h.tier == null || h.tier >= 5) {
+    clearHeld();
+    return;
+  }
+
+  var R = 80;
+  var R2 = R * R;
+  var cluster = [h];
+
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.dead || u.dying || u.tier !== h.tier) continue;
+    var dx = STATE.pointerX - u.x;
+    var dy = STATE.pointerY - u.y;
+    if (dx * dx + dy * dy <= R2) cluster.push(u);
+  }
+
+  if (cluster.length < 2) {
+    h.x = h.dragHomeX;
+    h.y = h.dragHomeY;
+    applyActorTransform(h);
+    clearHeld();
+    return;
+  }
+
+  var nextKey = TIER_TYPE[h.tier];
+  var nx = STATE.pointerX;
+  var ny = Math.max(FIELD_PAD_TOP, Math.min(FIELD_PAD_BOTTOM, STATE.pointerY));
+
+  for (i = 0; i < cluster.length; i++) {
+    cluster[i].dead = true;
+    if (cluster[i].dom && cluster[i].dom.parentNode) {
+      cluster[i].dom.parentNode.removeChild(cluster[i].dom);
+    }
+  }
+
+  STATE.units = STATE.units.filter(function(u) { return !u.dead; });
+
+  var nu = createActor(nextKey, MERGE_UNIT_TYPES, nx, ny);
+  nu.tier = h.tier + 1;
+  STATE.units.push(nu);
+
+  STATE.mergeCount++;
+  playSFX('unlock');
+  clearHeld();
+}
+```
+
+### 6. UX/click no botão durante drag
+
+Botão SUMMON deve continuar clicável, mas `pointerdown` no lane não pode capturar evento do botão. Garanta CSS/DOM separados e `touch-action:none` só no `#lane`, não no jogo inteiro. sprites internos devem ter `pointer-events:none`; `.actor` recebe
+
+### === kat ===
+# KAT Coder Pro V2
+
+- Modelo: `kwaipilot/kat-coder-pro-v2`
+
+---
+
+## Revisão KAT Coder Pro V2 — Foco JS/DOM
+
+### Edge Cases Críticos
+
+**1. Pointer events em mobile**
+- `pointerdown` no `#lane` pode não capturar se o sprite tiver `pointer-events: none` (comum em CSS de sprites). **Solução:** usar `e.target.closest('.actor')` ou hit-test manual via coordenadas.
+- Multitoque: `pointerdown` com 2 dedos → segundo dedo pode selecionar outra unit. **Solução:** `if (STATE.heldActor) return;` no início do handler.
+
+**2. Z-index do held actor**
+- Durante drag, o actor precisa ficar acima de tudo. **Solução:** `heldActor.dom.style.zIndex = 9999;` no `pointerdown`, restaurar no `pointerup`.
+
+**3. Hit area vs sprite visual**
+- Sprites têm `visualScale: 1.89` mas hitbox é `w/h` original. Unit tier-5 (dragon) tem `w:342` → hit area enorme. Merge radius 80px pode ser menor que a própria unit. **Solução:** usar `R_MERGE = Math.max(80, hit.w * 0.5)`.
+
+**4. Game loop vs drag**
+- `moveActors(dt)` ainda move units `held`? **Solução:** pular units com `state === 'held'` no `moveActors`.
+- `tickTackles` aplica dano em unit segurada? **Solução:** mesma verificação.
+
+**5. Unit morre durante cluster**
+- `resolveMergeAtPointer` itera `STATE.units` enquanto remove (`u.dom.remove()`). Se uma unit do cluster já está `dying` (animação 0.42s), o `dom.remove()` pode conflitar. **Solução:** marcar `u.dead = true` e deixar o `gameLoop` fazer cleanup via `STATE.units = STATE.units.filter(u => !u.dead)`.
+
+### Snippet Corrigido — Drag com Hit-Test Seguro
+
+```csharp
+// No pointerdown do #lane:
+var rect = lane.getBoundingClientRect();
+var gameX = e.clientX - rect.left;
+var gameY = e.clientY - rect.top;
+
+// Hit-test manual (evita pointer-events: none)
+var hit = null;
+for (var i = STATE.units.length - 1; i >= 0; i--) {
+  var u = STATE.units[i];
+  if (u.dead || u.tier == null || u.tier >= 5) continue;
+  var dx = gameX - u.x, dy = gameY - u.y;
+  if (Math.abs(dx) < u.w/2 && Math.abs(dy) < u.h/2) {
+    hit = u;
+    break;
+  }
+}
+if (!hit) return;
+
+STATE.heldActor = hit;
+STATE.pointerX = gameX;
+STATE.pointerY = gameY;
+hit.state = 'held';
+hit.dom.style.zIndex = 9999;
+```
+
+### Snippet Corrigido — Merge com Cleanup Seguro
+
+```csharp
+function resolveMergeAtPointer() {
+  var h = STATE.heldActor;
+  if (!h) return;
+  var R_MERGE = Math.max(80, h.w * 0.5);
+  var R2 = R_MERGE * R_MERGE;
+  var cluster = [h];
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.tier !== h.tier || u.dead) continue;
+    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
+    if (dx*dx + dy*dy < R2) cluster.push(u);
+  }
+  if (cluster.length < 2) {
+    h.state = 'idle';
+    h.dom.style.zIndex = ''; // restaurar
+    return;
+  }
+  // Marcar mortos (não remover DOM ainda)
+  cluster.forEach(function(u) { u.dead = true; });
+  // Spawn next tier
+  var nextKey = TIER_TYPE[h.tier];
+  if (!nextKey) return;
+  var newU = createActor(nextKey, UNIT_TYPES, STATE.pointerX, STATE.pointerY);
+  newU.tier = h.tier + 1;
+  STATE.units.push(newU);
+  playSFX('unlock');
+  // Flash visual
+  spawnMergeFlash(STATE.pointerX, STATE.pointerY);
+  // Cleanup DOM no próximo frame (evita conflito com dying)
+  setTimeout(function() {
+    cluster.forEach(function(u) { if (u.dom.parentNode) u.dom.remove(); });
+    STATE.units = STATE.units.filter(function(u) { return !u.dead; });
+  }, 50);
+}
+```
+
+### Performance — `will-change` no held actor
+
+```css
+.actor.held {
+  will-change: transform;
+  transition: none !important; /* desativa transições CSS durante drag */
+}
+```
+
+### Alternativa Magnética (se falhar)
+
+Se o lerp magnético causar "teleport" visual (unidades pulando), trocar por:
+- **Queue de cliques:** primeiro tap seleciona, segundo tap em outra unit do mesmo tier → merge instantâneo entre elas (sem drag).
+- **Pinch animation:** ao invés de puxar, as units encolhem e se fundem no ponto médio.
+
+**Recomendação:** manter o plano original mas testar em device real — o lerp de 600px/s pode ser lento demais em telas grandes (1080px height). Ajustar `pull = Math.min(900 * dt, d)` se necessário.
+
+### === gemini-flash ===
+# Gemini 3 Flash
+
+- Modelo: `google/gemini-3-flash-preview`
+
+---
+
+A mecânica magnética é sensacional para o "pulo do gato" de satisfação tátil (ASMR), mas em um motor top-down com colisão, ela é um campo minado.
+
+Aqui estão os insights de UX e estabilidade para o **HeroMerge**:
+
+1.  **O Fantasma do Combate (Race Condition):** O maior risco é o `moveActors` e o `resolveStacking` continuarem brigando com o seu drag. Se uma unidade "magnética" entrar em combate ou for empurrada enquanto voa para o dedo, o movimento ficará tremido (jitter).
+    *   **Solução:** Ao setar `u.state = 'held'` ou quando uma unidade entrar no raio de atração, você **precisa** flagar `u.isMagnetic = true` para ignorar o `moveActors` e o `resolveStacking` no loop principal.
+
+2.  **O Problema da Hierarquia Visual (Z-Index):** No `HeroSwarm`, o `z-index` é `floor(y)`. Ao arrastar uma unidade, se ela passar "por trás" de um inimigo ou de outra unidade parada (Y maior), a ilusão de controle quebra.
+    *   **Insight:** Unidades no `cluster` e o `heldActor` devem receber um `z-index: 9999` temporário e um `transform: scale(1.15)` para dar profundidade de "item levantado".
+
+3.  **Abuso do Summoner (Performance Limit):** Sem custo de mana, o jogador vai espamar o botão. 100+ atores com `tickMagnetic` calculando distância quadrática (`dx*dx + dy*dy`) a cada frame em um mobile lento vai derrubar o FPS.
+    *   **Pulo do gato:** Limite o `STATE.units.length`. Se atingir 20 unidades, desabilite o botão CSS (`grayscale + pointer-events: none`) com feedback visual "Full". Isso força o merge.
+
+4.  **Feedback de "Fusão Iminente":** O `resolveMergeAtPointer` por distância pura (80px) é seco. O jogador precisa saber *quem* vai sumir antes de soltar o dedo.
+    *   **UX:** Quando as unidades entrarem no `R_MERGE`, aplique um filtro CSS `brightness(1.5)` ou um leve `shake` nelas. Se soltar e nada acontecer, a sensação é de bug; se houver feedback visual, é erro do usuário.
+
+5.  **Multi-touch e Ghosting:** No mobile, o jogador pode tentar arrastar dois grupos com dois dedos.
+    *   **Fix rápido:** No `pointerdown`, adicione um check: `if (STATE.heldActor) return;`. Ignore o segundo toque para evitar que o `heldActor` pule entre dedos e quebre o estado do cluster.
+
+### === qwen ===
+# Qwen 3.6 Plus
+
+- Modelo: `qwen/qwen3.6-plus`
+
+---
+
+**Abordagem:** Razoável e aderente ao escopo/LoC, mas o acoplamento direto ao loop do motor legado gera risco alto de jitter e regressão física. A solução é direta, porém falta isolamento mínimo entre a lógica de toque e o pathfinding original.
+
+**Riscos de manutenção:** 
+- Duplicação de validação de bounds: o drag recalcula limites sem reusar o clamp existente, facilitando dessincronização em futuras patches.
+- Iteração `O(N)` em `tickMagnetic` + `resolveMergeAtPointer` sobre `STATE.units` global acopla performance à contagem de inimigos, inviabilizando escalabilidade simples.
+- O `z-index = floor(y)` do motor conflita com drag touch: a unit arrastada será renderizada atrás de mobs estáticos, quebrando a leitura da mecânica magnética.
+
+**Omitidos pelo plano (gerarão bugs reais):**
+- `moveActors` sobrescreverá `x/y` do `heldActor` a cada frame. É obrigatório um bypass explícito (`if (u.state === 'held' || u.state === 'magnetic') continue;`) ou o drag "escorregará".
+- HP-bar e hit-test assumem `transform3d` limpo. O scale 1.89× dos sprites distorce `elementFromPoint`. Aplique `pointer-events: none` a todos os filhos visuais; mantenha apenas o wrapper `.actor` capturável.
+- Ao cancelar merge (<2 units), a unit volta ao `x/y` original, mas o motor já avançou ela no delta anterior. Sem `_draggingOrigin` ou flag, ocorrerá teleporte brusco.
+
+**Alternativas arquiteturais (sem reescrita):**
+- Filtre por tier antes do loop: `var pool = STATE.units.filter(u => u.tier === h.tier);`. Cai para `O(M)` e poupa CPU em low-end.
+- Force `u.dom.style.zIndex = 9999` no `pointerdown` e restaure `floor(u.y)` no `pointerup`. Clamp manual obrigatório durante arrasto.
+- Substitua o timer rígido de 600s por verificação de `pointerDelta < 6px` por 2 frames estáveis; evita merge acidental em long-presses acidentais.
+Mantém-se o GDD, blinda-se o motor legado.
+
+### === grok ===
+# Grok 4.20
+
+- Modelo: `x-ai/grok-4.20`
+
+---
+
+**Grok 4.20 — RED TEAM (Attacker Lens)**
+
+- **Exploit: HeldActor Resurrection via Race on Death**
+  - Execução: Inicie drag em Recruit → mate o heldActor com enemy AoE exatamente no frame do pointerup ou no tickMagnetic auto-fire (use brute/dragon breath). O resolveMergeAtPointer ainda roda porque STATE.heldActor não foi nulado pelo death system.
+  - Impacto: Cria tier-2 Lumberjack "fantasma" com hp=0 que nunca morre, acumula cluster infinito e trava o wave counter.
+
+- **Exploit: Multi-touch ID Spoofing (2-finger merge bomb)**
+  - Execução: Toque primeiro dedo em Recruit A (heldActor=A), segundo dedo em Recruit B. No pointermove do dedo 2, force STATE.heldActor = B via reflection no devtools ou multitouch event spoof. Solte ambos rapidamente.
+  - Impacto: resolveMergeAtPointer processa o mesmo cluster duas vezes no mesmo tick, duplicando o tier resultante (2× Champion no mesmo ponto). Escalada exponencial de dano.
+
+- **Exploit: Magnetic Pull on Dying Actors (Persistência Local vs Remota)**
+  - Execução: Arraste um unit → deixe um Recruit morrendo (dying class + .actor.dying animation 0.42s). Magnetic tick continua puxando-o porque o check `u.dead` só roda após DOM removal no próximo frame.
+  - Impacto: Dying unit é incluída no cluster, despawn removido duas vezes (null reference no filter), e o novo merge herda posição inválida (NaN translate3d).
+
+- **Exploit: Pointer-leave Viewport + Restart Timing**
+  - Execução: Arraste o heldActor até o topo da tela (fora do #battlefield), feche o aba ou force pagehide via devtools. Ao reabrir o playable (ad reload), o STATE.heldActor ainda existe na closure mas o DOM actor foi destruído.
+  - Impacto: No próximo summon, resolveMergeAtPointer acessa actor morto → exception silenciosa que mata o game loop inteiro no próximo tick.
+
+- **Exploit: Tier Injection via Reflection no createActor**
+  - Execução: No console durante jogo: `STATE.units[0].tier = 999; STATE.units[0].hp = 9999`. Como tier é só número e TIER_TYPE[h.tier] faz lookup sem bound check, merge de tier 999 spawna `createActor(undefined, ...)` que cai no default sprite hero mas com stats do dragon.
+  - Impacto: Cria "God Recruit" que um-shot o Demon Lord. Funciona mesmo após minify.
+
+- **Exploit: Auto-fire Merge Replay Attack (600ms hold-still)**
+  - Execução: Segure o dedo parado por 590ms (auto-fire quase disparando), rapidamente solte e toque novamente no mesmo cluster antes do próximo game tick. Ambos os eventos (timeout + pointerup) chamam resolveMergeAtPointer no mesmo array.
+  - Impacto: Duplica merges. Com 8 recruits vira 4 lumberjacks + 2 knights no mesmo frame. Quebra balanceamento brutalmente.
+
+- **Exploit: Z-index + Visual Scale Hitbox Desync**
+  - Execução: Após 3 merges, o Champion (visualScale ~1.89× por causa do sprite dragon) tem hit area muito maior que o DOM box. Arraste outro unit por cima da "aura" invisível do Champion.
+  - Impacto: findActorAt() retorna o Champion como heldActor mesmo clicando em espaço vazio. Permite merge de tiers diferentes (bug silencioso que o motor HeroSwarm nunca teve).
+
+- **Exploit: Summon During Merge Despawn Race**
+  - Execução: Spam o botão SUMMON enquanto resolveMergeAtPointer está rodando (specially se merge animation flash for async). onSummonTap adiciona novo actor no meio do `STATE.units = STATE.units.filter(...)`.
+  - Impacto: Filter remove o novo recruit recém-spawnado (porque o .dead foi setado em race), mas o DOM actor permanece visível e imortal (nunca entra mais no array).
+
+- **Exploit: Memory Editing via exposed STATE (Firebase-style Desync)**
+  - Execução: Abra devtools → `STATE.cooldownUntil.summon = 0; STATE.units.push(createActor('dragon', UNIT_TYPES, 540, 555)); STATE.units[STATE.units.length-1].tier = 5`. Como não existe server validation e o playable é single-file, qualquer ad reload mantém o cheat state via localStorage remnant do HeroSwarm v2.
+  - Impacto: Joga com 4 Dragons desde o frame 1. Mata Demon Lord em <4s.
+
+- **Exploit: Pointerup Durante Level Transition + Animation Lock**
+  - Execução: Segure drag exatamente quando wave-info muda de Level 2 para 3 (Demon Lord spawn). O motor HeroSwarm pausa moveActors mas NÃO pausa o pointer handler. Solte após o transition.
+  - Impacto: resolveMergeAtPointer executa com STATE.gameActive=false, cria unit que nunca entra no combat loop, mas fica segurando referência no STATE.units causando memory leak + "ghost army" que bloqueia novos spawns.
+
+- **Exploit: Negative Tier via Cluster com Unit que Morreu no Tick Anterior**
+  - Execução: Mate uma unit do cluster com tackle ao mesmo tempo que o magnetic pull está ativo. No momento do resolve, `u.tier` já foi removido mas o objeto ainda existe no array temporário "cluster".
+  - Impacto: `h.tier + 1` vira NaN → `TIER_TYPE[NaN]` = undefined → createActor(undefined) cria actor corrompido que quebra applyActorTransform (translate3d(NaN, NaN, 0)).
+
+- **Exploit: Multitouch Hold-still Timer Corruption**
+  - Execução: Toque com 2 dedos em units diferentes do mesmo tier. O código atual sobrescreve STATE.holdStartedAt toda vez que qualquer pointermove acontece. Solte um dedo, segure o outro.
+  - Impacto: O timer de 600ms nunca reseta corretamente, fazendo auto-merge disparar constantemente mesmo quando o jogador já soltou. Cria merge chain infinita até crash por stack depth no despawn.
+
+Todos os exploits acima são viáveis com **mudança mínima** no plano proposto (~310 LoC). A maioria explora exatamente as janelas de race entre o game loop a 60fps, o pointer event model e a ausência de locks ou cópias defensivas nos clusters. Recomendo fortemente adicionar `if (u.dead || !u.dom.parentNode)` cedo em tickMagnetic e resolveMergeAtPointer antes de qualquer outra coisa.

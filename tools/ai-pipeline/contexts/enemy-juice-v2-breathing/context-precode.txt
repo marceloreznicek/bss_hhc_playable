@@ -1,0 +1,152 @@
+TASK: pre-code review of a small **iteration on the Enemy Visual Juice v1** that shipped 2026-04-26. The user playtested and reported: "feels a bit too wobbly and not breathing." Scope of this v2 patch is purely a motion-tuning + composition refactor inside `EnemyJuiceScheduler.LateUpdate` and `ArchetypeProfile.ForArchetype`. Surface determinism risks, regressions vs the v1 wiring, mobile perf concerns, edge cases on mid-Tween / mid-Death transitions, and per-archetype balance issues BEFORE Claude writes the code.
+
+══════════════════════════════════════════════════════════════════
+PROJECT CONTEXT (recap of v1 — already shipped)
+══════════════════════════════════════════════════════════════════
+
+- Unity 6, C#, mobile target. Turn-based deterministic combat (`CombatResolver.Resolve`, `RunController.PreviewNextFloor` MUST stay byte-identical regardless of any visual-only change).
+- Per-enemy `EnemyJuiceState` lives on `EnemyVisual.juice`. A single `EnemyJuiceScheduler` MonoBehaviour iterates `states[]` in `LateUpdate`. No allocations per frame. No `UnityEngine.Random`. `Time.unscaledTime` only.
+- Hierarchy per enemy: `Enemy_i` (root, owned by walk-in/lunge coroutines) → `MotionPivot` (child, owned by scheduler — this is where bob/weave/breathe/tilt/punch/wilt write) → `Sprite` (Image) ; `HpBarRoot` is sibling of MotionPivot.
+- v1 motion stack composes:
+  - bob (sin Y) + weave (sin X, different freq)
+  - breathe (uniform `localScale = (s, s)` pulse)
+  - Z-tilt (sin rotation, out of phase with bob)
+  - hit punch (multiplicative scale spike on damage taken)
+  - tide pulse (sprite color brightness pulse, only on Tide-marked enemies, gated on isAlive)
+  - death wilt → ash fade (terminal: alpha to 0, slight upward drift, slight shrink, then `widgetRoot.SetActive(false)`)
+- Per-archetype tuning lives in `ArchetypeProfile.ForArchetype(string)` for Grunt/Swarm/Bruiser/Ranged/Caster/Anchor. v1 dialed amplitudes/frequencies down ~50% from initial values after the user said "calm down".
+- Phase offsets per-enemy are deterministic via `EnemyJuiceScheduler.DeterministicPhase(slot, salt)` (PCG-style 32-bit hash). v1 uses 5 different salts (11 / 23 / 41 / 67 / 97) for bob-V / bob-H / breathe / tilt / pulse — so each motion has an independent phase.
+
+══════════════════════════════════════════════════════════════════
+USER FEEDBACK DRIVING THIS ITERATION
+══════════════════════════════════════════════════════════════════
+
+> "Right now it feels a bit too wobly and not breathing."
+
+Diagnosis (presented to user, accepted):
+- Lateral motion (weave + Z-tilt) is dominating → enemies look like they're floating sideways.
+- Breathe pulse is too small and too fast → reads as zoom flicker, not respiration.
+- Bob and breathe have independent random phases → motion feels uncoordinated, not coherent.
+- Uniform `(s, s)` scale pulse is the wrong shape for "breathing" — chest-expand needs asymmetric squash & stretch.
+
+══════════════════════════════════════════════════════════════════
+LOCKED PATCH SCOPE (v2-breathing)
+══════════════════════════════════════════════════════════════════
+
+**P1. Volume-preserving asymmetric breathe (squash & stretch).**
+Replace uniform `localScale = (s, s)` with `localScale = (1/s, s)` so the body inflates vertically while narrowing horizontally. Real chest expansion is mostly Y-axis; the X compression keeps silhouette mass roughly constant. Pivot is already at sprite center (anchorMin/Max stretch). For pivot at body-center this reads as a clean breath. (If bob pivot were at feet it would read even better, but that's out of scope.)
+
+**P2. Cut weave + tilt amplitudes for non-weighted archetypes.**
+Today every archetype has both. v2 pares them down so only Bruiser/Anchor retain meaningful weight-shift sway. Grunt/Caster/Ranged go near-still laterally and let the breathe carry the "alive" feel. Swarm keeps a touch of twitchy weave to stay differentiated.
+
+Proposed deltas (all in `ArchetypeProfile.ForArchetype`):
+
+| Archetype | weaveAmpX (was → new) | weaveFreqX (was → new) | tiltDeg (was → new) |
+|-----------|------------------------|------------------------|---------------------|
+| Grunt     | 1.5 → 0.4              | 0.5 → 0.4              | 1.0 → 0.4           |
+| Swarm     | 1.2 → 0.7              | 0.85 → 0.85 (keep)     | 1.2 → 0.6           |
+| Bruiser   | 2.0 → 2.2 (slight up)  | 0.4 → 0.35             | 0.8 → 0.8 (keep)    |
+| Ranged    | 1.8 → 0.5              | 0.45 → 0.4             | 0.8 → 0.4           |
+| Caster    | 1.8 → 0.5              | 0.4 → 0.4              | 0.7 → 0.3           |
+| Anchor    | 3.0 → 3.0 (keep)       | 0.3 → 0.25             | 0.7 → 0.7 (keep)    |
+
+**P3. Slower breathe + bigger amplitude.**
+Real respiration ~0.25 Hz (~15 breaths/min) for a calm creature, faster for agitated. Bump amplitude up so the squash/stretch reads.
+
+| Archetype | breatheAmp (was → new) | breatheFreq Hz (was → new) |
+|-----------|------------------------|-----------------------------|
+| Grunt     | 0.015 → 0.045          | 0.45 → 0.28                 |
+| Swarm     | 0.020 → 0.055          | 0.70 → 0.45 (twitchier than Grunt) |
+| Bruiser   | 0.012 → 0.040          | 0.35 → 0.22                 |
+| Ranged    | 0.015 → 0.040          | 0.45 → 0.32                 |
+| Caster    | 0.022 → 0.050          | 0.50 → 0.30                 |
+| Anchor    | 0.018 → 0.055          | 0.30 → 0.18 (slowest, "deep breaths") |
+
+**P4. Phase-couple bob to breathe.**
+Today bob-Y phase (`phaseBobV`, salt=11) and breathe phase (`phaseBreathe`, salt=41) are independent. Couple them: `phaseBreathe = phaseBobV` (drop salt=41 entirely OR set to same as 11). Result: as the chest inhales (breathe peaks), the body bobs to its high point — one coherent breath cycle instead of two competing motions. Bob freq stays decoupled from breathe freq (they can still be different rates), but the *phase offset* matches per-enemy so the natural high point of each motion aligns deterministically.
+
+Also synchronize bob frequency to match breathe frequency for archetypes where that reads better. Proposed: set `bobFreqY = breatheFreq` for Grunt/Bruiser/Ranged/Caster/Anchor (they breathe and bob in lockstep). Keep Swarm decoupled (twitchy).
+
+══════════════════════════════════════════════════════════════════
+CODE SURFACE
+══════════════════════════════════════════════════════════════════
+
+File: `Assets/Prototype/Scripts/EnemyJuice.cs`
+
+`ArchetypeProfile.ForArchetype(string)` — table edit. ~30 lines changed.
+
+`EnemyJuiceScheduler.LateUpdate()` — single change to the breathe block:
+```csharp
+// CURRENT (v1):
+float breathe = 1f + Mathf.Sin(t * s.profile.breatheFreq * TWO_PI + s.phaseBreathe) * s.profile.breatheAmp;
+scaleMul *= breathe;
+...
+s.motionPivot.localScale = new Vector3(scaleMul, scaleMul, 1f);
+
+// PROPOSED (v2):
+float breathe = 1f + Mathf.Sin(t * s.profile.breatheFreq * TWO_PI + s.phaseBreathe) * s.profile.breatheAmp;
+// Asymmetric: chest expands vertically while narrowing slightly. Volume-preserving via inverse.
+float scaleY = scaleMul * breathe;
+float scaleX = scaleMul / breathe;
+...
+s.motionPivot.localScale = new Vector3(scaleX, scaleY, 1f);
+```
+
+Hit punch composition needs review: the punch multiplies `scaleMul` BEFORE the X/Y split. With the new code, hit punch should still apply uniformly (1.18× both axes) on top of the breathe split. The proposed implementation does this correctly because `scaleMul` carries the punch and we split AFTER. Confirm.
+
+Death wilt path: the dead branch sets `scaleMul = Mathf.Lerp(1f, 0.78f, u);` and the new code splits to `(scaleX = scaleMul/breathe, scaleY = scaleMul*breathe)`. **Risk:** at death, breathe is still computed in the !dead branch — which is now skipped because dead is true. So `breathe` is not assigned in the dead path. Need to either (a) reset breathe to 1 in the dead path, OR (b) compute breathe even when dead and let it apply (might look strange — corpse breathing). Recommendation: (a). Confirm.
+
+`phaseBreathe = phaseBobV` change in `BuildEnemyVisuals` (UIController.cs):
+```csharp
+// v1:
+phaseBobV    = EnemyJuiceScheduler.DeterministicPhase(i, 11),
+phaseBobH    = EnemyJuiceScheduler.DeterministicPhase(i, 23),
+phaseBreathe = EnemyJuiceScheduler.DeterministicPhase(i, 41),
+phaseTilt    = EnemyJuiceScheduler.DeterministicPhase(i, 67),
+phasePulse   = EnemyJuiceScheduler.DeterministicPhase(i, 97),
+
+// v2 — couple bob-Y and breathe:
+phaseBobV    = EnemyJuiceScheduler.DeterministicPhase(i, 11),
+phaseBobH    = EnemyJuiceScheduler.DeterministicPhase(i, 23),
+phaseBreathe = EnemyJuiceScheduler.DeterministicPhase(i, 11),  // same salt as bobV
+phaseTilt    = EnemyJuiceScheduler.DeterministicPhase(i, 67),
+phasePulse   = EnemyJuiceScheduler.DeterministicPhase(i, 97),
+```
+
+══════════════════════════════════════════════════════════════════
+WHAT WE WANT FROM EACH REVIEWER
+══════════════════════════════════════════════════════════════════
+
+For each section give numbered findings with severity (BLOCKER / MAJOR / MINOR / NIT) + 1-line fix:
+
+1. **Breathe composition correctness**
+   - Volume-preserving math: is `(1/s, s)` correct for "constant area silhouette"? (Strict volume-preserving in 2D would be `(1/sqrt(s), sqrt(s))` to keep area constant. Is the simpler `(1/s, s)` good enough visually?)
+   - Hit punch + breathe stacking: with `scaleX = scaleMul/breathe, scaleY = scaleMul*breathe`, the punch peak (1.18×) is applied uniformly, then the split. Verify this reads as "punch + breath" rather than weird elongation.
+   - Death wilt: what's the right behavior — frozen breath at u=1, no breath, or inverse-breath as the corpse "exhales"?
+
+2. **Per-archetype balance**
+   - The proposed weave/tilt cuts and breathe bumps — anything that'll make a specific archetype look broken (e.g., Caster too still and lifeless, Bruiser too aggressive)?
+   - Frequencies in the 0.18–0.45 Hz range: any aliasing concerns at common framerates (60 Hz, 30 Hz)?
+
+3. **Phase coupling**
+   - `phaseBreathe = phaseBobV` (same salt) — does this introduce determinism risk? (Both still derive from PCG hash, same input/output guarantees.)
+   - Does coupling phase between bob and breathe risk a "marching in step" effect across multiple enemies of the same archetype, or is the per-slot deterministic seed enough to stagger them?
+   - For archetypes where we also couple frequency (`bobFreqY = breatheFreq`), is the visual coherence worth losing the bob/breathe decoupling we had before?
+
+4. **Sync edge cases**
+   - Mid-Tween (PlayAttack lunge): does the new asymmetric scale interact badly with PlayAttack writing root.localScale = 1.18× (lunge actor) or 0.86× (target push)? Reminder: motionPivot.localScale composes as a child of root.
+   - Mid-Death: confirm breathe is OFF in the dead branch.
+   - Hit punch landing exactly when breathe is at peak — momentary overshoot to 1.18 × 1.05 = 1.24 (uniform) AND 1.18 / 1.05 (X) = 1.12. Acceptable?
+
+5. **Determinism risks**
+   - Anything in this patch that could leak into the resolver / preview / replay path? (Should be zero — it's all visual.)
+   - Float stability: `1f / breathe` when breathe approaches 0 (won't, since breathe = 1 ± 0.06, so breathe ∈ [0.94, 1.06], 1/breathe ∈ [~0.943, ~1.064]). Safe.
+
+6. **Mobile perf**
+   - Same number of math ops as v1 (one extra divide per frame per enemy = 8 divides). Negligible. Confirm.
+
+7. **Anything we're leaving on the table**
+   - Other quick wins for "feels alive" that don't need new art / shaders / clips.
+   - Should we move the motion pivot to the sprite's bottom edge so breathe + bob feel anchored at the feet (more "weight")? That's a hierarchy change beyond the v2-breathing scope — flag as v3 candidate.
+
+Output: numbered, terse, one paragraph per finding max.

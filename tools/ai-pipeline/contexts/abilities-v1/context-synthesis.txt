@@ -1,0 +1,428 @@
+TAREFA: você é Kimi K2.6 sintetizador. As 8 IAs do precode revisaram o plano de implementação do feature 'Character Special Abilities v1' do DiverDungeon (Unity, C#, turn-based deterministic combat resolver). Consolide em um plano único e acionável seguindo o formato obrigatório de 4 seções (Causa raiz / Plano priorizado / Conflitos / Convergências).
+
+════════════════════════════════════════════════════════════════
+RESUMO DA TAREFA REVISADA (para contexto — não repetir)
+════════════════════════════════════════════════════════════════
+
+Implementar v1 de habilidades especiais por herói com mana que enche em ataque/dano-recebido, resolvendo automaticamente entre ações atômicas. Determinismo (Pillar 2) é não-negociável. Stats são structs hoje (HeroStats, EnemyStats). Spec quer adicionar campos: maxMana, startingMana, manaPerAttack, manaPerHit, manaPerHitCap, manaLockTicks, abilityId, e List<ActiveStatus> em cada stat. Resolver ganha hook ResolvePendingCasts() chamado após cada ação atômica. Mana reseta entre floors. Sem RNG em ability v1. PreviewNextFloor() roda o mesmo path.
+
+════════════════════════════════════════════════════════════════
+PARECERES BRUTOS DAS 8 IAs
+════════════════════════════════════════════════════════════════
+
+──── PARECER: opus ────
+# Claude Opus 4.7
+
+- Modelo: `anthropic/claude-opus-4.7`
+
+---
+
+# Pre-Code Review: Character Special Abilities v1
+
+## 1. Determinism Risks (CRITICAL)
+
+**1.1 Struct-list aliasing (BLOCKER).** `HeroStats`/`EnemyStats` são structs. Adicionar `List<ActiveStatus>` como campo faz o `heroList[tIdx] = h` copiar o *reference*, não o conteúdo. Dois problemas:
+- O `Party` em `RunController` e o `heroList` interno do resolver passam a compartilhar a MESMA lista de status. Preview contamina estado real.
+- `var h = heroList[tIdx]; h.hp -= dmg; heroList[tIdx] = h;` já existe — OK para primitivos, mas `h.activeStatuses.Add(...)` muta a lista original antes do write-back.
+- **Fix mandatório:** ou (a) converter `HeroStats`/`EnemyStats` para `class`, ou (b) no começo do `Resolve`, para cada hero/enemy fazer `stats.activeStatuses = new List<ActiveStatus>(src.activeStatuses);`. Recomendo (a) — elimina classe inteira de bugs e o custo é irrelevante (≤8 heróis).
+
+**1.2 Iteração de status.** Durante `TickAndPruneStatuses`, iterar e remover na mesma passada. Use loop reverso por índice; nunca `foreach` + `RemoveAll` com lambdas capturando state mutável (ordem de avaliação OK, mas fácil de quebrar em refactors).
+
+**1.3 Float em coeficientes.** Ability magnitude = `atk * coefficient` (float). Garantir `Math.Round` (não cast truncado) e ordem fixa de ops. Documentar: `(int)Math.Round(caster.atk * coef, MidpointRounding.AwayFromZero)`.
+
+**1.4 RNG.** v1 não adiciona RNG, mas `PickHeroTarget`/`PickEnemyTarget` já consomem o `rng`. `ResolvePendingCasts` entre ações NÃO pode consumir o RNG (spec item 10: "NO ability-specific RNG") — confirmar que resolução de target de ability é puramente determinística (slot index, first-alive, lowest-hp+tiebreak). ✅ spec cumpre.
+
+## 2. Edge Cases Faltando na Spec
+
+**2.1 DoT timing ambíguo.** Spec diz status decrementa "at end of enemy-side step". Mas QUANDO o dano de DoT é aplicado? Propostas possíveis:
+- (A) No tick-down de fim-de-round, ANTES de decrementar `ticksRemaining`.
+- (B) No começo do turno do afetado.
+- **Decida e trave.** Recomendo (A): aplica dano → `ResolvePendingCasts` (mana de dano de DoT? ver 2.2) → decrementa → prune. Se DoT matar inimigo, o early-exit precisa acionar antes do próximo round.
+
+**2.2 DoT gera mana?** Spec item 3 diz mana on-hit é PRE-mitigation de ataque inimigo. DoT não é "ataque inimigo". **Trave: DoT NÃO gera mana** (senão vira loop de auto-sustain). Documente.
+
+**2.3 Shield vs DoT.** Spec silencia. Trave: Shield absorve QUALQUER dano recebido (ataque ou DoT), na ordem shield→hp. Senão Shield fica subespecificado.
+
+**2.4 StatBuff mid-round.** Cast no meio da rodada altera `atk`/`def` dos próximos atacantes no MESMO round? Determinístico em ambos os casos, mas player-experience diferente. **Recomendo: efeito imediato** (mais previsível dado "cast entre ações atômicas"). Testes devem fixar isso.
+
+**2.5 `LowestHpAliveAlly` inclui o caster?** Spec não diz. Recomendo: INCLUI self; tiebreak por slot index já resolve self vs outro empatado.
+
+**2.6 Focus clear em mid-floor kill por cast.** Se cast mata `focusEnemyIndex`, resolver só usa focus em `PickHeroTarget` que já trata `enemy.hp<=0` com fallback (confirmar no código não-colado). Não precisa limpar focus durante resolve; mas `RunController.FocusEnemyIndex` UI-side precisa ser limpo em `ApplyFloorOutcome` — já é, OK. **Flag:** durante preview, nenhum write-back de focus deve vazar.
+
+**2.7 Floor-start AoE em inimigos recém-spawnados.** Spec item 8 manda `ResolvePendingCasts()` após reset. Se hero tem `startingMana >= maxMana` e ability = `AllEnemies`, dispara antes de qualquer ataque. **Isso é intencional? Confirme com PM.** Se sim, documente como feature. Senão, mude ordem: reset mana → attacks começam → cast no primeiro boundary.
+
+**2.8 Re-entrância de `ResolvePendingCasts`.** v1 não tem efeito que gera mana em aliados. Mas o
+
+──── PARECER: sonnet ────
+# Claude Sonnet 4.6
+
+- Modelo: `anthropic/claude-sonnet-4-6`
+
+---
+
+# Revisão de Segurança — Character Special Abilities v1
+
+## 1. Vetores de Ataque Críticos
+
+### 1.1 Cliente como fonte de verdade para mana/status
+**Risco alto.** O spec inteiro é server-side? Se o resolver roda APENAS no cliente (Unity), um atacante com GameGuardian pode:
+- Editar `hero[hi].mana` diretamente em memória → forçar cast instantâneo
+- Editar `ticksRemaining` de status → tornar Shield permanente
+- Editar `hp` de inimigos → pular floors
+
+**Mitigation:** Se houver qualquer placar competitivo (PvP/torneio), o seed + inputs devem ser enviados ao servidor e o resultado reprocessado server-side. Para PvE solo, documentar explicitamente que o modelo de ameaça aceita cheating local.
+
+### 1.2 Struct-List Aliasing — Vetor de State Corruption
+**Item 3 do prompt, mas com implicação de segurança:** `HeroStats` como struct com `List<ActiveStatus>` cria aliasing de referência. Em modo multiplayer ou replay, um state clone corrompido pode produzir resultados divergentes do servidor — abrindo brecha para replay fraudulento onde o cliente envia resultado manipulado.
+
+**Mitigation:** `ActiveStatus` lista deve ser deep-copied em toda cópia de `HeroStats`. Garantir via construtor explícito.
+
+### 1.3 Overflow de Recursos via manaPerHitCap = 0
+Se CSV carregar `manaPerHitCap = 0`, a expressão `min(rawDamage, 0)` resulta em 0 — comportamento silencioso. Se `maxMana = 0`, `mana >= maxMana` é sempre verdadeiro → cast infinito por tick.
+
+**Mitigation obrigatória:** Validação no loader: `maxMana <= 0` → warn + force `maxMana = 1`, desabilitar ability.
+
+### 1.4 Save File — Status Effects Persistidos
+Spec item 8 determina clear de statuses no floor start, mas se o save file serializar `activeStatuses` e for modificado externamente (GameGuardian file editor), o hero pode entrar no floor com Shield permanente.
+
+**Mitigation:** Ao deserializar save, forçar `activeStatuses.Clear()` antes de `ResolvePendingCasts()`. Não confiar no estado serializado de statuses.
+
+### 1.5 DamageOverTime — Pre-mitigation no spec é ambíguo
+Spec item 3 define mana gain on hit como `rawDamage = enemyAtk` (pre-mitigation). Se DoT também usar `magnitude` sem mitigação aplicada sobre Shield, um atacante que manipula `sourceHeroIndex` no save pode inflar DoT de heróis inexistentes.
+
+**Mitigation:** Validar `sourceHeroIndex` está em `[0, heroCount-1]` ao deserializar. Tratar index inválido como no-op + log.
+
+## 2. Determinismo — Riscos Adicionais
+
+- `List<ActiveStatus>` não é value type: iteração de substituição ("replace on re-cast") usando `List.Find` pode divergir se implementada com LINQ (order não garantida em edge cases de igualdade)
+- `dmgMult` é `float` — `System.Math.Round(rawDmg * dmgMult)` pode divergir entre plataformas ARM vs x86 se `dmgMult != 1f`. Usar aritmética inteira: `(rawDmg * misFocusMultiplierNumerator) / misFocusDenominator`
+
+## 3. Invariantes de Teste Críticos
+
+```
+// Deve falhar se aliasing de lista estiver presente
+Assert(clone.activeStatuses != original.activeStatuses) // referência diferente
+
+// Determinismo
+Assert(Resolve(state, seed) == Resolve(state, seed)) // byte-identical
+
+// maxMana=0 não causa loop infinito
+Assert(ResolvePendingCasts com maxMana=0 termina em <= 1 iteração)
+```
+
+**Veredicto:** Não shipar em modo com scores competitivos sem reprocessamento server-side do resolver. Para PvE, priorizar fix do aliasing de struct antes de qualquer merge.
+
+──── PARECER: gpt53-codex ────
+# GPT-5.3 Codex
+
+- Modelo: `openai/gpt-5.3-codex`
+
+---
+
+(1) Análise passo-a-passo da lógica
+
+1) Fluxo base está correto com gatilho “entre ações atômicas” (item 4), mas há TOCTOU lógico: após `PerformHeroAttack`/`ApplyEnemyAttack`, `ResolvePendingCasts()` pode matar alvos e alterar `AnyAlive*`; os loops precisam revalidar estado imediatamente (já previsto parcialmente).  
+2) Determinismo: hoje já existe float em `misFocusDamageMultiplier` + `Math.Round(rawDmg * dmgMult)`. Isso é ponto de divergência cross-runtime. Com habilidades/status novos, proíba qualquer novo float no resolver.  
+3) Estruturas: `HeroStats`/`EnemyStats` são `struct`. Adicionar `List<ActiveStatus>` dentro de struct cria aliasing em cópia por valor (preview e runtime compartilhando referência interna). Isso quebra determinismo e isolamento de preview. Eu não aprovo ship com essa forma.  
+4) Floor-start cast (item 8): ordem “spawn inimigos -> reset mana/status -> ResolvePendingCasts” implica burst em inimigos recém-spawnados; está coerente com contrato, mas deve ser explícito em UX.  
+5) `ResolvePendingCasts()` em ordem de slot é determinístico, mas precisa garantia de não reentrância (cast não chama cast).  
+6) CSV-driven: falta invariantes de saneamento antes do combate.
+
+(2) Casos onde falha
+
+1) `maxMana<=0`: com regra `mana>=maxMana`, herói casta infinitamente em todo gatilho (ou casta sempre no floor start).  
+2) `manaPerAttack<0` / `manaPerHitCap<0`: mana negativa/saturação errada; pode impedir cast para sempre.  
+3) `startingMana>maxMana`: sem clamp de entrada, comportamento depende do local do clamp.  
+4) Tick de status: se combate termina no meio do enemy-side, “decrement no fim da rodada” pode nunca ocorrer; precisa regra única e testável.  
+5) DoT timing indefinido (aplica dano quando? no tick-down? antes/depois de lock decrement).  
+6) Shield vs DoT indefinido (absorve ou não).  
+7) `LowestHpAliveAlly`: se caster é menor HP, alvo deve ser self (não skip).  
+8) Foco após morte do alvo durante cast: se não recair para `FirstAliveEnemy` no próximo target pick, pode gerar target inválido.
+
+(3) Correção proposta
+
+1) Trocar runtime para classes (`HeroState`/`EnemyState`) ou manter structs sem referências; status em arrays/listas externas por índice.  
+2) Resolver inteiro-only: multiplicadores em fixed-point (ex. milésimos int) e arredondamento explícito determinístico.  
+3) Guardrails CSV no load: clamp `maxMana>=1`, `startingMana[0..maxMana]`, `manaPer*>=0`, `manaPerHitCap>=0`; `abilityId` inválido => `None` consumindo mana + warning (item 13).  
+4) Definir sem ambiguidade: “status efetivo imediatamente após aplicação”; DoT processa no `TickAndPrune` de fim de rodada; Shield não absorve DoT (ou absorve), mas fixar em contrato.  
+5) API mínima: adicionar `heroManaAfter:int[]` em `CombatResult` (compatível), opcionalmente `logFlags` sem expandir TickEvent.  
+6) Testes obrigatórios:  
+   - determinismo byte-a-byte (1000 seeds, repetir N vezes);  
+   - preview não muta party original;  
+   - teste anti-aliasing (status alterado no clone não aparece no live);  
+   - casos-limite de CSV inválido;  
+   - ordem de multi-cast por slot;  
+   - morte no hit ainda ganha mana, mas não casta (item 3/6).
+
+──── PARECER: qwen ────
+# Qwen 3.6 Plus
+
+- Modelo: `qwen/qwen3.6-plus`
+
+---
+
+1. **Determinismo & Struct/Aliasing:** `HeroStats` é `struct`; adicionar `List<ActiveStatus>` cria referência compartilhada na cópia-valor. Mutação em um ciclo vaza para outras instâncias no loop, quebrando a invariante byte-identical e o preview. *Correção obrigatória:* Substitua a lista por array fixo embutido (`ActiveStatus[4]`) ou use `ImmutableList`. Alternativa futura de manutenção: migrar `HeroStats` para `record class` com deep-clone explícito se a contagem de status crescer.
+
+2. **Ponto Flutuante & Arredondamento:** `dmgMult` usa `float` e `Math.Round`. Semântica IEEE-754 varia entre IL2CPP e Editor, arriscando divergência de bits. *Correção:* Trabalhe com inteiros fixos (ex: `int scaled = 1000; dmg = (raw * mult) / scaled`). Buffs aplicados mid-round devem vigorar apenas na *próxima ação do alvo*, nunca sincronamente, para evitar acoplamento de ordem de iteração.
+
+3. **Edge Cases Críticos:** (a) `Tick` vs `DoT`: defina que o decremento global ocorre no fim do turno do inimigo; DoTs disparam no *início* da ação do alvo. (b) `LowestHpAliveAlly`: empate resolvido obrigatoriamente por menor índice de slot (0..N-1). (c) Foco eliminado mid-round: `focusEnemyIndex` deve ser invalidado (`-1`) antes do próximo `PickTarget`, senão `rng` e fallback divergem.
+
+4. **Preview & GC:** Chamado por frame na UI, alocar `List<>` por tick gera picos de GC e duplica custo de clone. Use `ArrayPool<T>` ou `Span<T>` para logs/status. Mantenha o resolver 100% síncrono, zero `new` exceto no `CombatResult` final.
+
+5. **API/CSV Shape:** Estenda `CombatResult` com `int[] heroManaAfter`. CSV deve usar `TryParse` com defaults seguros (`maxMana<1→1`, ID vazio→`None`, logs só no `Load`, nunca no loop). Valide integridade upfront; falhas silenciosas previnem crashes em runtime.
+
+──── PARECER: gemini-flash ────
+# Gemini 3 Flash
+
+- Modelo: `google/gemini-3-flash-preview`
+
+---
+
+Aqui estão os insights críticos para a implementação do sistema de habilidades:
+
+1.  **O Trap de Mutabilidade em Structs (Pilar 2):** Ao adicionar `List<ActiveStatus>` à `HeroStats` (struct), você quebra a imutabilidade por valor. Ao copiar a struct, a referência da lista é compartilhada. Se o `PreviewNextFloor` rodar, ele modificará o estado da lista na `Party` real do `RunController`.
+    *   **Solução:** O `CombatResolver` deve realizar um *deep clone* manual das listas de status ao inicializar ou, preferencialmente, usar uma estrutura de dados fixa (ex: array de tamanho fixo com contagem) para evitar alocações e garantir determinismo total.
+
+2.  **Abuso do Rounding em Multiplicadores (Determinismo):** O código atual usa `(int)Math.Round(rawDmg * dmgMult)`. Com multiplicadores vindos de habilidades (`StatBuff`), o risco de divergência de ponto flutuante entre plataformas aumenta.
+    *   **Solução:** Converta todos os coeficientes de habilidades no CSV para inteiros (ex: 150 em vez de 1.5) e use aritmética de base fixa: `(damage * magnitude) / 100`. Nunca confie em `float` para resultados que impactam o HP.
+
+3.  **Recursão de Cast e State-Lock:** O `ResolvePendingCasts` é chamado após cada ação. Se uma habilidade de v1 (ex: flat heal) gerar mana indiretamente ou se o escopo expandir, você pode entrar em loop infinito.
+    *   **Insight:** Implemente um "CurrentCastingHeroIndex" temporário ou uma flag `isCasting` para evitar que `ResolvePendingCasts` seja reentrado antes de limpar o mana do conjurador atual. Redefina o mana para 0 *antes* de processar o efeito da habilidade.
+
+4.  **A Ambiguidade do "Post-Attack" Mana:** Se o Hero0 ataca e mata o último inimigo, o item 3 diz que o ganho de mana ocorre *após* o dano. Se o inimigo morre, a luta acaba. O herói ganha esse mana para o próximo andar?
+    *   **Conflito com Item 8:** O item 8 diz que no início do andar o mana é resetado para `startingMana`. Isso torna o ganho de mana no golpe final inútil e pune heróis de final de round. Sugiro que `startingMana` seja apenas para o Round 1 da run, persistindo o mana entre andares (contrariando o item 8 para evitar frustração de UX).
+
+5.  **Excesso de Logs no Preview:** O `PreviewNextFloor` é chamado frequentemente. Adicionar `TickEvent` para cada ganho de mana e cast de habilidade causará pressão severa no GC.
+    *   **O pulo do gato:** Adicione uma flag `bool isPreview` no `Resolve`. Se `true`, ignore o `log.Add(...)`. Retorne apenas o estado final de HP/Mana. O custo de clonar `List<ActiveStatus>` repetidamente no preview será o gargalo; use um pool de objetos ou arrays estáticos.
+
+6.  **Invariante de Teste:** Escreva um teste de "Bit-Identical Result": rode o resolver 1000 vezes com o mesmo seed e compare o `GetHashCode` do `CombatResult` final (incluindo o novo array `heroManaAfter`). Se houver discrepância, você tem vazamento de estado ou uso de `System.Random` global.
+
+──── PARECER: kat ────
+# KAT Coder Pro V2
+
+- Modelo: `kwaipilot/kat-coder-pro-v2`
+
+---
+
+# Pre-Code Review: Character Special Abilities v1
+
+## 1. Determinism Risks (Critical)
+
+### 1.1 Struct-List Aliasing — **BLOCKER**
+`HeroStats` is a `struct`. Adding `List<ActiveStatus> activeStatuses` creates shared reference semantics on copy:
+
+```csharp
+var h1 = heroList[0];        // copies struct, but List ref is shared
+h1.activeStatuses.Add(...);  // mutates the SAME list as heroList[0]
+```
+
+This breaks determinism if any code path copies the struct without deep-cloning the list. The current resolver already does `var h = heroList[tIdx];` — if `ActiveStatus` list is added, this pattern silently corrupts.
+
+**Fix required before coding:** Either make `HeroStats` a `class`, or add a `Clone()` helper that deep-copies the list, and enforce its use everywhere the struct is read/modified.
+
+### 1.2 Floating-Point in Status Tick
+Spec says `StatBuff`/`StatDebuff` magnitude scales off `atk` via a coefficient. If coefficient is `float` and applied each tick, order-of-operations divergence is possible across runs.
+
+**Fix:** Store magnitude as `int` in `ActiveStatus`. Pre-compute at cast time.
+
+### 1.3 `System.Random` Re-seeding
+Current code creates one `Random(seed)` at start. If `ResolvePendingCasts` needs RNG (future: random-target abilities), it must reuse the same instance. Creating new `Random()` inside the loop risks same-tick seeds.
+
+**Flag:** Ensure `rng` is threaded through every method that might need it, even if v1 doesn't use it.
+
+## 2. Edge Cases the Spec Misses
+
+### 2.1 Status Tick on Early-Exit Rounds
+If the last hero kills all enemies during the hero-side, the loop breaks **before** the enemy-side and before `TickAndPruneStatuses()`. Do statuses still tick? The spec says "end of enemy-side step" — but there is no enemy-side step if enemies are dead.
+
+**Recommendation:** Tick statuses at end of every **full round** (after enemy-side OR after hero-side if enemies wiped). Add explicit rule.
+
+### 2.2 DamageOverTime Application Timing
+DoT is listed as a status type but its damage application timing is unspecified. Does DoT damage apply:
+- At the same time as the global tick-down?
+- Before or after the mana-gain-from-damage check?
+- Does DoT damage count as "taking damage" for `manaPerHit`?
+
+**Recommendation:** DoT damage applies during `TickAndPruneStatuses()`, after all attacks, before mana lock decrement. DoT damage does NOT trigger `manaPerHit` (it's not an enemy attack).
+
+### 2.3 Shield vs DoT Interaction
+Spec is silent. Does Shield absorb DoT damage? If yes, Shield must be checked during DoT application, not just during direct attacks.
+
+**Recommendation:** Shield absorbs all damage (including DoT). Document.
+
+### 2.4 StatBuff Timing
+If a hero casts `StatBuff` on themselves during their attack trigger, does the buffed `atk` apply to the **same** attack's damage, or only future attacks?
+
+Given the flow (`PerformHeroAttack` → `mana += manaPerAttack` → `ResolvePendingCasts`), the buff lands **after** damage. This is correct but non-obvious. Document.
+
+### 2.5 `LowestHpAliveAlly` Self-Target
+If caster is the lowest-HP alive ally, should the ability target self (effectively `SelfOnly`) or skip? The fallback rule says "→ `SelfOnly` if caster is the only alive ally" — but doesn't cover "caster is lowest among multiple."
+
+**Recommendation:** `LowestHpAliveAlly` always picks the lowest-HP alive ally (could be self). Only falls back to `SelfOnly` when caster is the *only* alive ally.
+
+### 2.6 Focus Clear on Target Death
+Spec says `RunController.FocusEnemyIndex` resets on `ApplyFloorOutcome`, but mid-floor focus when the focused enemy dies is unhandled. The resolver's `PickHeroTarget` currently returns `-1` if no valid target — but with focus set to a dead enemy, what happens?
+
+**Recommendation:** `PickHeroTarget` should auto-fallback to `FirstAliveEnemy` when focused enemy is dead, and `focusEnemyIndex` should be cleared to `-1` in the resolver state (not just at floor end).
+
+### 2.7 Floor-Start Cast on Fresh Enemies
+`ResolvePendingCasts()` runs after `startingMana` assignment and after enemies are spawned. If a hero has `startingMana >= maxMana` and ability is `AllEnemies`, the cast fires at floor start. Is this intended? It effectively gives a free pre-combat nuke.
+
+**Recommendation:** Confirm with design. If unintended, move `ResolvePendingCasts()` to **before** enemy spawn, or add a `canCastAtFloorStart` flag.
+
+### 2.8 Re-entrancy Safety
+`ResolvePendingCasts` iterates heroes; a cast could (in future) apply mana to allies, pushing them to max and triggering another cast in the same loop iteration. The current sequential walk would handle this (the later hero would be checked after the buff lands). But if a cast could buff an **earlier** hero in the list, that hero would not get re-checked.
+
+**Flag:** Document that v1 abilities cannot grant mana. If future abilities do, the loop must be re-entrant (repeat until no new casts).
+
+## 3. C# / Unity Gotchas
+
+### 3.1 Struct Mutation Pattern
+Current code:
+```csharp
+var h = heroList[tIdx];
+h.hp -= dmg;
+heroList[tIdx] = h;
+```
+With `List<ActiveStatus>` added, this pattern becomes dangerous because `h.activeStatuses` is a reference to the list inside `heroList[tIdx]`. Mutating `h.activeStatuses` **does** mutate the original (since it's the same list object). But **reassigning** `h.activeStatuses = newList` would not propagate back.
+
+This is a subtle inconsistency: some mutations persist, others don't. **Strongly recommend converting `HeroStats` to a `class`.**
+
+### 3.2 `IList<>` Copy in `Resolve`
+```csharp
+var heroList = new List<HeroStats>(heroes); // shallow copy of struct values
+```
+If `HeroStats` gains a `List<>` field, this copy shares list references. Any mutation inside `Resolve` (which is also used by `PreviewNextFloor`) would corrupt the live `Party` state.
+
+**This is a determinism-breaking bug if `PreviewNextFloor` passes
+
+──── PARECER: gpt55 ────
+# GPT-5.5 (co-coder)
+
+- Modelo: `openai/gpt-5.5`
+
+---
+
+1. **Contradições que Claude precisa resolver antes de codar**
+   - Scope item 3 diz: se herói morre, mana-on-hit ainda é registrada, mas não cast. Pseudocode faz `if hero[target].hp > 0` antes de ganhar mana. Isso viola o contrato. Implementar ganho sempre, cast bloqueado por `hp <= 0`.
+   - “rawDamage PRE-mitigation = enemyAtk” conflita com pseudocode `enemy.atk * dmgMult` e código atual calcula `rawDmg = max(1, atk - def)` antes do multiplicador. Precisa invariant único. Sugestão: `preMitigationRaw = max(1, Round(enemy.atk * dmgMult))`; mitigado = `max(1, Round((enemy.atk - hero.def) * dmgMult))`, ou documentar diferente. Não misturar.
+
+2. **Maior risco determinístico: `struct` + `List<ActiveStatus>`**
+   - `new List<HeroStats>(heroes)` copia structs, mas copia a referência da lista interna. Preview pode mutar status da party real. Isso quebra preview, replay e determinismo aparente.
+   - Eu evitaria `List<>` dentro de struct. Melhor trocar runtime stats para classe clonável ou fazer deep clone explícito.
+
+```csharp
+public sealed class HeroStats {
+    public int hp, maxHp, atk, def, mana, manaLockTicksRemaining;
+    public AttackType attackType;
+    public readonly List<ActiveStatus> activeStatuses = new();
+
+    public HeroStats CloneRuntime() {
+        var c = (HeroStats)MemberwiseClone();
+        c.activeStatuses.Clear();
+        c.activeStatuses.AddRange(activeStatuses);
+        return c;
+    }
+}
+```
+
+   - Se mantiver struct, nunca use `new List<HeroStats>(heroes)`; criar helper `CloneHeroStatsDeep`.
+
+3. **Status effects estão subespecificados**
+   - Definir ordem única no fim do round: aplicar DoT/heal/status effects primeiro, depois decrementar/prunar, ou vice-versa. “tick-down” não diz quando DoT causa dano.
+   - Definir se status ticka quando o combate acaba no meio do round. Sugestão determinística: só tickar após completar enemy-side loop e ainda houver ambos os lados vivos.
+   - Definir Shield vs DoT: absorve ou não. Sugestão: Shield absorve todo dano recebido, inclusive DoT, para uma regra simples.
+   - StatBuff/Debuff aplicado mid-round deve afetar imediatamente ações posteriores do mesmo round; mais simples e deterministicamente observável.
+
+4. **ResolvePendingCasts: cuidado com reentrância e cascata**
+   - Não chamar recursivamente. Um cast não deve disparar outro cast até o loop atual continuar em slot order.
+   - Se efeitos futuros concederem mana, o herói anterior no slot não deve ser reconsiderado até o próximo boundary. Documentar como invariant.
+   - Unknown ability deve consumir mana mesmo sem efeito.
+
+5. **Targeting**
+   - `FocusedEnemy` deve validar alive; se morto, cair para first alive, sem alterar `RunController.FocusEnemyIndex` durante resolver.
+   - `LowestHpAliveAlly`: se caster é menor HP, target self. Fallback para self só quando não há outro vivo é redundante, mas ok.
+   - AoE deve iterar por índice crescente; nunca por dictionary/set.
+
+6. **CSV hardening**
+   - `maxMana <= 0` é perigoso: todo boundary castaria. Definir default mínimo `1` ou tratar como invalid row e usar no-op ability com `maxMana=999999`.
+   - Clamp `startingMana`, `manaPerAttack`, `manaPerHitCap` para `>=0`; rejeitar/normalizar negativos.
+   - `abilityId` vazio → `None`, warning único por id/hero, não por cast.
+   - Não usar `Dictionary.Values` para resolver ordem de habilidades/status. Lookup por id ok; aplicação sempre por listas ordenadas.
+
+7. **Preview/performance**
+   - Adicionar `CombatOptions { bool collectLog }`; preview pode não coletar log detalhado.
+   - Evitar alocações por cast: targets via loops diretos, não `LINQ`, não listas temporárias.
+   - Deep clone só no início do resolver, não por tick.
+   - Status list capacity pequena inicial, exemplo `new List<ActiveStatus>(4)`.
+
+8. **API mínima**
+   - Estender resultado:
+```csharp
+public struct CombatResult {
+    public FloorOutcome outcome;
+    public int[] heroHpAfter;
+    public int[] heroManaAfter;
+    public int totalTicks;
+    public List<TickEvent> log;
+}
+```
+   - Se UI quer trajetória, adicionar opcionalmente mana em `TickEvent`: `actorManaAfter`, `targetManaAfter`, ou novo `AbilityEvent`.
+
+9. **Testes obrigatórios**
+   - Mesmo input resolve 100 vezes com hash byte-idêntico de outcome/hp/mana/ticks/log.
+   - Preview não altera `RunController.Party` hp/mana/status.
+   - Herói morto por hit ainda ganha mana, mas não casta.
+   - Dois heróis cheios castam em slot order.
+   - Unknown ability consome mana e não crasha.
+   - Focus morto cai para first alive.
+   - Status recast substitui, não duplica.
+
+──── PARECER: grok ────
+# Grok 4.20
+
+- Modelo: `x-ai/grok-4.20`
+
+---
+
+**RED TEAM REVIEW – DiverDungeon Character Special Abilities v1 (pre-code)**
+
+- **StructListAliasingExploit**: Adicionar `List<ActiveStatus> activeStatuses` diretamente em `HeroStats` (struct). Execute: `var copy = heroList[0]; copy.activeStatuses.Add(newStatus);` — a lista é compartilhada por referência entre todas as cópias feitas em `Resolve()`, `PreviewNextFloor()` e clones. Impacto: preview altera estado do Party real, multi-device save/load divergem, preview floor X modifica mana/status de floor X-1 de forma não-determinística.
+
+- **ResolvePendingCastsReentrancyViaStatBuff**: Embora v1 não tenha mana-gain-on-cast, o framework permite `StatBuff` que aumente `atk` ou `maxMana` indiretamente. Execute: cast de herói 0 aplica StatBuff que faz herói 1 atingir `mana >= maxMana` dentro do mesmo `ResolvePendingCasts()`. Impacto: se o loop continuar sem cópia de lista ou snapshot, itera sobre coleção modificada (InvalidOperationException ou skips silenciosos), quebra ordem de slot e determinism (resultado varia conforme ordem de aplicação).
+
+- **ManaLockTickRaceWithEndOfRound**: `manaLockTicksRemaining` decrementado só em `TickAndPruneStatuses()` no final do round inimigo. Execute: cast que aplica manaLock=2 no último atomic action da rodada; o decremento ocorre antes ou depois do próximo `ResolvePendingCasts()` dependendo se o round terminou cedo por wipe. Impacto: herói pode castar 1 tick antes do esperado em runs vs preview, violando Pillar 2.
+
+- **FloorStartCastOnFreshEnemiesDesync**: `on_floor_start` limpa statuses, seta `startingMana`, chama `ResolvePendingCasts()`. Execute: herói com `startingMana >= maxMana` e `abilityId` = AllEnemies/FirstAliveEnemy. Impacto: jogador vê dano em inimigos antes do primeiro turno visual (UI mostra inimigos full HP mas log tem dano), preview e real run divergem em totalTicks se o cast matar inimigos instantaneamente.
+
+- **StatusListCopyOmissionInPreview**: `PreviewNextFloor()` passa `Party` (List<HeroStats>) que internamente vira `new List<HeroStats>(heroes)`. Como struct copia referência da List<ActiveStatus>, qualquer `Add()` ou `Clear()` em preview contamina o estado real do RunController. Execute: preview roda 60fps enquanto jogador abre menu. Impacto: save/load entre devices mostra mana/status errados, ou preview altera HP/mana do run atual de forma silenciosa.
+
+- **NonDeterministicDictionaryOrLinqInTargetSelection**: Se `LowestHpAliveAlly` ou `FirstAliveAlly` for implementado com `.OrderBy(h => h.hp).ThenBy(h => h.slot)` e `HeroStats` virar class ou usar LINQ em dicionário, ordem de iteração não é garantida. Execute: dois heróis com mesmo HP exato. Impacto: preview e real run escolhem alvos diferentes → byte output diverge (viola spec #11).
+
+- **RawDamageManaGainPreMitigationLeak**: Mana gain usa `rawDamage = enemyAtk * dmgMult` (pré-mitigation). Execute: inimigo com misFocus (dmgMult=2.5f), `rawDamage` = 250, mas dano real após def = 80. Herói ganha mana baseado em 250. Impacto: mana inflacionado em runs com tide rule, preview (que recria rule) pode usar float rounding diferente se `(int)Round` for chamado em ordem errada, quebra determinism em seeds idênticos.
+
+- **MultipleCastsPerTriggerOrderDependency**: `ResolvePendingCasts()` anda de slot 0 a N. Execute: herói 0 cast AllEnemies que aplica DoT em todos; herói 1 (agora com mana cheia por algum buff) casta Shield. Ordem fixa é boa, mas se alguém mover o loop para `while any at max` sem ordem de slot, ordem de cast vira não-determinística. Impacto: StatBuff/Debuff aplicados em sequência diferente alteram dano posterior no mesmo round.
+
+- **TickAndPruneDuringEarlyExitRace**: Spec diz tick só no final do enemy-side. Execute: wipe ocorre no meio do hero-side após cast que mata último inimigo. `TickAndPruneStatuses()` roda ou não? Se rodar sempre no final do while, mas early return pula, status ticks ficam inconsistentes entre preview e run real. Impacto: DoT dura 1 tick a mais/menos, altera HP final em 1-2 pontos → CombatResult diferente.
+
+- **CSVNegativeManaValuesPersistenceBug**: CSV com `manaPerAttack=-5`, `maxMana=0` ou `startingMana=9999`. Spec diz “Unknown abilityId → None que consome mana”. Execute: herói com maxMana=0 ganha mana negativa via manaPerHit, nunca reseta. Impacto: mana fica negativo para sempre (clamp falha se feito só em >=0), preview acumula valores diferentes, save entre floors carrega mana “locked” negativo.
+
+- **HeroStatsStructMutationDuringCastListModification**: Porque `HeroStats` é struct, `CastAbility(hi)` que faz `var h = heroList[hi]; h.activeStatuses.Add(...)` e depois `heroList[hi] = h` copia a lista reference, mas se `ActiveStatus` for struct e lista for modificada dentro de `ApplyStatus`, mutação visível em outras cópias. Execute: cast em preview vs real. Impacto: GC pressure + silent state corruption, especialmente com `PreviewNextFloor()` chamando Resolve múltiplas vezes por frame.
+
+- **AbilityNoneStillConsumesManaButPreviewLogPollution**: Spec #13: unknown abilityId = None, consome mana, log warning. Execute: abilityId inválido no CSV. Cast ocorre, mana reseta, mas `TickEvent` não registra o cast (só dano/heal). Impacto: preview log e real log divergem em tamanho/conteúdo → UI de “battle replay” quebra se for implementada depois, determinism visual perdido.
+
+- **FocusDeathMidCastTargetResolutionRace**: Cast de tipo `FocusedEnemy` mas o foco morre no cast anterior do mesmo `ResolvePendingCasts()`. Spec não define fallback dentro do loop. Execute: herói 0 mata focused enemy com FlatDamage, herói 1 tem FocusedEnemy. Usa índice morto ou re-resolve para FirstAlive? Impacto: preview e real podem escolher alvos diferentes se fallback não for deterministic e baseado em slot order.
+
+- **CloningCostExplosionInPreview**: Cada `ResolvePendingCasts()` + status list deep-copy a cada atomic action. Preview chamado todo frame na UI. Execute: party de 4 heróis, 6 inimigos, fight longa = 80+ casts/status checks por preview. Impacto: GC spike, frame drop no editor e mobile, jogador sente lag ao mover focus slider.
+
+- **ManaClampOrderWithManaOnKO**: Spec diz “if hp <= 0 after hit, mana gain is still recorded but cast does NOT fire”. Execute: dano leva HP para -10, mana ganha mesmo assim, clamp acontece antes ou depois do check hp<=0 no `ResolvePendingCasts()` seguinte? Se clamp após morte, mana pode ficar negativo ou acima de maxMana em edge case. Impacto: save state carrega mana inválido entre floors.
+
+- **SystemRandomSeedingInPreviewVsReal**: `seed = floor * 1000 + Party.Count` é usado tanto em preview quanto real. Mas se `Resolve()` agora chama `System.Random` dentro de `PickTarget` após mais passos (devido a casts), o consumo de RNG diverges se número de casts variar. Impacto: mesmo seed, preview mostra wipe, real run limpa floor (violação crítica do Pillar 2).
+
+- **ActiveStatusSourceHeroIndexAfterHeroDeath**: Status carrega `sourceHeroIndex`. Herói 0 aplica DoT, morre, herói 2 usa sourceHeroIndex=0 para scaling. Index inválido acessado. Impacto: ArrayIndexOutOfRange ou scaling errado se lista de heróis mudar de tamanho, especialmente em multi-floor persistence (mesmo que locked out para mana, status clear não impede index stale).
+
+- **NoDeepCloneForCombatResultInPreview**: `CombatResult` contém `List<TickEvent>` e arrays. Se `RunController` guardar referência ao resultado do preview sem copiar, UI modificando log por engano contamina próximo preview. Impacto: replay/determinism visual quebrado, difícil debuggar “why preview diferente do real”.
+
+- **BalanceCSVZeroMaxManaCastSpam**: `maxMana=0` no CSV. Spec #13 cobre unknown ability mas não maxMana=0. Execute: manaPerAttack=1, maxMana=0 → todo attack enche mana instantaneamente, cast toda ação. Impacto: performance explode (ResolvePendingCasts chamado 200x por floor), determinism ok mas game vira spam de abilities, CSV malfeito quebra balance sem warning visível.
+
+- **ListAllocationPerCastGCPressure**: `ResolvePendingCasts()` alocando temporários (ex: new List para targets ou filtered heroes) a cada atomic action. Execute: preview em loop. Impacto: GC.Collect() frequente, stutter em builds mobile

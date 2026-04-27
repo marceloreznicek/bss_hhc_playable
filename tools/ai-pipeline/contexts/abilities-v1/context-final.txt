@@ -1,0 +1,938 @@
+TAREFA: aprovação final do v1 do feature **Character Special Abilities** do DiverDungeon. O código passou pela ETAPA 3 (postcode review, 6 IAs) que gerou 2 REJEITADOS pedindo correções. As correções foram aplicadas. Sua missão é decidir APROVAR ou REJEITAR para commit.
+
+════════════════════════════════════════════════════════════════
+CHANGES APLICADAS APÓS POSTCODE
+════════════════════════════════════════════════════════════════
+**Postcode rejections + fixes:**
+
+1. (GPT-5.5 triagem + Grok + MiMo): `manaPerHit` field declared mas nunca usado no resolver.
+   → CombatResolver agora calcula `manaGain = manaPerHit + rawDmg`, capado a `manaPerHitCap`.
+
+2. (GPT-5.5 triagem + Grok): foco morto fazia `PickHeroTarget(-1, ...)` que cai em RNG → viola plano "FirstAliveEnemy por slot".
+   → CombatResolver hero-side: agora se foco está vivo, target é foco; senão target é `FirstAliveEnemyIndex` (determinístico, por slot).
+
+3. (GPT-5.5 triagem): silenciosamente herói com abilityId mas maxMana=0 nunca casta; ou maxMana>0 sem manaPer* set nunca enche.
+   → HeroData.ToStats() loga `Debug.LogWarning` em ambos os casos.
+
+4. (GPT-5.5 triagem + MiMo): StatBuff/StatDebuff são salvos/decrementados mas NUNCA lidos pela computação de atk/def.
+   → Documentado em ActiveStatus.cs como gap conhecido (v1 example abilities — Cleric heal, Pyromancer AoE, Warden shield — não usam StatBuff). Mantido wired-but-not-yet-consumed pattern, paralelo ao IsInterrupted hook.
+
+5. (MiniMax + MiMo): TickEvent.actorHpAfter hardcoded a 0 em DoT events.
+   → Agora populado com `heroList[sourceHeroIndex].hp` quando válido.
+
+6. (MiniMax + MiMo): TickEvent em Cast tem `damage = magnitude` que pode confundir consumidores.
+   → Comentário adicionado documentando que `damage` carrega magnitude e UI deve branch em `kind`.
+
+**Não aplicado (false positives ou deferidos):**
+
+- "Math.Max sem using System" (GPT-5.5 triagem) — `using System;` está no topo de HeroData.cs.
+- "LowestHpAliveAlly tiebreak" (Grok + MiMo) — strict `<` já dá lowest-slot tiebreak (verificado em código).
+- "Reload() não limpa cache" (Grok) — `Cache.Clear()` está antes de `EnsureLoaded()`.
+- "Buffer reuse" (Grok + GPT-5.5 triagem) — perf optimization para v2, não correctness. Aceitável para protótipo.
+- "Aliasing em enemyList" (MiniMax) — auto-corrigido: EnemyStats é struct value-type sem refs, copy semantics safe.
+
+════════════════════════════════════════════════════════════════
+ARQUIVOS NOVOS — conteúdo final completo
+════════════════════════════════════════════════════════════════
+
+──── Assets/Prototype/Scripts/AbilityDef.cs ────
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace DiverDungeon.Prototype
+{
+    public enum AbilityTargetType
+    {
+        SelfOnly = 0,
+        FocusedEnemy = 1,
+        FirstAliveEnemy = 2,
+        FirstAliveAlly = 3,
+        LowestHpAliveAlly = 4,
+        AllEnemies = 5,
+        AllAllies = 6
+    }
+
+    public enum AbilityEffectType
+    {
+        None = 0,
+        FlatDamage = 1,
+        FlatHeal = 2,
+        DamageOverTime = 3,
+        Shield = 4,
+        StatBuffNTicks = 5,
+        StatDebuffNTicks = 6
+    }
+
+    public enum AbilityScale
+    {
+        CasterAtk = 0,
+        CasterMaxHp = 1
+    }
+
+    public class AbilityDef
+    {
+        public string abilityId;
+        public string displayName;
+        public AbilityTargetType targetType;
+        public AbilityEffectType effectType;
+        public AbilityScale scale;
+        public int magnitudeCoeffMilli;
+        public int durationTicks;
+        public string description;
+
+        public static AbilityDef NoOp(string id)
+        {
+            return new AbilityDef
+            {
+                abilityId = id ?? string.Empty,
+                displayName = "None",
+                targetType = AbilityTargetType.SelfOnly,
+                effectType = AbilityEffectType.None,
+                scale = AbilityScale.CasterAtk,
+                magnitudeCoeffMilli = 0,
+                durationTicks = 0,
+                description = "(no-op)"
+            };
+        }
+    }
+
+    public static class AbilityRegistry
+    {
+        const string CsvFileName = "balance_abilities.csv";
+        static readonly Dictionary<string, AbilityDef> Cache = new Dictionary<string, AbilityDef>();
+        static bool Loaded;
+
+        public static AbilityDef Get(string abilityId)
+        {
+            EnsureLoaded();
+            if (string.IsNullOrEmpty(abilityId)) return AbilityDef.NoOp(abilityId);
+            if (Cache.TryGetValue(abilityId, out var def)) return def;
+            Debug.LogWarning($"[AbilityRegistry] unknown abilityId='{abilityId}' → using None");
+            var stub = AbilityDef.NoOp(abilityId);
+            Cache[abilityId] = stub;
+            return stub;
+        }
+
+        public static void Reload()
+        {
+            Cache.Clear();
+            Loaded = false;
+            EnsureLoaded();
+        }
+
+        static void EnsureLoaded()
+        {
+            if (Loaded) return;
+            Loaded = true;
+            var rows = CsvLoader.LoadFile(CsvFileName);
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                string id = CsvLoader.GetString(row, "abilityId").Trim();
+                if (string.IsNullOrEmpty(id)) continue;
+
+                var def = new AbilityDef
+                {
+                    abilityId = id,
+                    displayName = CsvLoader.GetString(row, "displayName", id),
+                    targetType = ParseTarget(CsvLoader.GetString(row, "targetType")),
+                    effectType = ParseEffect(CsvLoader.GetString(row, "effectType")),
+                    scale = ParseScale(CsvLoader.GetString(row, "scale", "CasterAtk")),
+                    magnitudeCoeffMilli = System.Math.Max(0, CsvLoader.GetInt(row, "magnitudeCoeffMilli", 0)),
+                    durationTicks = System.Math.Max(0, CsvLoader.GetInt(row, "durationTicks", 0)),
+                    description = CsvLoader.GetString(row, "description")
+                };
+                Cache[id] = def;
+            }
+            Debug.Log($"[AbilityRegistry] loaded {Cache.Count} abilities");
+        }
+
+        static AbilityTargetType ParseTarget(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return AbilityTargetType.SelfOnly;
+            switch (s.Trim())
+            {
+                case "SelfOnly": return AbilityTargetType.SelfOnly;
+                case "FocusedEnemy": return AbilityTargetType.FocusedEnemy;
+                case "FirstAliveEnemy": return AbilityTargetType.FirstAliveEnemy;
+                case "FirstAliveAlly": return AbilityTargetType.FirstAliveAlly;
+                case "LowestHpAliveAlly": return AbilityTargetType.LowestHpAliveAlly;
+                case "AllEnemies": return AbilityTargetType.AllEnemies;
+                case "AllAllies": return AbilityTargetType.AllAllies;
+                default:
+                    Debug.LogWarning($"[AbilityRegistry] unknown targetType='{s}' → SelfOnly");
+                    return AbilityTargetType.SelfOnly;
+            }
+        }
+
+        static AbilityEffectType ParseEffect(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return AbilityEffectType.None;
+            switch (s.Trim())
+            {
+                case "None": return AbilityEffectType.None;
+                case "FlatDamage": return AbilityEffectType.FlatDamage;
+                case "FlatHeal": return AbilityEffectType.FlatHeal;
+                case "DamageOverTime": return AbilityEffectType.DamageOverTime;
+                case "Shield": return AbilityEffectType.Shield;
+                case "StatBuffNTicks": return AbilityEffectType.StatBuffNTicks;
+                case "StatDebuffNTicks": return AbilityEffectType.StatDebuffNTicks;
+                default:
+                    Debug.LogWarning($"[AbilityRegistry] unknown effectType='{s}' → None");
+                    return AbilityEffectType.None;
+            }
+        }
+
+        static AbilityScale ParseScale(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return AbilityScale.CasterAtk;
+            switch (s.Trim())
+            {
+                case "CasterAtk": return AbilityScale.CasterAtk;
+                case "CasterMaxHp": return AbilityScale.CasterMaxHp;
+                default: return AbilityScale.CasterAtk;
+            }
+        }
+    }
+}
+
+──── Assets/Prototype/Scripts/ActiveStatus.cs ────
+namespace DiverDungeon.Prototype
+{
+    // StatBuff / StatDebuff are stored and ticked by the resolver but not yet consumed
+    // by atk/def computation. They become live when an example hero ships using them; v1
+    // example abilities (mending_light, cinderburst, bulwark) only exercise Shield + flat dmg/heal.
+    public enum StatusType
+    {
+        Shield = 0,
+        DamageOverTime = 1,
+        StatBuff = 2,
+        StatDebuff = 3
+    }
+
+    public struct ActiveStatus
+    {
+        public StatusType type;
+        public int magnitude;
+        public int ticksRemaining;
+        public int sourceHeroIndex;
+    }
+}
+
+──── Balance/balance_abilities.csv ────
+abilityId,displayName,targetType,effectType,scale,magnitudeCoeffMilli,durationTicks,description
+mending_light,Mending Light,LowestHpAliveAlly,FlatHeal,CasterAtk,400,0,Restore HP to the lowest-HP ally (or self if alone).
+cinderburst,Cinderburst,AllEnemies,FlatDamage,CasterAtk,1500,0,Deal fire damage to every alive enemy.
+bulwark,Bulwark,SelfOnly,Shield,CasterMaxHp,200,10,Gain a shield equal to 20% of max HP for 10 ticks.
+
+════════════════════════════════════════════════════════════════
+DIFF FINAL — CombatResolver.cs + HeroData.cs
+════════════════════════════════════════════════════════════════
+
+diff --git a/Assets/Prototype/Scripts/CombatResolver.cs b/Assets/Prototype/Scripts/CombatResolver.cs
+index d512445..08fcf4a 100644
+--- a/Assets/Prototype/Scripts/CombatResolver.cs
++++ b/Assets/Prototype/Scripts/CombatResolver.cs
+@@ -16,6 +16,18 @@ namespace DiverDungeon.Prototype
+         public int atk;
+         public int def;
+         public AttackType attackType;
++
++        // Ability / mana fields (see Character Special Abilities v1 spec).
++        // Strings are immutable so this struct stays safe to copy by value.
++        public int mana;
++        public int maxMana;
++        public int startingMana;
++        public int manaPerAttack;
++        public int manaPerHit;
++        public int manaPerHitCap;
++        public int manaLockTicks;
++        public int manaLockTicksRemaining;
++        public string abilityId;
+     }
+ 
+     public struct EnemyStats
+@@ -32,9 +44,17 @@ namespace DiverDungeon.Prototype
+         Wiped
+     }
+ 
++    public enum TickEventKind
++    {
++        Attack = 0,
++        Cast = 1,
++        StatusTick = 2
++    }
++
+     public struct TickEvent
+     {
+         public int tick;
++        public TickEventKind kind;
+         public string actor;
+         public string target;
+         public int damage;
+@@ -45,7 +65,8 @@ namespace DiverDungeon.Prototype
+     public struct CombatResult
+     {
+         public FloorOutcome outcome;
+-        public int[] heroHpAfter;   // index = party slot
++        public int[] heroHpAfter;     // index = party slot
++        public int[] heroManaAfter;   // index = party slot
+         public int totalTicks;
+         public List<TickEvent> log;
+     }
+@@ -67,35 +88,67 @@ namespace DiverDungeon.Prototype
+         public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
+             int focusEnemyIndex, int seed, DungeonRule rule)
+         {
+-            var heroList = new List<HeroStats>(heroes);
++            // Deep-copy inputs into local lists. Statuses live in resolver-owned parallel
++            // arrays — never inside the *Stats structs — so PreviewNextFloor cannot
++            // contaminate the live RunController state via shared list references.
++            var heroList = new List<HeroStats>(heroes.Count);
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                var h = heroes[i];
++                h.mana = h.startingMana;            // floor-start mana reset (spec item 8)
++                h.manaLockTicksRemaining = 0;
++                heroList.Add(h);
++            }
+             var enemyList = new List<EnemyStats>(enemies);
++
++            var heroStatuses = new List<List<ActiveStatus>>(heroList.Count);
++            for (int i = 0; i < heroList.Count; i++) heroStatuses.Add(new List<ActiveStatus>(2));
++            var enemyStatuses = new List<List<ActiveStatus>>(enemyList.Count);
++            for (int i = 0; i < enemyList.Count; i++) enemyStatuses.Add(new List<ActiveStatus>(2));
++
+             var log = new List<TickEvent>();
+             var rng = new System.Random(seed);
+             int tick = 0;
+ 
+             if (rule.focusRule == FocusRule.NoFocus) focusEnemyIndex = -1;
+ 
++            // Pre-combat: handle startingMana >= maxMana cast-at-floor-start.
++            ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                ref tick, ref focusEnemyIndex, log);
++
+             while (AnyAliveHero(heroList) && AnyAliveEnemy(enemyList))
+             {
+                 // Hero side
+                 for (int hi = 0; hi < heroList.Count; hi++)
+                 {
+                     if (heroList[hi].hp <= 0) continue;
+-                    int tIdx = PickHeroTarget(focusEnemyIndex, enemyList, rng);
++
++                    int focusValid = ResolveLiveFocus(focusEnemyIndex, enemyList);
++                    int tIdx;
++                    if (focusValid >= 0) tIdx = focusValid;
++                    else tIdx = FirstAliveEnemyIndex(enemyList);   // deterministic fallback by slot (Pillar 2)
+                     if (tIdx < 0) break;
+                     tick++;
+                     int dmg = System.Math.Max(1, heroList[hi].atk - enemyList[tIdx].def);
+-                    var e = enemyList[tIdx];
+-                    e.hp -= dmg;
+-                    enemyList[tIdx] = e;
++                    ApplyDamageToEnemy(enemyList, enemyStatuses, tIdx, dmg);
++
+                     log.Add(new TickEvent {
+                         tick = tick,
++                        kind = TickEventKind.Attack,
+                         actor = $"Hero{hi}",
+                         target = $"Enemy{tIdx}",
+                         damage = dmg,
+                         actorHpAfter = heroList[hi].hp,
+                         targetHpAfter = enemyList[tIdx].hp
+                     });
++
++                    // Mana on attack — applied AFTER damage, even if attack killed the target.
++                    GainMana(heroList, hi, heroList[hi].manaPerAttack);
++
++                    ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, ref focusEnemyIndex, log);
++
++                    if (!AnyAliveEnemy(enemyList)) break;
+                 }
+ 
+                 if (!AnyAliveEnemy(enemyList)) break;
+@@ -116,37 +169,491 @@ namespace DiverDungeon.Prototype
+                     tick++;
+                     int rawDmg = System.Math.Max(1, enemyList[ei].atk - heroList[tIdx].def);
+                     int dmg = System.Math.Max(1, (int)System.Math.Round(rawDmg * dmgMult));
++
++                    int absorbed = AbsorbWithShield(heroStatuses, tIdx, dmg);
++                    int hpDamage = dmg - absorbed;
+                     var h = heroList[tIdx];
+-                    h.hp -= dmg;
++                    h.hp -= hpDamage;
+                     heroList[tIdx] = h;
++
+                     log.Add(new TickEvent {
+                         tick = tick,
++                        kind = TickEventKind.Attack,
+                         actor = $"Enemy{ei}",
+                         target = $"Hero{tIdx}",
+                         damage = dmg,
+                         actorHpAfter = enemyList[ei].hp,
+                         targetHpAfter = System.Math.Max(0, heroList[tIdx].hp)
+                     });
++
++                    // Mana on hit — flat manaPerHit + pre-mitigation rawDmg, capped at manaPerHitCap.
++                    // Even applies if the hit was lethal (KO blocks the cast, not the gain).
++                    int manaGain = heroList[tIdx].manaPerHit + rawDmg;
++                    if (heroList[tIdx].manaPerHitCap > 0 && manaGain > heroList[tIdx].manaPerHitCap)
++                        manaGain = heroList[tIdx].manaPerHitCap;
++                    GainMana(heroList, tIdx, manaGain);
++
++                    ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, ref focusEnemyIndex, log);
++
++                    if (!AnyAliveHero(heroList)) break;
++                }
++
++                // End-of-round: tick statuses (DoT damage, then decrement, then prune)
++                // and decrement mana lock.
++                if (AnyAliveHero(heroList) && AnyAliveEnemy(enemyList))
++                {
++                    TickAndPruneStatuses(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, log);
++                    DecrementManaLocks(heroList);
++                    ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, ref focusEnemyIndex, log);
+                 }
+             }
+ 
+             var hpAfter = new int[heroList.Count];
+-            for (int i = 0; i < heroList.Count; i++) hpAfter[i] = System.Math.Max(0, heroList[i].hp);
++            var manaAfter = new int[heroList.Count];
++            for (int i = 0; i < heroList.Count; i++)
++            {
++                hpAfter[i] = System.Math.Max(0, heroList[i].hp);
++                manaAfter[i] = heroList[i].mana;
++            }
+ 
+             return new CombatResult {
+                 outcome = AnyAliveHero(heroList) ? FloorOutcome.Cleared : FloorOutcome.Wiped,
+                 heroHpAfter = hpAfter,
++                heroManaAfter = manaAfter,
+                 totalTicks = tick,
+                 log = log
+             };
+         }
+ 
++        // ───────────────────────── Mana / Cast ─────────────────────────
++
++        static void GainMana(List<HeroStats> heroList, int hi, int gain)
++        {
++            if (gain <= 0) return;
++            var h = heroList[hi];
++            if (h.maxMana <= 0) return;       // hero with no ability: no mana tracking
++            int next = h.mana + gain;
++            if (next < 0) next = 0;           // overflow guard
++            if (next > h.maxMana) next = h.maxMana;
++            h.mana = next;
++            heroList[hi] = h;
++        }
++
++        // Walks heroes in slot order; any alive hero with mana>=maxMana casts.
++        // Each cast resets mana to 0. Multiple casts can fire from a single trigger.
++        // After every cast, an alive-side check exits early if combat ended.
++        // Re-entrancy: a cast does NOT call ResolvePendingCasts itself; if a cast
++        // applies a buff that grants mana, the next outer trigger will pick it up.
++        static void ResolvePendingCasts(List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            ref int tick, ref int focusEnemyIndex, List<TickEvent> log)
++        {
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                if (heroList[hi].hp <= 0) continue;                // Q4: no death-casts
++                if (IsInterrupted(hi)) continue;                   // Q8: always false in v1
++                if (heroList[hi].manaLockTicksRemaining > 0) continue;
++                if (heroList[hi].maxMana <= 0) continue;           // no ability
++                if (heroList[hi].mana < heroList[hi].maxMana) continue;
++
++                CastAbility(hi, heroList, heroStatuses, enemyList, enemyStatuses,
++                    ref tick, ref focusEnemyIndex, log);
++
++                var h = heroList[hi];
++                h.mana = 0;
++                if (h.manaLockTicks > 0) h.manaLockTicksRemaining = h.manaLockTicks;
++                heroList[hi] = h;
++
++                if (!AnyAliveEnemy(enemyList)) return;
++                if (!AnyAliveHero(heroList)) return;
++            }
++        }
++
++        static bool IsInterrupted(int heroIndex) { return false; }   // wired but always off in v1
++
++        static void CastAbility(int hi, List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            ref int tick, ref int focusEnemyIndex, List<TickEvent> log)
++        {
++            var def = AbilityRegistry.Get(heroList[hi].abilityId);
++            int magnitude = ComputeMagnitude(heroList[hi], def);
++
++            tick++;
++            // For Cast events: `damage` carries the ability magnitude (not necessarily HP damage —
++            // could be heal amount, shield amount, DoT base). UI consumers should branch on `kind`.
++            log.Add(new TickEvent {
++                tick = tick,
++                kind = TickEventKind.Cast,
++                actor = $"Hero{hi}",
++                target = def.targetType.ToString(),
++                damage = magnitude,
++                actorHpAfter = heroList[hi].hp,
++                targetHpAfter = 0
++            });
++
++            if (def.effectType == AbilityEffectType.None || magnitude == 0)
++            {
++                // No-op ability still "fires" (mana resets in caller). Logged for traceability.
++                return;
++            }
++
++            switch (def.targetType)
++            {
++                case AbilityTargetType.SelfOnly:
++                    ApplyEffectToHero(hi, hi, def, magnitude, heroList, heroStatuses);
++                    break;
++                case AbilityTargetType.FocusedEnemy:
++                {
++                    int idx = ResolveLiveFocus(focusEnemyIndex, enemyList);
++                    if (idx < 0) idx = FirstAliveEnemyIndex(enemyList);
++                    if (idx >= 0) ApplyEffectToEnemy(hi, idx, def, magnitude, enemyList, enemyStatuses);
++                    break;
++                }
++                case AbilityTargetType.FirstAliveEnemy:
++                {
++                    int idx = FirstAliveEnemyIndex(enemyList);
++                    if (idx >= 0) ApplyEffectToEnemy(hi, idx, def, magnitude, enemyList, enemyStatuses);
++                    break;
++                }
++                case AbilityTargetType.FirstAliveAlly:
++                {
++                    int idx = FirstAliveAllyIndex(heroList, hi, includeSelf: true);
++                    if (idx >= 0) ApplyEffectToHero(hi, idx, def, magnitude, heroList, heroStatuses);
++                    break;
++                }
++                case AbilityTargetType.LowestHpAliveAlly:
++                {
++                    int idx = LowestHpAliveAllyIndex(heroList, hi);
++                    if (idx >= 0) ApplyEffectToHero(hi, idx, def, magnitude, heroList, heroStatuses);
++                    break;
++                }
++                case AbilityTargetType.AllEnemies:
++                    for (int ei = 0; ei < enemyList.Count; ei++)
++                    {
++                        if (enemyList[ei].hp > 0)
++                            ApplyEffectToEnemy(hi, ei, def, magnitude, enemyList, enemyStatuses);
++                    }
++                    break;
++                case AbilityTargetType.AllAllies:
++                    for (int ai = 0; ai < heroList.Count; ai++)
++                    {
++                        if (heroList[ai].hp > 0)
++                            ApplyEffectToHero(hi, ai, def, magnitude, heroList, heroStatuses);
++                    }
++                    break;
++            }
++        }
++
++        static int ComputeMagnitude(HeroStats caster, AbilityDef def)
++        {
++            int basis = def.scale == AbilityScale.CasterMaxHp ? caster.maxHp : caster.atk;
++            // Fixed-point: coeff is in milli (e.g., 400 = 0.4x). Avoids float in determinism path.
++            long m = (long)basis * def.magnitudeCoeffMilli / 1000L;
++            if (m < 0) m = 0;
++            if (m > int.MaxValue) m = int.MaxValue;
++            return (int)m;
++        }
++
++        static void ApplyEffectToHero(int sourceHi, int targetHi, AbilityDef def, int magnitude,
++            List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses)
++        {
++            switch (def.effectType)
++            {
++                case AbilityEffectType.FlatHeal:
++                {
++                    var h = heroList[targetHi];
++                    int healed = System.Math.Min(magnitude, System.Math.Max(0, h.maxHp - h.hp));
++                    h.hp += healed;
++                    heroList[targetHi] = h;
++                    break;
++                }
++                case AbilityEffectType.Shield:
++                    UpsertStatus(heroStatuses[targetHi], new ActiveStatus {
++                        type = StatusType.Shield,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.StatBuffNTicks:
++                    UpsertStatus(heroStatuses[targetHi], new ActiveStatus {
++                        type = StatusType.StatBuff,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.FlatDamage:
++                {
++                    int absorbed = AbsorbWithShield(heroStatuses, targetHi, magnitude);
++                    var h = heroList[targetHi];
++                    h.hp -= (magnitude - absorbed);
++                    heroList[targetHi] = h;
++                    break;
++                }
++                case AbilityEffectType.DamageOverTime:
++                    UpsertStatus(heroStatuses[targetHi], new ActiveStatus {
++                        type = StatusType.DamageOverTime,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++            }
++        }
++
++        static void ApplyEffectToEnemy(int sourceHi, int targetEi, AbilityDef def, int magnitude,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses)
++        {
++            switch (def.effectType)
++            {
++                case AbilityEffectType.FlatDamage:
++                {
++                    int absorbed = AbsorbWithShield(enemyStatuses, targetEi, magnitude);
++                    var e = enemyList[targetEi];
++                    e.hp -= (magnitude - absorbed);
++                    enemyList[targetEi] = e;
++                    break;
++                }
++                case AbilityEffectType.DamageOverTime:
++                    UpsertStatus(enemyStatuses[targetEi], new ActiveStatus {
++                        type = StatusType.DamageOverTime,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.StatDebuffNTicks:
++                    UpsertStatus(enemyStatuses[targetEi], new ActiveStatus {
++                        type = StatusType.StatDebuff,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.Shield:
++                    UpsertStatus(enemyStatuses[targetEi], new ActiveStatus {
++                        type = StatusType.Shield,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++            }
++        }
++
++        // Status of the same type on the same target REPLACES (no stacking) — locked v1 rule.
++        static void UpsertStatus(List<ActiveStatus> bag, ActiveStatus s)
++        {
++            for (int i = 0; i < bag.Count; i++)
++            {
++                if (bag[i].type == s.type) { bag[i] = s; return; }
++            }
++            bag.Add(s);
++        }
++
++        // Damage absorbed by Shield statuses; remainder goes to HP.
++        // Multiple Shield statuses (cannot happen in v1 due to UpsertStatus replace) drained in order.
++        static int AbsorbWithShield(List<List<ActiveStatus>> statusBag, int targetIdx, int incoming)
++        {
++            if (incoming <= 0) return 0;
++            var bag = statusBag[targetIdx];
++            int absorbed = 0;
++            for (int i = 0; i < bag.Count; i++)
++            {
++                if (bag[i].type != StatusType.Shield) continue;
++                var s = bag[i];
++                int take = System.Math.Min(s.magnitude, incoming - absorbed);
++                if (take <= 0) continue;
++                s.magnitude -= take;
++                absorbed += take;
++                bag[i] = s;
++                if (absorbed >= incoming) break;
++            }
++            // Prune drained shields.
++            for (int i = bag.Count - 1; i >= 0; i--)
++            {
++                if (bag[i].type == StatusType.Shield && bag[i].magnitude <= 0) bag.RemoveAt(i);
++            }
++            return absorbed;
++        }
++
++        static void TickAndPruneStatuses(List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            ref int tick, List<TickEvent> log)
++        {
++            // DoT damage applies BEFORE decrementing ticksRemaining. Heroes first, then enemies.
++            // AbsorbWithShield prunes drained shields from the same bag we're scanning, so we
++            // snapshot the DoT magnitude+source pairs first and only mutate after.
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                if (heroList[hi].hp <= 0) continue;
++                var bag = heroStatuses[hi];
++                int dotCount = 0;
++                for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.DamageOverTime) dotCount++;
++                if (dotCount == 0) continue;
++                var dotMag = new int[dotCount];
++                var dotSrc = new int[dotCount];
++                int k = 0;
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    if (bag[i].type != StatusType.DamageOverTime) continue;
++                    dotMag[k] = bag[i].magnitude;
++                    dotSrc[k] = bag[i].sourceHeroIndex;
++                    k++;
++                }
++                for (int j = 0; j < dotCount; j++)
++                {
++                    if (heroList[hi].hp <= 0) break;
++                    int absorbed = AbsorbWithShield(heroStatuses, hi, dotMag[j]);
++                    int damage = dotMag[j] - absorbed;
++                    if (damage > 0)
++                    {
++                        var h = heroList[hi];
++                        h.hp -= damage;
++                        heroList[hi] = h;
++                        tick++;
++                        int srcHp = (dotSrc[j] >= 0 && dotSrc[j] < heroList.Count)
++                            ? System.Math.Max(0, heroList[dotSrc[j]].hp) : 0;
++                        log.Add(new TickEvent {
++                            tick = tick,
++                            kind = TickEventKind.StatusTick,
++                            actor = $"Hero{dotSrc[j]}",
++                            target = $"Hero{hi}",
++                            damage = damage,
++                            actorHpAfter = srcHp,
++                            targetHpAfter = System.Math.Max(0, heroList[hi].hp)
++                        });
++                    }
++                }
++            }
++            for (int ei = 0; ei < enemyList.Count; ei++)
++            {
++                if (enemyList[ei].hp <= 0) continue;
++                var bag = enemyStatuses[ei];
++                int dotCount = 0;
++                for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.DamageOverTime) dotCount++;
++                if (dotCount == 0) continue;
++                var dotMag = new int[dotCount];
++                var dotSrc = new int[dotCount];
++                int k = 0;
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    if (bag[i].type != StatusType.DamageOverTime) continue;
++                    dotMag[k] = bag[i].magnitude;
++                    dotSrc[k] = bag[i].sourceHeroIndex;
++                    k++;
++                }
++                for (int j = 0; j < dotCount; j++)
++                {
++                    if (enemyList[ei].hp <= 0) break;
++                    int absorbed = AbsorbWithShield(enemyStatuses, ei, dotMag[j]);
++                    int damage = dotMag[j] - absorbed;
++                    if (damage > 0)
++                    {
++                        var e = enemyList[ei];
++                        e.hp -= damage;
++                        enemyList[ei] = e;
++                        tick++;
++                        int srcHp = (dotSrc[j] >= 0 && dotSrc[j] < heroList.Count)
++                            ? System.Math.Max(0, heroList[dotSrc[j]].hp) : 0;
++                        log.Add(new TickEvent {
++                            tick = tick,
++                            kind = TickEventKind.StatusTick,
++                            actor = $"Hero{dotSrc[j]}",
++                            target = $"Enemy{ei}",
++                            damage = damage,
++                            actorHpAfter = srcHp,
++                            targetHpAfter = System.Math.Max(0, enemyList[ei].hp)
++                        });
++                    }
++                }
++            }
++
++            // Now decrement ticksRemaining on every status and prune expired.
++            for (int hi = 0; hi < heroStatuses.Count; hi++) DecrementBag(heroStatuses[hi]);
++            for (int ei = 0; ei < enemyStatuses.Count; ei++) DecrementBag(enemyStatuses[ei]);
++        }
++
++        static void DecrementBag(List<ActiveStatus> bag)
++        {
++            for (int i = bag.Count - 1; i >= 0; i--)
++            {
++                var s = bag[i];
++                s.ticksRemaining -= 1;
++                bag[i] = s;
++                if (s.ticksRemaining <= 0) bag.RemoveAt(i);
++            }
++        }
++
++        static void DecrementManaLocks(List<HeroStats> heroList)
++        {
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                var h = heroList[hi];
++                if (h.manaLockTicksRemaining > 0)
++                {
++                    h.manaLockTicksRemaining -= 1;
++                    heroList[hi] = h;
++                }
++            }
++        }
++
++        static int ResolveLiveFocus(int focusIdx, List<EnemyStats> enemies)
++        {
++            if (focusIdx < 0 || focusIdx >= enemies.Count) return -1;
++            return enemies[focusIdx].hp > 0 ? focusIdx : -1;
++        }
++
++        static int FirstAliveEnemyIndex(List<EnemyStats> enemies)
++        {
++            for (int i = 0; i < enemies.Count; i++) if (enemies[i].hp > 0) return i;
++            return -1;
++        }
++
++        static int FirstAliveAllyIndex(List<HeroStats> heroes, int casterIdx, bool includeSelf)
++        {
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                if (heroes[i].hp <= 0) continue;
++                if (!includeSelf && i == casterIdx) continue;
++                return i;
++            }
++            return includeSelf ? casterIdx : -1;
++        }
++
++        static int LowestHpAliveAllyIndex(List<HeroStats> heroes, int casterIdx)
++        {
++            int best = -1;
++            int bestHp = int.MaxValue;
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                if (heroes[i].hp <= 0) continue;
++                if (heroes[i].hp < bestHp) { best = i; bestHp = heroes[i].hp; }
++            }
++            return best >= 0 ? best : casterIdx;     // fall back to self
++        }
++
++        static void ApplyDamageToEnemy(List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            int targetEi, int dmg)
++        {
++            int absorbed = AbsorbWithShield(enemyStatuses, targetEi, dmg);
++            int hpDamage = dmg - absorbed;
++            var e = enemyList[targetEi];
++            e.hp -= hpDamage;
++            enemyList[targetEi] = e;
++        }
++
+         public static string FormatLog(CombatResult r)
+         {
+             var sb = new StringBuilder();
+             sb.Append("[Combat] outcome=").Append(r.outcome).Append(" ticks=").Append(r.totalTicks).AppendLine();
+             foreach (var e in r.log)
+-                sb.Append("  t").Append(e.tick).Append(": ").Append(e.actor).Append("→").Append(e.target)
++                sb.Append("  t").Append(e.tick).Append(" [").Append(e.kind).Append("] ")
++                  .Append(e.actor).Append("→").Append(e.target)
+                   .Append(" dmg=").Append(e.damage).Append(" (target hp now ").Append(e.targetHpAfter).Append(")").AppendLine();
+             return sb.ToString();
+         }
+@@ -168,10 +675,8 @@ namespace DiverDungeon.Prototype
+ 
+         public static int PickHeroTarget(int focusIdx, IList<EnemyStats> enemies, System.Random rng)
+         {
+-            // Focused enemy alive → all heroes hit it.
+             if (focusIdx >= 0 && focusIdx < enemies.Count && enemies[focusIdx].hp > 0)
+                 return focusIdx;
+-            // Otherwise this hero picks an alive enemy at random (independently of others).
+             int aliveCount = 0;
+             for (int i = 0; i < enemies.Count; i++) if (enemies[i].hp > 0) aliveCount++;
+             if (aliveCount == 0) return -1;
+@@ -195,10 +700,5 @@ namespace DiverDungeon.Prototype
+             for (int i = 0; i < es.Count; i++) if (es[i].hp > 0) return true;
+             return false;
+         }
+-        static int FirstAliveHeroIndex(List<HeroStats> hs)
+-        {
+-            for (int i = 0; i < hs.Count; i++) if (hs[i].hp > 0) return i;
+-            return -1;
+-        }
+     }
+ }
+diff --git a/Assets/Prototype/Scripts/HeroData.cs b/Assets/Prototype/Scripts/HeroData.cs
+index eeeb011..f8338ef 100644
+--- a/Assets/Prototype/Scripts/HeroData.cs
++++ b/Assets/Prototype/Scripts/HeroData.cs
+@@ -22,13 +22,45 @@ namespace DiverDungeon.Prototype
+ 
+         public AttackType attackType = AttackType.Melee;
+ 
++        // Ability / mana — see product/features/2026-04-26-character-special-abilities.md.
++        public int maxMana = 0;            // 0 = no ability (purely defensive default)
++        public int startingMana = 0;
++        public int manaPerAttack = 0;
++        public int manaPerHit = 0;
++        public int manaPerHitCap = 0;
++        public int manaLockTicks = 0;      // CSV column wired but always 0 in v1
++        public string abilityId = "";
++
+         public int MaxHp => baseHp + (level - 1) * hpPerLevel;
+         public int Atk => baseAtk + (level - 1) * atkPerLevel;
+         public int Def => baseDef + (level - 1) * defPerLevel;
+ 
+         public HeroStats ToStats()
+         {
+-            return new HeroStats { hp = MaxHp, maxHp = MaxHp, atk = Atk, def = Def, attackType = attackType };
++            int safeMaxMana = Math.Max(0, maxMana);
++            int safeStartingMana = Mathf.Clamp(startingMana, 0, safeMaxMana);
++            bool hasAbility = !string.IsNullOrEmpty(abilityId);
++            if (hasAbility && safeMaxMana <= 0)
++                Debug.LogWarning($"[HeroData] '{heroName}' has abilityId='{abilityId}' but maxMana<=0; ability will never cast.");
++            if (safeMaxMana > 0 && manaPerHitCap <= 0 && manaPerAttack <= 0 && manaPerHit <= 0)
++                Debug.LogWarning($"[HeroData] '{heroName}' has maxMana>0 but no mana-gain knobs set; mana will never fill.");
++            return new HeroStats
++            {
++                hp = MaxHp,
++                maxHp = MaxHp,
++                atk = Atk,
++                def = Def,
++                attackType = attackType,
++                mana = safeStartingMana,
++                maxMana = safeMaxMana,
++                startingMana = safeStartingMana,
++                manaPerAttack = Math.Max(0, manaPerAttack),
++                manaPerHit = Math.Max(0, manaPerHit),
++                manaPerHitCap = Math.Max(0, manaPerHitCap),
++                manaLockTicks = Math.Max(0, manaLockTicks),
++                manaLockTicksRemaining = 0,
++                abilityId = abilityId ?? string.Empty
++            };
+         }
+     }
+ }
+
+════════════════════════════════════════════════════════════════
+VEREDICTO ESPERADO
+════════════════════════════════════════════════════════════════
+Decida APROVADO ou REJEITADO. Se rejeitado, liste exatamente o que ainda é blocker (linha + arquivo). Se aprovado, opcional listar follow-ups não-blockers.
+
+Critérios de aprovação:
+- Determinismo (Pillar 2) está intacto — mesmo input dá mesmo output, byte-identical?
+- PreviewNextFloor não pode contaminar Party (aliasing)?
+- Nenhum bug óbvio que crashe o jogo ou dê comportamento errado nas 3 example abilities (mending_light heal, cinderburst AoE damage, bulwark shield)?
+- CSV malformado não crasha?
+- Compila? (mesmo que vocês não rodem o compiler — leitura crítica).
+- Mudanças coerentes com o plano da síntese precode?
+
+Output enxuto e direto. Se em dúvida, REJEITAR com motivo específico.

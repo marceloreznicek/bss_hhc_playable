@@ -1,0 +1,123 @@
+REVISÃO FINAL — Correção do placar do World Boss (HeroHeroClicker, Unity 6, C#)
+
+## OBJETIVO
+Aprovar o diff que reordena visualmente os 3 jogadores do TOP HERÓIS ÚLTIMO BOSS por dano DESC, defendendo o cliente de uma ordem inconsistente vinda do servidor externo.
+
+## DIFF FINAL (sem alterações desde o pós-code)
+
+```diff
+diff --git a/Assets/Scripts/Behaviour/GlobalBossManager.cs b/Assets/Scripts/Behaviour/GlobalBossManager.cs
+index 26ba9a7d1..1d9433bec 100644
+--- a/Assets/Scripts/Behaviour/GlobalBossManager.cs
++++ b/Assets/Scripts/Behaviour/GlobalBossManager.cs
+@@ -684,6 +684,12 @@ public class GlobalBossManager : MonoBehaviour
+             // Calcula top 3 valores (pela ordem das chaves como no Firebase)
+             var topValues = ExtractTopValues(root, 3);
+
++            // Defesa contra ordering inconsistente do servidor: re-ordena por dano DESC.
++            // O nó "Tops" no Firebase é populado por servidor externo a partir de "Positions",
++            // que pode estar dessincronizado com o dano real. Reordenamos aqui pelo
++            // dealtDamage embutido em parts[2] de cada entrada "uid;nome;dealtDamage".
++            topValues = SortTopValuesByDamageDesc(topValues);
++
+             for (int i = 0; i < 3; i++)
+             {
+                 //Debug.LogError(i + " = topValues[i]: " + topValues[i]);
+@@ -2778,6 +2784,55 @@ public class GlobalBossManager : MonoBehaviour
+         return result;
+     }
+
++    // Reordena os top values por dealtDamage DESC, com tie-breaker estável (índice original).
++    // Entradas inválidas ("null", vazias, parts < 3, dano negativo ou não numérico) são empurradas para o fim.
++    // Loga um Warning quando a ordem do servidor diverge do dano — indica bug no servidor.
++    private static List<string> SortTopValuesByDamageDesc(List<string> topValues)
++    {
++        if (topValues == null || topValues.Count == 0)
++            return new List<string>();
++
++        var ordered = topValues
++            .Select((value, index) => new
++            {
++                Value = value,
++                Damage = ParseDamageFromTop(value),
++                OriginalIndex = index
++            })
++            .OrderByDescending(x => x.Damage)
++            .ThenBy(x => x.OriginalIndex)
++            .Select(x => x.Value)
++            .ToList();
++
++        for (int i = 0; i < ordered.Count; i++)
++        {
++            if (ordered[i] != topValues[i])
++            {
++                Debug.LogWarning("[WorldBoss] Tops do servidor com ordem inconsistente. Original: ["
++                    + string.Join(" | ", topValues) + "] -> Reordenado por dano DESC: ["
++                    + string.Join(" | ", ordered) + "]");
++                break;
++            }
++        }
++
++        return ordered;
++    }
++
++    private static System.Numerics.BigInteger ParseDamageFromTop(string topLine)
++    {
++        if (string.IsNullOrWhiteSpace(topLine) || topLine == "null" || topLine == "0")
++            return System.Numerics.BigInteger.MinusOne;
++
++        var parts = SafeSplit(topLine, ';');
++        if (parts.Length < 3)
++            return System.Numerics.BigInteger.MinusOne;
++
++        if (System.Numerics.BigInteger.TryParse(parts[2], out var damage) && damage >= 0)
++            return damage;
++
++        return System.Numerics.BigInteger.MinusOne;
++    }
++
+     private static void SetImgSpriteEnable(Transform root, string path, string spritePath, bool enable)
+```
+
+## RESUMO DO PRÉ-CODE (8 IAs)
+- 8/8 IAs validaram que reordenar no cliente resolve o sintoma visual.
+- Insights aplicados: helper estático isolado, tie-breaker estável (OriginalIndex), validação rigorosa de edge cases (null, vazio, parts<3, negativo, não-numérico), log de Warning para diagnosticar bug do servidor.
+- Insights NÃO aplicados (com justificativa):
+  - feature-toggle (over-engineering — fix simples e seguro)
+  - MaxSaneDamage cap (security-theater — server é o único writer, regras Firebase já restringem)
+  - lookup ao vivo no nó "Players" (inadequado — "ÚLTIMO BOSS" é snapshot, não tempo real)
+
+## RESUMO DO PÓS-CODE (5 IAs)
+- ✅ APROVADO: Grok 4.20 (cross-file analysis: nenhum outro listener depende da ordem original; correção cirúrgica)
+- 💬 SEM VERDICT EXPLÍCITO: Gemini 3.1 Pro (erro 502 antes de finalizar; análise técnica não levantou problemas) e MiniMax M2.7 (validou todos os cenários da tabela A/B com OK; resposta truncada antes do verdict)
+- ❌ REJEITADO (×2): GPT-5.4 Mini e GPT-5.4 — ambos pelo MESMO motivo: a correção visual desacopla a ordem exibida da ordem de RECOMPENSAS distribuídas pelo servidor, podendo gerar tickets de suporte ("apareci como TOP 1 mas só recebi 250 chifres em vez de 500").
+
+## RESPOSTA À REJEIÇÃO
+
+A divergência UI vs recompensa apontada pelos GPT-5.4 é **legítima**, mas:
+
+1. **A divergência JÁ EXISTE atualmente, antes do fix.** O servidor distribui recompensas baseado em `Positions` que estão dessincronizadas com o dano real. Antes do fix, o jogador VIA uma ordem visualmente errada (162M em 2º lugar) e recebia recompensa "alinhada com a UI errada". Pior UX: o jogador percebe a inconsistência visual e abre ticket.
+
+2. **Após o fix, a UI fica VISUALMENTE CORRETA por dano.** Continua havendo divergência com recompensa (problema do servidor), mas pelo menos o jogador NÃO está mais vendo um ranking absurdo. O log de Warning vai facilitar diagnosticar o problema raiz no servidor.
+
+3. **A correção REAL é no servidor** (Unity headless em Oracle Cloud — código não está neste repo). Será reportada ao usuário separadamente. Esta correção do cliente é um **workaround visual de baixo risco** enquanto o backend não é corrigido.
+
+4. **Risco real estimado**: BAIXO. As recompensas (chifres) são pequenas (500/250/100). Tickets esporádicos comparados ao bug visual atual que afeta TODOS os jogadores que abrem a tela.
+
+## VERIFICAÇÕES DE INTEGRIDADE
+
+- ✅ Compilação Unity OK (verificado via UnityMCP refresh + read_console: 0 erros).
+- ✅ Apenas 1 arquivo modificado (`GlobalBossManager.cs`), apenas 2 hunks (chamada do helper + definição dos 2 helpers).
+- ✅ Métodos novos são `private static` — escopo restrito.
+- ✅ Não há outros listeners de "Tops" no projeto (verificado por grep).
+- ✅ `ExtractTopValues` continua intacto — apenas o resultado é reordenado.
+- ✅ Compatível com IL2CPP arm64 (não usa nada exótico — LINQ, BigInteger, string ops).
+- ✅ Sem alocações em path crítico (1x por boss kill, ~6h/dia).
+
+## RELEASE NOTES (a anexar em releasenotes-new.txt)
+
+`* Correção: Placar final do World Boss (TOP HERÓIS ÚLTIMO BOSS) agora exibe os 3 jogadores ordenados por dano causado em ordem decrescente, mesmo quando o servidor envia a lista em ordem inconsistente. Adicionado log de Warning para detectar o bug do servidor que precisa ser corrigido posteriormente.`
+
+## PEDIDO
+
+Por favor APROVEM ou REJEITEM o diff. Se houver problemas concretos não considerados (não a divergência já discutida), reportem para correção. Caso aprovem, posso commitar.

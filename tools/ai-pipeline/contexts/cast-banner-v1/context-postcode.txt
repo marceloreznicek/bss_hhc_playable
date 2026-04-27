@@ -1,0 +1,1968 @@
+TASK: pós-code review do feature **Cast Banner + 5-Hero Ability Activation** no DiverDungeon (Unity 6, C#, turn-based deterministic combat). O implementador (Claude) acabou de aplicar o código abaixo seguindo o plano de síntese — sua tarefa é encontrar bugs, regressões de determinismo, condições de corrida em corotinas, falhas de cobertura de teste, e qualquer divergência entre o resolver determinístico (PreviewNextFloor) e o caminho ao vivo (RunLiveCombat).
+
+CONTEXTO LOCKED:
+- Determinismo (Pillar 2): heroes/enemies/foco/floor + seed = saída byte-idêntica.
+- 5 heróis ativos: Knight=bulwark, Rogue=hemorrhage, Mage=arcane_bolt, Cleric=mending_light, Ranger=mark_for_death.
+- Banner UI: 1.0s real-time pause (não escala com SpeedMultiplier), input bloqueado por raycast-absorbing image.
+- Extensibilidade: hero #6 deve poder ser adicionado via 1 linha no Balance/balance_heroes.csv + 1 entrada no HeroClassRegistry, sem code change.
+
+DECISÕES TOMADAS NO PRECODE:
+- D1 = híbrido: lógica de cast extraída do CombatResolver para método privado ApplyCastBody, exposta via TryResolveOneCastLive público chamado de dentro de RunLiveCombat. Mesma lógica em um único lugar.
+- D3.B = balance_heroes.csv overlay aplicado em MetaState.ApplyHeroAbilityOverlay após SeedDefaultRoster.
+- Status tick + mana lock decrement portados para o caminho ao vivo via TickAndPruneStatusesLive + DecrementHeroManaLocksLive.
+- Shield absorption portada via AbsorbWithShieldLive aplicada no caminho ao vivo (Knight Bulwark agora reduz dano recebido).
+
+PONTOS DE ATENÇÃO PARA REVIEW:
+1. **Determinismo paridade**: o caminho live aplica os mesmos efeitos via funções compartilhadas. Mas as estruturas internas (List<List<ActiveStatus>>) são paralelas (uma por path). Existe alguma forma do live divergir de PreviewNextFloor para um mesmo (party, dungeon, focus, floor)?
+2. **Race conditions em corotinas**: durante WaitForSecondsRealtime do banner, o player pode tap descend/bank/focus. O input blocker absorve raycasts (raycastTarget=true). Buracos?
+3. **StatDebuff inerte (limitação pré-existente)**: o resolver não consome StatDebuff/StatBuff em cálculo de damage. Ranger mark_for_death dispara banner mas não reduz def do inimigo. Documentado em Assets/Prototype/Scripts/ActiveStatus.cs. Isso é regressão? Ou é OK aceitar como out-of-scope?
+4. **Order: cast antes ou depois do dano de cast?** TryResolveOneCastLive aplica efeito + zera mana + arma lock + RETORNA. Caller (DrainCastQueue) depois chama RefreshAllCombatBars + ShowCastBanner (yield 1s). Spec §5.3 / D5-A: efeito aplicado AT banner-start.
+5. **Ranger mana_lock=0**: ainda não há lock. Remover lock_remaining decrement do live?
+6. **Multi-cast em mesma ação atômica**: mesmo enemy attack pode levar Knight + Cleric ao max. Slot order garante Knight casta primeiro. Banners encadeiam 1s+1s.
+7. **CSV failure modes**: balance_heroes.csv ausente, heroId=999, abilityId desconhecido, startingMana>maxMana. Comportamento?
+8. **AoE clear ends combat**: cast dispara em DrainCastQueue → mata todos enemies → loop sai → SettleFloor. Banner finishes ANTES do "WIPED!"/"CLEARED!". OK?
+
+══════════════════════════════════════════════════════════════════
+DIFF COMPLETO (vs HEAD)
+══════════════════════════════════════════════════════════════════
+
+Inclui o trabalho do PR anterior (v1 ability framework + banner+wiring deste PR). FOCO DA REVIEW: as adições/refactors abaixo, NÃO o framework original. Os arquivos novos são:
+- Balance/balance_heroes.csv (novo)
+- product/features/2026-04-26-character-ability-roster.md (doc)
+- product/specs/character-ability-cast-banner.md (spec)
+
+Os arquivos modificados:
+- Balance/balance_abilities.csv (3 rows adicionadas: hemorrhage, mark_for_death, arcane_bolt)
+- Assets/Prototype/Scripts/CombatResolver.cs (extraído ApplyCastBody, adicionado public live API: TryResolveOneCastLive, TickAndPruneStatusesLive, DecrementHeroManaLocksLive, GainHeroManaLive, AbsorbWithShieldLive, SumEnemyDefDebuff)
+- Assets/Prototype/Scripts/MetaState.cs (added ApplyHeroAbilityOverlay)
+- Assets/Prototype/Scripts/UIController.cs (added cast banner UI fields/builder/coroutine, refactored RunLiveCombat to use shared helpers, added DrainCastQueue/SettleFloor/RefreshAllCombatBars/MarkDeadVisuals)
+
+═══════════════════════════════════════════════════════════════
+DIFF
+═══════════════════════════════════════════════════════════════
+diff --git a/Assets/Prototype/Scripts/CombatResolver.cs b/Assets/Prototype/Scripts/CombatResolver.cs
+index d512445..e45787b 100644
+--- a/Assets/Prototype/Scripts/CombatResolver.cs
++++ b/Assets/Prototype/Scripts/CombatResolver.cs
+@@ -16,6 +16,18 @@ namespace DiverDungeon.Prototype
+         public int atk;
+         public int def;
+         public AttackType attackType;
++
++        // Ability / mana fields (see Character Special Abilities v1 spec).
++        // Strings are immutable so this struct stays safe to copy by value.
++        public int mana;
++        public int maxMana;
++        public int startingMana;
++        public int manaPerAttack;
++        public int manaPerHit;
++        public int manaPerHitCap;
++        public int manaLockTicks;
++        public int manaLockTicksRemaining;
++        public string abilityId;
+     }
+ 
+     public struct EnemyStats
+@@ -32,9 +44,17 @@ namespace DiverDungeon.Prototype
+         Wiped
+     }
+ 
++    public enum TickEventKind
++    {
++        Attack = 0,
++        Cast = 1,
++        StatusTick = 2
++    }
++
+     public struct TickEvent
+     {
+         public int tick;
++        public TickEventKind kind;
+         public string actor;
+         public string target;
+         public int damage;
+@@ -45,7 +65,8 @@ namespace DiverDungeon.Prototype
+     public struct CombatResult
+     {
+         public FloorOutcome outcome;
+-        public int[] heroHpAfter;   // index = party slot
++        public int[] heroHpAfter;     // index = party slot
++        public int[] heroManaAfter;   // index = party slot
+         public int totalTicks;
+         public List<TickEvent> log;
+     }
+@@ -67,35 +88,67 @@ namespace DiverDungeon.Prototype
+         public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
+             int focusEnemyIndex, int seed, DungeonRule rule)
+         {
+-            var heroList = new List<HeroStats>(heroes);
++            // Deep-copy inputs into local lists. Statuses live in resolver-owned parallel
++            // arrays — never inside the *Stats structs — so PreviewNextFloor cannot
++            // contaminate the live RunController state via shared list references.
++            var heroList = new List<HeroStats>(heroes.Count);
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                var h = heroes[i];
++                h.mana = h.startingMana;            // floor-start mana reset (spec item 8)
++                h.manaLockTicksRemaining = 0;
++                heroList.Add(h);
++            }
+             var enemyList = new List<EnemyStats>(enemies);
++
++            var heroStatuses = new List<List<ActiveStatus>>(heroList.Count);
++            for (int i = 0; i < heroList.Count; i++) heroStatuses.Add(new List<ActiveStatus>(2));
++            var enemyStatuses = new List<List<ActiveStatus>>(enemyList.Count);
++            for (int i = 0; i < enemyList.Count; i++) enemyStatuses.Add(new List<ActiveStatus>(2));
++
+             var log = new List<TickEvent>();
+             var rng = new System.Random(seed);
+             int tick = 0;
+ 
+             if (rule.focusRule == FocusRule.NoFocus) focusEnemyIndex = -1;
+ 
++            // Pre-combat: handle startingMana >= maxMana cast-at-floor-start.
++            ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                ref tick, ref focusEnemyIndex, log);
++
+             while (AnyAliveHero(heroList) && AnyAliveEnemy(enemyList))
+             {
+                 // Hero side
+                 for (int hi = 0; hi < heroList.Count; hi++)
+                 {
+                     if (heroList[hi].hp <= 0) continue;
+-                    int tIdx = PickHeroTarget(focusEnemyIndex, enemyList, rng);
++
++                    int focusValid = ResolveLiveFocus(focusEnemyIndex, enemyList);
++                    int tIdx;
++                    if (focusValid >= 0) tIdx = focusValid;
++                    else tIdx = FirstAliveEnemyIndex(enemyList);   // deterministic fallback by slot (Pillar 2)
+                     if (tIdx < 0) break;
+                     tick++;
+                     int dmg = System.Math.Max(1, heroList[hi].atk - enemyList[tIdx].def);
+-                    var e = enemyList[tIdx];
+-                    e.hp -= dmg;
+-                    enemyList[tIdx] = e;
++                    ApplyDamageToEnemy(enemyList, enemyStatuses, tIdx, dmg);
++
+                     log.Add(new TickEvent {
+                         tick = tick,
++                        kind = TickEventKind.Attack,
+                         actor = $"Hero{hi}",
+                         target = $"Enemy{tIdx}",
+                         damage = dmg,
+                         actorHpAfter = heroList[hi].hp,
+                         targetHpAfter = enemyList[tIdx].hp
+                     });
++
++                    // Mana on attack — applied AFTER damage, even if attack killed the target.
++                    GainMana(heroList, hi, heroList[hi].manaPerAttack);
++
++                    ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, ref focusEnemyIndex, log);
++
++                    if (!AnyAliveEnemy(enemyList)) break;
+                 }
+ 
+                 if (!AnyAliveEnemy(enemyList)) break;
+@@ -116,37 +169,646 @@ namespace DiverDungeon.Prototype
+                     tick++;
+                     int rawDmg = System.Math.Max(1, enemyList[ei].atk - heroList[tIdx].def);
+                     int dmg = System.Math.Max(1, (int)System.Math.Round(rawDmg * dmgMult));
++
++                    int absorbed = AbsorbWithShield(heroStatuses, tIdx, dmg);
++                    int hpDamage = dmg - absorbed;
+                     var h = heroList[tIdx];
+-                    h.hp -= dmg;
++                    h.hp -= hpDamage;
+                     heroList[tIdx] = h;
++
+                     log.Add(new TickEvent {
+                         tick = tick,
++                        kind = TickEventKind.Attack,
+                         actor = $"Enemy{ei}",
+                         target = $"Hero{tIdx}",
+                         damage = dmg,
+                         actorHpAfter = enemyList[ei].hp,
+                         targetHpAfter = System.Math.Max(0, heroList[tIdx].hp)
+                     });
++
++                    // Mana on hit — flat manaPerHit + pre-mitigation rawDmg, capped at manaPerHitCap.
++                    // Even applies if the hit was lethal (KO blocks the cast, not the gain).
++                    int manaGain = heroList[tIdx].manaPerHit + rawDmg;
++                    if (heroList[tIdx].manaPerHitCap > 0 && manaGain > heroList[tIdx].manaPerHitCap)
++                        manaGain = heroList[tIdx].manaPerHitCap;
++                    GainMana(heroList, tIdx, manaGain);
++
++                    ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, ref focusEnemyIndex, log);
++
++                    if (!AnyAliveHero(heroList)) break;
++                }
++
++                // End-of-round: tick statuses (DoT damage, then decrement, then prune)
++                // and decrement mana lock.
++                if (AnyAliveHero(heroList) && AnyAliveEnemy(enemyList))
++                {
++                    TickAndPruneStatuses(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, log);
++                    DecrementManaLocks(heroList);
++                    ResolvePendingCasts(heroList, heroStatuses, enemyList, enemyStatuses,
++                        ref tick, ref focusEnemyIndex, log);
+                 }
+             }
+ 
+             var hpAfter = new int[heroList.Count];
+-            for (int i = 0; i < heroList.Count; i++) hpAfter[i] = System.Math.Max(0, heroList[i].hp);
++            var manaAfter = new int[heroList.Count];
++            for (int i = 0; i < heroList.Count; i++)
++            {
++                hpAfter[i] = System.Math.Max(0, heroList[i].hp);
++                manaAfter[i] = heroList[i].mana;
++            }
+ 
+             return new CombatResult {
+                 outcome = AnyAliveHero(heroList) ? FloorOutcome.Cleared : FloorOutcome.Wiped,
+                 heroHpAfter = hpAfter,
++                heroManaAfter = manaAfter,
+                 totalTicks = tick,
+                 log = log
+             };
+         }
+ 
++        // ───────────────────────── Mana / Cast ─────────────────────────
++
++        static void GainMana(List<HeroStats> heroList, int hi, int gain)
++        {
++            if (gain <= 0) return;
++            var h = heroList[hi];
++            if (h.maxMana <= 0) return;       // hero with no ability: no mana tracking
++            int next = h.mana + gain;
++            if (next < 0) next = 0;           // overflow guard
++            if (next > h.maxMana) next = h.maxMana;
++            h.mana = next;
++            heroList[hi] = h;
++        }
++
++        // Walks heroes in slot order; any alive hero with mana>=maxMana casts.
++        // Each cast resets mana to 0. Multiple casts can fire from a single trigger.
++        // After every cast, an alive-side check exits early if combat ended.
++        // Re-entrancy: a cast does NOT call ResolvePendingCasts itself; if a cast
++        // applies a buff that grants mana, the next outer trigger will pick it up.
++        static void ResolvePendingCasts(List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            ref int tick, ref int focusEnemyIndex, List<TickEvent> log)
++        {
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                if (heroList[hi].hp <= 0) continue;                // Q4: no death-casts
++                if (IsInterrupted(hi)) continue;                   // Q8: always false in v1
++                if (heroList[hi].manaLockTicksRemaining > 0) continue;
++                if (heroList[hi].maxMana <= 0) continue;           // no ability
++                if (heroList[hi].mana < heroList[hi].maxMana) continue;
++
++                CastAbility(hi, heroList, heroStatuses, enemyList, enemyStatuses,
++                    ref tick, ref focusEnemyIndex, log);
++
++                var h = heroList[hi];
++                h.mana = 0;
++                if (h.manaLockTicks > 0) h.manaLockTicksRemaining = h.manaLockTicks;
++                heroList[hi] = h;
++
++                if (!AnyAliveEnemy(enemyList)) return;
++                if (!AnyAliveHero(heroList)) return;
++            }
++        }
++
++        static bool IsInterrupted(int heroIndex) { return false; }   // wired but always off in v1
++
++        static void CastAbility(int hi, List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            ref int tick, ref int focusEnemyIndex, List<TickEvent> log)
++        {
++            var def = AbilityRegistry.Get(heroList[hi].abilityId);
++            int magnitude = ComputeMagnitude(heroList[hi], def);
++
++            tick++;
++            // For Cast events: `damage` carries the ability magnitude (not necessarily HP damage —
++            // could be heal amount, shield amount, DoT base). UI consumers should branch on `kind`.
++            log.Add(new TickEvent {
++                tick = tick,
++                kind = TickEventKind.Cast,
++                actor = $"Hero{hi}",
++                target = def.targetType.ToString(),
++                damage = magnitude,
++                actorHpAfter = heroList[hi].hp,
++                targetHpAfter = 0
++            });
++
++            ApplyCastBody(hi, def, magnitude, heroList, heroStatuses, enemyList, enemyStatuses, focusEnemyIndex);
++        }
++
++        // Pure cast-effect application. Shared between the deterministic resolver and
++        // the live UI path (UIController.RunLiveCombat) so the logic exists in exactly one place.
++        // No tick / log / mana mutation here — caller owns those side effects.
++        static void ApplyCastBody(int hi, AbilityDef def, int magnitude,
++            List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            int focusEnemyIndex)
++        {
++            if (def.effectType == AbilityEffectType.None || magnitude == 0) return;
++
++            switch (def.targetType)
++            {
++                case AbilityTargetType.SelfOnly:
++                    ApplyEffectToHero(hi, hi, def, magnitude, heroList, heroStatuses);
++                    break;
++                case AbilityTargetType.FocusedEnemy:
++                {
++                    int idx = ResolveLiveFocus(focusEnemyIndex, enemyList);
++                    if (idx < 0) idx = FirstAliveEnemyIndex(enemyList);
++                    if (idx >= 0) ApplyEffectToEnemy(hi, idx, def, magnitude, enemyList, enemyStatuses);
++                    break;
++                }
++                case AbilityTargetType.FirstAliveEnemy:
++                {
++                    int idx = FirstAliveEnemyIndex(enemyList);
++                    if (idx >= 0) ApplyEffectToEnemy(hi, idx, def, magnitude, enemyList, enemyStatuses);
++                    break;
++                }
++                case AbilityTargetType.FirstAliveAlly:
++                {
++                    int idx = FirstAliveAllyIndex(heroList, hi, includeSelf: true);
++                    if (idx >= 0) ApplyEffectToHero(hi, idx, def, magnitude, heroList, heroStatuses);
++                    break;
++                }
++                case AbilityTargetType.LowestHpAliveAlly:
++                {
++                    int idx = LowestHpAliveAllyIndex(heroList, hi);
++                    if (idx >= 0) ApplyEffectToHero(hi, idx, def, magnitude, heroList, heroStatuses);
++                    break;
++                }
++                case AbilityTargetType.AllEnemies:
++                    for (int ei = 0; ei < enemyList.Count; ei++)
++                    {
++                        if (enemyList[ei].hp > 0)
++                            ApplyEffectToEnemy(hi, ei, def, magnitude, enemyList, enemyStatuses);
++                    }
++                    break;
++                case AbilityTargetType.AllAllies:
++                    for (int ai = 0; ai < heroList.Count; ai++)
++                    {
++                        if (heroList[ai].hp > 0)
++                            ApplyEffectToHero(hi, ai, def, magnitude, heroList, heroStatuses);
++                    }
++                    break;
++            }
++        }
++
++        // ───────────────────────── Live-path helpers (shared with UIController.RunLiveCombat) ─────────────────────────
++        // The deterministic resolver above uses the same primitives; the live UI yields a banner
++        // coroutine between casts, so it needs one-cast-at-a-time control. State mutation order
++        // mirrors ResolvePendingCasts exactly — keep these in lockstep when changing either path.
++
++        // Returns true iff a cast fired this call. Walks heroes from `startSlot` in slot order.
++        // On success: cast effect is fully applied, mana is zeroed, lock is set. Out params describe
++        // the cast so the caller (UI) can show a banner. Caller resumes the walk by passing
++        // `casterSlot + 1` as the next `startSlot`.
++        public static bool TryResolveOneCastLive(
++            List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            int focusEnemyIndex, int startSlot,
++            out int casterSlot, out string abilityId, out int magnitude)
++        {
++            casterSlot = -1;
++            abilityId = string.Empty;
++            magnitude = 0;
++            if (startSlot < 0) startSlot = 0;
++            for (int hi = startSlot; hi < heroList.Count; hi++)
++            {
++                if (heroList[hi].hp <= 0) continue;                       // Q4: no death-casts
++                if (heroList[hi].manaLockTicksRemaining > 0) continue;
++                if (heroList[hi].maxMana <= 0) continue;                  // no ability
++                if (heroList[hi].mana < heroList[hi].maxMana) continue;
++
++                var def = AbilityRegistry.Get(heroList[hi].abilityId);
++                int mag = ComputeMagnitude(heroList[hi], def);
++
++                ApplyCastBody(hi, def, mag, heroList, heroStatuses, enemyList, enemyStatuses, focusEnemyIndex);
++
++                // Atomic: zero mana + arm lock BEFORE returning so the caller can yield safely.
++                var h = heroList[hi];
++                h.mana = 0;
++                if (h.manaLockTicks > 0) h.manaLockTicksRemaining = h.manaLockTicks;
++                heroList[hi] = h;
++
++                casterSlot = hi;
++                abilityId = def.abilityId ?? string.Empty;
++                magnitude = mag;
++                return true;
++            }
++            return false;
++        }
++
++        // Tick + prune pass for the live path. Reports per-hero / per-enemy DoT damage so the UI
++        // can animate floating numbers. Mirrors TickAndPruneStatuses exactly (DoT first, then
++        // decrement; Shield-typed statuses absorb DoT; expired entries pruned).
++        public static void TickAndPruneStatusesLive(
++            List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            int[] heroDotDamageOut, int[] enemyDotDamageOut)
++        {
++            if (heroDotDamageOut != null) for (int i = 0; i < heroDotDamageOut.Length; i++) heroDotDamageOut[i] = 0;
++            if (enemyDotDamageOut != null) for (int i = 0; i < enemyDotDamageOut.Length; i++) enemyDotDamageOut[i] = 0;
++
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                if (heroList[hi].hp <= 0) continue;
++                var bag = heroStatuses[hi];
++                int dotCount = 0;
++                for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.DamageOverTime) dotCount++;
++                if (dotCount == 0) continue;
++                var dotMag = new int[dotCount];
++                int k = 0;
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    if (bag[i].type != StatusType.DamageOverTime) continue;
++                    dotMag[k++] = bag[i].magnitude;
++                }
++                int totalDamage = 0;
++                for (int j = 0; j < dotCount; j++)
++                {
++                    if (heroList[hi].hp <= 0) break;
++                    int absorbed = AbsorbWithShield(heroStatuses, hi, dotMag[j]);
++                    int damage = dotMag[j] - absorbed;
++                    if (damage > 0)
++                    {
++                        var h = heroList[hi];
++                        h.hp -= damage;
++                        heroList[hi] = h;
++                        totalDamage += damage;
++                    }
++                }
++                if (heroDotDamageOut != null && hi < heroDotDamageOut.Length) heroDotDamageOut[hi] = totalDamage;
++            }
++            for (int ei = 0; ei < enemyList.Count; ei++)
++            {
++                if (enemyList[ei].hp <= 0) continue;
++                var bag = enemyStatuses[ei];
++                int dotCount = 0;
++                for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.DamageOverTime) dotCount++;
++                if (dotCount == 0) continue;
++                var dotMag = new int[dotCount];
++                int k = 0;
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    if (bag[i].type != StatusType.DamageOverTime) continue;
++                    dotMag[k++] = bag[i].magnitude;
++                }
++                int totalDamage = 0;
++                for (int j = 0; j < dotCount; j++)
++                {
++                    if (enemyList[ei].hp <= 0) break;
++                    int absorbed = AbsorbWithShield(enemyStatuses, ei, dotMag[j]);
++                    int damage = dotMag[j] - absorbed;
++                    if (damage > 0)
++                    {
++                        var e = enemyList[ei];
++                        e.hp -= damage;
++                        enemyList[ei] = e;
++                        totalDamage += damage;
++                    }
++                }
++                if (enemyDotDamageOut != null && ei < enemyDotDamageOut.Length) enemyDotDamageOut[ei] = totalDamage;
++            }
++
++            for (int hi = 0; hi < heroStatuses.Count; hi++) DecrementBag(heroStatuses[hi]);
++            for (int ei = 0; ei < enemyStatuses.Count; ei++) DecrementBag(enemyStatuses[ei]);
++        }
++
++        public static void DecrementHeroManaLocksLive(List<HeroStats> heroList) => DecrementManaLocks(heroList);
++
++        // Public live-path variant of AbsorbWithShield. Used by UIController.RunLiveCombat
++        // to apply Knight's Bulwark (and any future hero shield) on incoming enemy damage.
++        public static int AbsorbWithShieldLive(List<List<ActiveStatus>> statusBag, int targetIdx, int incoming)
++            => AbsorbWithShield(statusBag, targetIdx, incoming);
++
++        // Mana-on-attack and mana-on-hit applied identically to the deterministic resolver.
++        // Returns the new mana value (clamped to maxMana). Heroes with maxMana<=0 are no-ops.
++        public static int GainHeroManaLive(List<HeroStats> heroList, int hi, int gain)
++        {
++            GainMana(heroList, hi, gain);
++            return heroList[hi].mana;
++        }
++
++        // Total enemy DEF debuff active on the target. Mirrors what enemy attacks would face if
++        // an ally hit them — used by the live UI to show debuff impact on the focus ring or an
++        // overlay. Pure read-only.
++        public static int SumEnemyDefDebuff(List<List<ActiveStatus>> enemyStatuses, int ei)
++        {
++            if (ei < 0 || ei >= enemyStatuses.Count) return 0;
++            var bag = enemyStatuses[ei];
++            int total = 0;
++            for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.StatDebuff) total += bag[i].magnitude;
++            return total;
++        }
++
++        static int ComputeMagnitude(HeroStats caster, AbilityDef def)
++        {
++            int basis = def.scale == AbilityScale.CasterMaxHp ? caster.maxHp : caster.atk;
++            // Fixed-point: coeff is in milli (e.g., 400 = 0.4x). Avoids float in determinism path.
++            long m = (long)basis * def.magnitudeCoeffMilli / 1000L;
++            if (m < 0) m = 0;
++            if (m > int.MaxValue) m = int.MaxValue;
++            return (int)m;
++        }
++
++        static void ApplyEffectToHero(int sourceHi, int targetHi, AbilityDef def, int magnitude,
++            List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses)
++        {
++            switch (def.effectType)
++            {
++                case AbilityEffectType.FlatHeal:
++                {
++                    var h = heroList[targetHi];
++                    int healed = System.Math.Min(magnitude, System.Math.Max(0, h.maxHp - h.hp));
++                    h.hp += healed;
++                    heroList[targetHi] = h;
++                    break;
++                }
++                case AbilityEffectType.Shield:
++                    UpsertStatus(heroStatuses[targetHi], new ActiveStatus {
++                        type = StatusType.Shield,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.StatBuffNTicks:
++                    UpsertStatus(heroStatuses[targetHi], new ActiveStatus {
++                        type = StatusType.StatBuff,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.FlatDamage:
++                {
++                    int absorbed = AbsorbWithShield(heroStatuses, targetHi, magnitude);
++                    var h = heroList[targetHi];
++                    h.hp -= (magnitude - absorbed);
++                    heroList[targetHi] = h;
++                    break;
++                }
++                case AbilityEffectType.DamageOverTime:
++                    UpsertStatus(heroStatuses[targetHi], new ActiveStatus {
++                        type = StatusType.DamageOverTime,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++            }
++        }
++
++        static void ApplyEffectToEnemy(int sourceHi, int targetEi, AbilityDef def, int magnitude,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses)
++        {
++            switch (def.effectType)
++            {
++                case AbilityEffectType.FlatDamage:
++                {
++                    int absorbed = AbsorbWithShield(enemyStatuses, targetEi, magnitude);
++                    var e = enemyList[targetEi];
++                    e.hp -= (magnitude - absorbed);
++                    enemyList[targetEi] = e;
++                    break;
++                }
++                case AbilityEffectType.DamageOverTime:
++                    UpsertStatus(enemyStatuses[targetEi], new ActiveStatus {
++                        type = StatusType.DamageOverTime,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.StatDebuffNTicks:
++                    UpsertStatus(enemyStatuses[targetEi], new ActiveStatus {
++                        type = StatusType.StatDebuff,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++                case AbilityEffectType.Shield:
++                    UpsertStatus(enemyStatuses[targetEi], new ActiveStatus {
++                        type = StatusType.Shield,
++                        magnitude = magnitude,
++                        ticksRemaining = System.Math.Max(1, def.durationTicks),
++                        sourceHeroIndex = sourceHi
++                    });
++                    break;
++            }
++        }
++
++        // Status of the same type on the same target REPLACES (no stacking) — locked v1 rule.
++        static void UpsertStatus(List<ActiveStatus> bag, ActiveStatus s)
++        {
++            for (int i = 0; i < bag.Count; i++)
++            {
++                if (bag[i].type == s.type) { bag[i] = s; return; }
++            }
++            bag.Add(s);
++        }
++
++        // Damage absorbed by Shield statuses; remainder goes to HP.
++        // Multiple Shield statuses (cannot happen in v1 due to UpsertStatus replace) drained in order.
++        static int AbsorbWithShield(List<List<ActiveStatus>> statusBag, int targetIdx, int incoming)
++        {
++            if (incoming <= 0) return 0;
++            var bag = statusBag[targetIdx];
++            int absorbed = 0;
++            for (int i = 0; i < bag.Count; i++)
++            {
++                if (bag[i].type != StatusType.Shield) continue;
++                var s = bag[i];
++                int take = System.Math.Min(s.magnitude, incoming - absorbed);
++                if (take <= 0) continue;
++                s.magnitude -= take;
++                absorbed += take;
++                bag[i] = s;
++                if (absorbed >= incoming) break;
++            }
++            // Prune drained shields.
++            for (int i = bag.Count - 1; i >= 0; i--)
++            {
++                if (bag[i].type == StatusType.Shield && bag[i].magnitude <= 0) bag.RemoveAt(i);
++            }
++            return absorbed;
++        }
++
++        static void TickAndPruneStatuses(List<HeroStats> heroList, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            ref int tick, List<TickEvent> log)
++        {
++            // DoT damage applies BEFORE decrementing ticksRemaining. Heroes first, then enemies.
++            // AbsorbWithShield prunes drained shields from the same bag we're scanning, so we
++            // snapshot the DoT magnitude+source pairs first and only mutate after.
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                if (heroList[hi].hp <= 0) continue;
++                var bag = heroStatuses[hi];
++                int dotCount = 0;
++                for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.DamageOverTime) dotCount++;
++                if (dotCount == 0) continue;
++                var dotMag = new int[dotCount];
++                var dotSrc = new int[dotCount];
++                int k = 0;
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    if (bag[i].type != StatusType.DamageOverTime) continue;
++                    dotMag[k] = bag[i].magnitude;
++                    dotSrc[k] = bag[i].sourceHeroIndex;
++                    k++;
++                }
++                for (int j = 0; j < dotCount; j++)
++                {
++                    if (heroList[hi].hp <= 0) break;
++                    int absorbed = AbsorbWithShield(heroStatuses, hi, dotMag[j]);
++                    int damage = dotMag[j] - absorbed;
++                    if (damage > 0)
++                    {
++                        var h = heroList[hi];
++                        h.hp -= damage;
++                        heroList[hi] = h;
++                        tick++;
++                        int srcHp = (dotSrc[j] >= 0 && dotSrc[j] < heroList.Count)
++                            ? System.Math.Max(0, heroList[dotSrc[j]].hp) : 0;
++                        log.Add(new TickEvent {
++                            tick = tick,
++                            kind = TickEventKind.StatusTick,
++                            actor = $"Hero{dotSrc[j]}",
++                            target = $"Hero{hi}",
++                            damage = damage,
++                            actorHpAfter = srcHp,
++                            targetHpAfter = System.Math.Max(0, heroList[hi].hp)
++                        });
++                    }
++                }
++            }
++            for (int ei = 0; ei < enemyList.Count; ei++)
++            {
++                if (enemyList[ei].hp <= 0) continue;
++                var bag = enemyStatuses[ei];
++                int dotCount = 0;
++                for (int i = 0; i < bag.Count; i++) if (bag[i].type == StatusType.DamageOverTime) dotCount++;
++                if (dotCount == 0) continue;
++                var dotMag = new int[dotCount];
++                var dotSrc = new int[dotCount];
++                int k = 0;
++                for (int i = 0; i < bag.Count; i++)
++                {
++                    if (bag[i].type != StatusType.DamageOverTime) continue;
++                    dotMag[k] = bag[i].magnitude;
++                    dotSrc[k] = bag[i].sourceHeroIndex;
++                    k++;
++                }
++                for (int j = 0; j < dotCount; j++)
++                {
++                    if (enemyList[ei].hp <= 0) break;
++                    int absorbed = AbsorbWithShield(enemyStatuses, ei, dotMag[j]);
++                    int damage = dotMag[j] - absorbed;
++                    if (damage > 0)
++                    {
++                        var e = enemyList[ei];
++                        e.hp -= damage;
++                        enemyList[ei] = e;
++                        tick++;
++                        int srcHp = (dotSrc[j] >= 0 && dotSrc[j] < heroList.Count)
++                            ? System.Math.Max(0, heroList[dotSrc[j]].hp) : 0;
++                        log.Add(new TickEvent {
++                            tick = tick,
++                            kind = TickEventKind.StatusTick,
++                            actor = $"Hero{dotSrc[j]}",
++                            target = $"Enemy{ei}",
++                            damage = damage,
++                            actorHpAfter = srcHp,
++                            targetHpAfter = System.Math.Max(0, enemyList[ei].hp)
++                        });
++                    }
++                }
++            }
++
++            // Now decrement ticksRemaining on every status and prune expired.
++            for (int hi = 0; hi < heroStatuses.Count; hi++) DecrementBag(heroStatuses[hi]);
++            for (int ei = 0; ei < enemyStatuses.Count; ei++) DecrementBag(enemyStatuses[ei]);
++        }
++
++        static void DecrementBag(List<ActiveStatus> bag)
++        {
++            for (int i = bag.Count - 1; i >= 0; i--)
++            {
++                var s = bag[i];
++                s.ticksRemaining -= 1;
++                bag[i] = s;
++                if (s.ticksRemaining <= 0) bag.RemoveAt(i);
++            }
++        }
++
++        static void DecrementManaLocks(List<HeroStats> heroList)
++        {
++            for (int hi = 0; hi < heroList.Count; hi++)
++            {
++                var h = heroList[hi];
++                if (h.manaLockTicksRemaining > 0)
++                {
++                    h.manaLockTicksRemaining -= 1;
++                    heroList[hi] = h;
++                }
++            }
++        }
++
++        static int ResolveLiveFocus(int focusIdx, List<EnemyStats> enemies)
++        {
++            if (focusIdx < 0 || focusIdx >= enemies.Count) return -1;
++            return enemies[focusIdx].hp > 0 ? focusIdx : -1;
++        }
++
++        static int FirstAliveEnemyIndex(List<EnemyStats> enemies)
++        {
++            for (int i = 0; i < enemies.Count; i++) if (enemies[i].hp > 0) return i;
++            return -1;
++        }
++
++        static int FirstAliveAllyIndex(List<HeroStats> heroes, int casterIdx, bool includeSelf)
++        {
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                if (heroes[i].hp <= 0) continue;
++                if (!includeSelf && i == casterIdx) continue;
++                return i;
++            }
++            return includeSelf ? casterIdx : -1;
++        }
++
++        static int LowestHpAliveAllyIndex(List<HeroStats> heroes, int casterIdx)
++        {
++            int best = -1;
++            int bestHp = int.MaxValue;
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                if (heroes[i].hp <= 0) continue;
++                if (heroes[i].hp < bestHp) { best = i; bestHp = heroes[i].hp; }
++            }
++            return best >= 0 ? best : casterIdx;     // fall back to self
++        }
++
++        static void ApplyDamageToEnemy(List<EnemyStats> enemyList, List<List<ActiveStatus>> enemyStatuses,
++            int targetEi, int dmg)
++        {
++            int absorbed = AbsorbWithShield(enemyStatuses, targetEi, dmg);
++            int hpDamage = dmg - absorbed;
++            var e = enemyList[targetEi];
++            e.hp -= hpDamage;
++            enemyList[targetEi] = e;
++        }
++
+         public static string FormatLog(CombatResult r)
+         {
+             var sb = new StringBuilder();
+             sb.Append("[Combat] outcome=").Append(r.outcome).Append(" ticks=").Append(r.totalTicks).AppendLine();
+             foreach (var e in r.log)
+-                sb.Append("  t").Append(e.tick).Append(": ").Append(e.actor).Append("→").Append(e.target)
++                sb.Append("  t").Append(e.tick).Append(" [").Append(e.kind).Append("] ")
++                  .Append(e.actor).Append("→").Append(e.target)
+                   .Append(" dmg=").Append(e.damage).Append(" (target hp now ").Append(e.targetHpAfter).Append(")").AppendLine();
+             return sb.ToString();
+         }
+@@ -168,10 +830,8 @@ namespace DiverDungeon.Prototype
+ 
+         public static int PickHeroTarget(int focusIdx, IList<EnemyStats> enemies, System.Random rng)
+         {
+-            // Focused enemy alive → all heroes hit it.
+             if (focusIdx >= 0 && focusIdx < enemies.Count && enemies[focusIdx].hp > 0)
+                 return focusIdx;
+-            // Otherwise this hero picks an alive enemy at random (independently of others).
+             int aliveCount = 0;
+             for (int i = 0; i < enemies.Count; i++) if (enemies[i].hp > 0) aliveCount++;
+             if (aliveCount == 0) return -1;
+@@ -195,10 +855,5 @@ namespace DiverDungeon.Prototype
+             for (int i = 0; i < es.Count; i++) if (es[i].hp > 0) return true;
+             return false;
+         }
+-        static int FirstAliveHeroIndex(List<HeroStats> hs)
+-        {
+-            for (int i = 0; i < hs.Count; i++) if (hs[i].hp > 0) return i;
+-            return -1;
+-        }
+     }
+ }
+diff --git a/Assets/Prototype/Scripts/MetaState.cs b/Assets/Prototype/Scripts/MetaState.cs
+index c118bb6..46c6f87 100644
+--- a/Assets/Prototype/Scripts/MetaState.cs
++++ b/Assets/Prototype/Scripts/MetaState.cs
+@@ -49,6 +49,7 @@ namespace DiverDungeon.Prototype
+             Instance = this;
+             if (classRegistry == null) classRegistry = Resources.Load<HeroClassRegistry>("HeroClassRegistry");
+             if (roster.Count == 0) SeedDefaultRoster();
++            ApplyHeroAbilityOverlay();
+             EnsureVaultUnlocked();
+             Load();
+         }
+@@ -77,6 +78,58 @@ namespace DiverDungeon.Prototype
+             };
+         }
+ 
++        // Overlay ability/mana profile from Balance/balance_heroes.csv onto the in-code roster.
++        // CSV is the source of truth for which heroes have abilities — adding hero #6 is a
++        // CSV row + a HeroClassRegistry entry, no code edit needed. Heroes with no CSV row
++        // simply have maxMana=0 (the existing "no ability" sentinel in HeroData).
++        void ApplyHeroAbilityOverlay()
++        {
++            const string csvFile = "balance_heroes.csv";
++            var rows = CsvLoader.LoadFile(csvFile);
++            if (rows == null || rows.Count == 0)
++            {
++                Debug.Log($"[MetaState] {csvFile} not found or empty — heroes ship with no abilities.");
++                return;
++            }
++            int applied = 0;
++            for (int r = 0; r < rows.Count; r++)
++            {
++                var row = rows[r];
++                int id = CsvLoader.GetInt(row, "heroId", -1);
++                if (id < 0) continue;
++                var hero = GetById(id);
++                if (hero == null)
++                {
++                    Debug.LogWarning($"[MetaState] {csvFile} row {r + 2}: heroId={id} not in roster — skipping.");
++                    continue;
++                }
++
++                int maxMana       = Mathf.Max(0, CsvLoader.GetInt(row, "maxMana", 0));
++                int startingMana  = Mathf.Max(0, CsvLoader.GetInt(row, "startingMana", 0));
++                int manaPerAttack = Mathf.Max(0, CsvLoader.GetInt(row, "manaPerAttack", 0));
++                int manaPerHit    = Mathf.Max(0, CsvLoader.GetInt(row, "manaPerHit", 0));
++                int manaPerHitCap = Mathf.Max(0, CsvLoader.GetInt(row, "manaPerHitCap", 0));
++                int manaLockTicks = Mathf.Max(0, CsvLoader.GetInt(row, "manaLockTicks", 0));
++                string abilityId  = CsvLoader.GetString(row, "abilityId", string.Empty).Trim();
++
++                if (startingMana > maxMana)
++                {
++                    Debug.LogWarning($"[MetaState] {csvFile} heroId={id}: startingMana ({startingMana}) > maxMana ({maxMana}); clamping.");
++                    startingMana = maxMana;
++                }
++
++                hero.maxMana       = maxMana;
++                hero.startingMana  = startingMana;
++                hero.manaPerAttack = manaPerAttack;
++                hero.manaPerHit    = manaPerHit;
++                hero.manaPerHitCap = manaPerHitCap;
++                hero.manaLockTicks = manaLockTicks;
++                hero.abilityId     = abilityId;
++                applied++;
++            }
++            Debug.Log($"[MetaState] applied ability overlay to {applied} hero(es) from {csvFile}.");
++        }
++
+         public HeroData GetById(int id)
+         {
+             for (int i = 0; i < roster.Count; i++)
+diff --git a/Assets/Prototype/Scripts/UIController.cs b/Assets/Prototype/Scripts/UIController.cs
+index e21d28c..c0c56c2 100644
+--- a/Assets/Prototype/Scripts/UIController.cs
++++ b/Assets/Prototype/Scripts/UIController.cs
+@@ -43,11 +43,42 @@ namespace DiverDungeon.Prototype
+         Text resultLabel;
+         Text previewLabel;
+         Image flashOverlay;
++        Text fightBanner;
+         RectTransform damageLayer;
+         readonly List<HeroVisual> heroVisuals = new List<HeroVisual>();
+         readonly List<EnemyVisual> enemyVisuals = new List<EnemyVisual>();
+         bool isPlayingFloor = false;
+ 
++        // Cast banner (per-character special-ability flash). Built once in BuildCombat,
++        // shown by ShowCastBanner during RunLiveCombat. raycastTarget=true on the input
++        // blocker so the existing focus/descend buttons are ignored while the banner is up.
++        RectTransform castBannerRoot;
++        Image castBannerInputBlocker;
++        Image castBannerBg;
++        Image castBannerPortrait;
++        Image castBannerPortraitFallback;
++        Text castBannerName;
++        bool isCastBannerActive = false;
++
++        // Floor transition (walk-out → fade → walk-in → FIGHT) — all unscaled time so a future
++        // pause menu (timeScale=0) can't deadlock the UI.
++        // Hero walk pace: original 0.5s × 2.5 (-60%) × ~1.43 (-30% more) ≈ 1.785s.
++        const float WalkOutDuration   = 1.785f;
++        const float FadeOutDuration   = 0.25f;
++        const float FadeInDuration    = 0.25f;
++        const float WalkInDuration    = 1.785f;
++        const float FightBannerInTime = 0.1f;
++        const float FightBannerHold   = 0.4f;
++        const float FightBannerOut    = 0.1f;
++        // Cast banner timing (real-time, not scaled by SpeedMultiplier — locked at 1.0s for
++        // legibility per character-ability-cast-banner spec §5.3).
++        const float CastBannerInTime  = 0.15f;
++        const float CastBannerHold    = 0.70f;
++        const float CastBannerOut     = 0.15f;
++        const float WalkOffsetMargin  = 200f; // extra px past panel height so heroes go fully off-screen
++
++        public event System.Action OnFightBannerShown;
++
+         // Main menu
+         Text mainMenuStatus;
+         Button menuEnterDungeonBtn;
+@@ -81,6 +112,8 @@ namespace DiverDungeon.Prototype
+             public Graphic sprite;
+             public Image hpFill;
+             public Text hpLabel;
++            public Image manaBg;
++            public Image manaFill;
+             public Text nameLabel;
+             public Vector2 homeAnchoredPos;
+             public Color baseColor;
+@@ -89,6 +122,7 @@ namespace DiverDungeon.Prototype
+             public Camera heroCam;
+             public RenderTexture heroRT;
+             public Animator animator;
++            public ParticleSystem dustParticles;
+         }
+         class EnemyVisual {
+             public RectTransform root;
+@@ -151,6 +185,9 @@ namespace DiverDungeon.Prototype
+             if (meta != null) meta.OnDungeonUnlocked -= OnDungeonUnlocked;
+             DisposeAllHeroVisuals();
+             StopDescendTimer();
++            // Coroutine `finally` blocks aren't guaranteed to run on StopAllCoroutines or
++            // scene unload; reset transition state here as a belt-and-suspenders.
++            isPlayingFloor = false;
+         }
+ 
+         void DisposeAllHeroVisuals()
+@@ -887,6 +924,78 @@ namespace DiverDungeon.Prototype
+             flashOverlay = MakeImage("FlashOverlay", combatPanel, new Color(1, 0, 0, 0));
+             Stretch(flashOverlay.rectTransform);
+             flashOverlay.raycastTarget = false;
++
++            // FIGHT banner — shown after walk-in, before combat ticks
++            fightBanner = MakeText("FightBanner", combatPanel, "FIGHT", 200, TextAnchor.MiddleCenter);
++            fightBanner.fontStyle = FontStyle.Bold;
++            fightBanner.raycastTarget = false;
++            var fbRt = fightBanner.rectTransform;
++            fbRt.anchorMin = new Vector2(0.5f, 0.5f);
++            fbRt.anchorMax = new Vector2(0.5f, 0.5f);
++            fbRt.pivot = new Vector2(0.5f, 0.5f);
++            fbRt.anchoredPosition = Vector2.zero;
++            fbRt.sizeDelta = new Vector2(800, 240);
++            fightBanner.gameObject.SetActive(false);
++
++            BuildCastBanner();
++        }
++
++        // Per-cast banner: portrait + ability name, full-screen pause for 1s real-time.
++        // Built once at startup; ShowCastBanner just toggles activation + swaps the portrait/text.
++        // Designed to scale to any hero in HeroClassRegistry (portrait fetched at cast time via
++        // MetaState.GetPortrait(heroId)) — adding hero #6 requires no UI change.
++        void BuildCastBanner()
++        {
++            // Full-screen invisible image that absorbs raycasts so combat buttons (focus, descend,
++            // bank, speed) are ignored while a cast is mid-flash. raycastTarget defaults to true.
++            castBannerInputBlocker = MakeImage("CastBannerInputBlocker", combatPanel, new Color(0f, 0f, 0f, 0.001f));
++            Stretch(castBannerInputBlocker.rectTransform);
++            castBannerInputBlocker.gameObject.SetActive(false);
++
++            castBannerRoot = new GameObject("CastBannerRoot", typeof(RectTransform)).GetComponent<RectTransform>();
++            castBannerRoot.SetParent(combatPanel, false);
++            castBannerRoot.anchorMin = new Vector2(0.5f, 0.5f);
++            castBannerRoot.anchorMax = new Vector2(0.5f, 0.5f);
++            castBannerRoot.pivot = new Vector2(0.5f, 0.5f);
++            castBannerRoot.anchoredPosition = Vector2.zero;
++            castBannerRoot.sizeDelta = new Vector2(1200f, 400f);
++
++            // Translucent backdrop strip behind portrait + name.
++            castBannerBg = MakeImage("Bg", castBannerRoot, new Color(0f, 0f, 0f, 0.85f));
++            Stretch(castBannerBg.rectTransform);
++            castBannerBg.raycastTarget = false;
++
++            // Color-block fallback rendered behind the portrait so a missing sprite still gives a
++            // visible silhouette in the hero's color. Sized identically to the portrait.
++            castBannerPortraitFallback = MakeImage("PortraitFallback", castBannerRoot, Color.gray);
++            castBannerPortraitFallback.raycastTarget = false;
++            var pfRt = castBannerPortraitFallback.rectTransform;
++            pfRt.anchorMin = new Vector2(0f, 0.5f);
++            pfRt.anchorMax = new Vector2(0f, 0.5f);
++            pfRt.pivot = new Vector2(0f, 0.5f);
++            pfRt.anchoredPosition = new Vector2(40f, 0f);
++            pfRt.sizeDelta = new Vector2(360f, 360f);
++
++            castBannerPortrait = MakeImage("Portrait", castBannerRoot, Color.white);
++            castBannerPortrait.raycastTarget = false;
++            castBannerPortrait.preserveAspect = true;
++            var pRt = castBannerPortrait.rectTransform;
++            pRt.anchorMin = new Vector2(0f, 0.5f);
++            pRt.anchorMax = new Vector2(0f, 0.5f);
++            pRt.pivot = new Vector2(0f, 0.5f);
++            pRt.anchoredPosition = new Vector2(40f, 0f);
++            pRt.sizeDelta = new Vector2(360f, 360f);
++
++            castBannerName = MakeText("Name", castBannerRoot, "", 96, TextAnchor.MiddleLeft);
++            castBannerName.fontStyle = FontStyle.Bold;
++            castBannerName.raycastTarget = false;
++            var nRt = castBannerName.rectTransform;
++            nRt.anchorMin = new Vector2(0f, 0f);
++            nRt.anchorMax = new Vector2(1f, 1f);
++            nRt.offsetMin = new Vector2(440f, 20f);
++            nRt.offsetMax = new Vector2(-40f, -20f);
++
++            castBannerRoot.gameObject.SetActive(false);
+         }
+ 
+         void ToggleFastSpeed()
+@@ -958,6 +1067,7 @@ namespace DiverDungeon.Prototype
+                 Camera heroCam = null;
+                 RenderTexture heroRT = null;
+                 Animator heroAnim = null;
++                ParticleSystem dustPs = null;
+ 
+                 var prefabSrc = meta != null ? meta.GetPrefab(hd.id) : null;
+                 if (prefabSrc != null)
+@@ -985,6 +1095,8 @@ namespace DiverDungeon.Prototype
+                     heroAnim = heroInstance.GetComponentInChildren<Animator>();
+                     if (heroAnim != null) heroAnim.Play("Idle");
+ 
++                    dustPs = BuildDustParticles(heroInstance.transform);
++
+                     var raw = go.AddComponent<RawImage>();
+                     raw.texture = heroRT;
+                     raw.color = Color.white;
+@@ -1008,13 +1120,13 @@ namespace DiverDungeon.Prototype
+                     heroGraphic = img;
+                 }
+ 
+-                // Name + level under the character (below the HP bar)
++                // Name + level under the character (below the HP and mana bars)
+                 var nm = MakeText("Name", rt, hd.heroName.ToUpperInvariant(), 24, TextAnchor.MiddleCenter);
+                 nm.color = Color.white;
+                 var nmRt = nm.rectTransform;
+                 nmRt.anchorMin = new Vector2(0f, 0f); nmRt.anchorMax = new Vector2(1f, 0f);
+                 nmRt.pivot = new Vector2(0.5f, 1f);
+-                nmRt.anchoredPosition = new Vector2(0, -40);
++                nmRt.anchoredPosition = new Vector2(0, -54);
+                 nmRt.sizeDelta = new Vector2(0, 30);
+ 
+                 var lvl = MakeText("Lvl", rt, $"L{hd.level}", 20, TextAnchor.MiddleCenter);
+@@ -1022,7 +1134,7 @@ namespace DiverDungeon.Prototype
+                 var lvlRt = lvl.rectTransform;
+                 lvlRt.anchorMin = new Vector2(0f, 0f); lvlRt.anchorMax = new Vector2(1f, 0f);
+                 lvlRt.pivot = new Vector2(0.5f, 1f);
+-                lvlRt.anchoredPosition = new Vector2(0, -72);
++                lvlRt.anchoredPosition = new Vector2(0, -86);
+                 lvlRt.sizeDelta = new Vector2(0, 24);
+ 
+                 // HP bar under sprite
+@@ -1046,10 +1158,31 @@ namespace DiverDungeon.Prototype
+                 hpLbl.rectTransform.anchorMin = Vector2.zero; hpLbl.rectTransform.anchorMax = Vector2.one;
+                 hpLbl.rectTransform.offsetMin = Vector2.zero; hpLbl.rectTransform.offsetMax = Vector2.zero;
+ 
++                // Mana bar — slim blue bar directly beneath the HP bar. Hidden when the hero has no ability.
++                var manaBg = MakeImage("ManaBg", rt, new Color(0.05f, 0.05f, 0.05f));
++                var manaBgRt = manaBg.rectTransform;
++                manaBgRt.anchorMin = new Vector2(0f, 0f); manaBgRt.anchorMax = new Vector2(1f, 0f);
++                manaBgRt.pivot = new Vector2(0.5f, 1f);
++                manaBgRt.anchoredPosition = new Vector2(0, -36);
++                manaBgRt.sizeDelta = new Vector2(0, 14);
++
++                var manaFill = MakeImage("ManaFill", manaBg.rectTransform, new Color(0.25f, 0.55f, 1f));
++                manaFill.raycastTarget = false;
++                var manaFillRt = manaFill.rectTransform;
++                manaFillRt.anchorMin = new Vector2(0f, 0f); manaFillRt.anchorMax = new Vector2(1f, 1f);
++                manaFillRt.pivot = new Vector2(0f, 0.5f);
++                manaFillRt.offsetMin = new Vector2(2, 2);
++                manaFillRt.offsetMax = new Vector2(-2, -2);
++                float manaT0 = hd.maxMana > 0 ? Mathf.Clamp01((float)hd.startingMana / hd.maxMana) : 0f;
++                manaFillRt.localScale = new Vector3(manaT0, 1f, 1f);
++                if (hd.maxMana <= 0) manaBg.gameObject.SetActive(false);
++
+                 heroVisuals.Add(new HeroVisual {
+-                    root = rt, sprite = heroGraphic, hpFill = hpFill, hpLabel = hpLbl, nameLabel = nm,
++                    root = rt, sprite = heroGraphic, hpFill = hpFill, hpLabel = hpLbl,
++                    manaBg = manaBg, manaFill = manaFill, nameLabel = nm,
+                     homeAnchoredPos = home, baseColor = heroGraphic != null ? heroGraphic.color : Color.white, slot = i,
+-                    heroInstance = heroInstance, heroCam = heroCam, heroRT = heroRT, animator = heroAnim
++                    heroInstance = heroInstance, heroCam = heroCam, heroRT = heroRT, animator = heroAnim,
++                    dustParticles = dustPs
+                 });
+             }
+         }
+@@ -1057,29 +1190,442 @@ namespace DiverDungeon.Prototype
+         void DisposeHeroVisual(HeroVisual hv)
+         {
+             if (hv == null) return;
++            // dustParticles is parented under heroInstance, so destroying heroInstance disposes it too.
+             if (hv.heroCam != null) Destroy(hv.heroCam.gameObject);
+             if (hv.heroInstance != null) Destroy(hv.heroInstance);
+             if (hv.heroRT != null) { hv.heroRT.Release(); Destroy(hv.heroRT); }
+             if (hv.root != null) Destroy(hv.root.gameObject);
+         }
+ 
++        // Per-hero ground-dust ParticleSystem rendered into the same per-hero camera as the
++        // 3D model. Emission is off by default and toggled on by WalkOut/WalkInAlive while the
++        // hero is "running" between floors. The system lives on the world stage at the model's
++        // feet — the model itself doesn't translate during walk (the UI rect does), so the
++        // illusion of running comes from the particles puffing up around stationary feet plus
++        // the rect lerping across the canvas.
++        ParticleSystem BuildDustParticles(Transform parent)
++        {
++            var go = new GameObject("DustFx");
++            go.transform.SetParent(parent, false);
++            // Slight forward offset (-Z) so puffs aren't occluded by the model torso/legs.
++            go.transform.localPosition = new Vector3(0f, 0.05f, -0.25f);
++            go.transform.localRotation = Quaternion.identity;
++            // Force Default layer (0) so the per-hero camera (cullingMask = 1<<0) actually renders it,
++            // even if heroInstance lives on a custom layer.
++            go.layer = 0;
++
++            var ps = go.AddComponent<ParticleSystem>();
++            // Configure BEFORE the system auto-plays. We never call Play() here — emission is
++            // gated entirely by StartDustForAlive / StopDustAll.
++            var main = ps.main;
++            main.duration = 5f;
++            main.loop = true;
++            main.playOnAwake = false;
++            main.startLifetime = 0.6f;
++            main.startSpeed = 0.5f;
++            main.startSize = new ParticleSystem.MinMaxCurve(0.4f, 0.7f);
++            main.startColor = new Color(0.55f, 0.45f, 0.32f, 0.85f);
++            main.simulationSpace = ParticleSystemSimulationSpace.World;
++            main.gravityModifier = -0.2f;
++            main.maxParticles = 96;
++
++            var emission = ps.emission;
++            emission.enabled = false;
++            emission.rateOverTime = 40f;
++
++            var shape = ps.shape;
++            shape.shapeType = ParticleSystemShapeType.Cone;
++            shape.angle = 35f;
++            shape.radius = 0.18f;
++            shape.rotation = new Vector3(-90f, 0f, 0f);   // emit upward out of the ground
++
++            var color = ps.colorOverLifetime;
++            color.enabled = true;
++            var grad = new Gradient();
++            grad.SetKeys(
++                new[] {
++                    new GradientColorKey(new Color(0.55f, 0.45f, 0.32f), 0f),
++                    new GradientColorKey(new Color(0.7f, 0.6f, 0.45f), 1f)
++                },
++                new[] {
++                    new GradientAlphaKey(0.95f, 0f),
++                    new GradientAlphaKey(0f, 1f)
++                });
++            color.color = grad;
++
++            var size = ps.sizeOverLifetime;
++            size.enabled = true;
++            size.size = new ParticleSystem.MinMaxCurve(1f, AnimationCurve.EaseInOut(0f, 0.4f, 1f, 1.8f));
++
++            var psr = go.GetComponent<ParticleSystemRenderer>();
++            if (psr != null)
++            {
++                psr.renderMode = ParticleSystemRenderMode.Billboard;
++                psr.alignment = ParticleSystemRenderSpace.View;
++                psr.material = ResolveDustMaterial();
++                psr.sortingOrder = 100;
++            }
++
++            // Belt-and-suspenders: ensure the system isn't already emitting from the auto-play
++            // it might have done before our config landed.
++            ps.Clear();
++            return ps;
++        }
++
++        // Tries Built-in render pipeline shaders first, then falls back to Sprites/Default,
++        // then to Standard. The first one that resolves wins. Without this, ParticleSystem-
++        // Renderer ships with a null material and renders invisible (or magenta in editor).
++        Material ResolveDustMaterial()
++        {
++            string[] candidates = {
++                "Legacy Shaders/Particles/Alpha Blended",
++                "Particles/Standard Unlit",
++                "Mobile/Particles/Alpha Blended",
++                "Sprites/Default",
++                "UI/Default"
++            };
++            for (int i = 0; i < candidates.Length; i++)
++            {
++                var sh = Shader.Find(candidates[i]);
++                if (sh != null) return new Material(sh);
++            }
++            // Last-resort fallback so renderer never has null material.
++            return new Material(Shader.Find("Standard"));
++        }
++
++        void StartDustForAlive(bool[] wasAlive)
++        {
++            int n = Mathf.Min(wasAlive.Length, heroVisuals.Count);
++            for (int i = 0; i < n; i++)
++            {
++                if (!wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv == null || hv.dustParticles == null) continue;
++                var em = hv.dustParticles.emission;
++                em.enabled = true;
++                hv.dustParticles.Play();
++            }
++        }
++
++        void StopDustAll()
++        {
++            for (int i = 0; i < heroVisuals.Count; i++)
++            {
++                var hv = heroVisuals[i];
++                if (hv == null || hv.dustParticles == null) continue;
++                var em = hv.dustParticles.emission;
++                em.enabled = false;
++                hv.dustParticles.Stop(true, ParticleSystemStopBehavior.StopEmitting);
++            }
++        }
++
+         void OnDescendClicked()
+         {
+             if (isPlayingFloor) return;
++            // Synchronous lock BEFORE StopDescendTimer / StartCoroutine — closes the same-frame
++            // race between manual click and the auto-descend timer (and Bank).
++            isPlayingFloor = true;
+             StopDescendTimer();
+             ClearDamageLayer();
++            descendButton.interactable = false;
++            bankButton.interactable = false;
++            // First descend of a run (CurrentFloor==0 before BeginFloor) skips walk-out — heroes
++            // haven't been "in" any room yet. Floor 1 still gets fade + walk-in + FIGHT.
++            bool playWalkOut = run.CurrentFloor > 0;
++            StartCoroutine(FloorTransitionThenCombat(playWalkOut));
++        }
++
++        IEnumerator FloorTransitionThenCombat(bool playWalkOut)
++        {
++            // Snapshot alive state BEFORE BeginFloor so any future BeginFloor mutation can't
++            // desync visual decisions. Used by walk-out, reposition, and walk-in.
++            int n = Mathf.Min(heroVisuals.Count, run.Party.Count);
++            var wasAlive = new bool[n];
++            for (int i = 0; i < n; i++) wasAlive[i] = run.Party[i].hp > 0;
++
++            // Defensive: re-assert Defeat clip on dead heroes so they look right during walk-out.
++            for (int i = 0; i < n; i++)
++            {
++                if (wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv != null && hv.animator != null) hv.animator.Play("Defeat", 0, 1f);
++            }
++
++            float walkOffset = GetWalkOffsetY();
++
++            if (playWalkOut)
++                yield return WalkOutAlive(wasAlive, walkOffset);
++
++            yield return FadeOverlay(0f, 1f, FadeOutDuration);
++
++            // Room swap (under fully black overlay)
+             var enemies = run.BeginFloor();
+             BuildEnemyVisuals(enemies);
+             UpdateFocusVisuals();
+-            descendButton.interactable = false;
+-            bankButton.interactable = false;
+-            StartCoroutine(RunLiveCombat(enemies));
++            UpdateCounters();
++            // Reposition alive heroes to below-screen entry; leave dead heroes where they are
++            // so the slumped visual is preserved.
++            for (int i = 0; i < n; i++)
++            {
++                if (!wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv == null || hv.root == null) continue;
++                hv.root.anchoredPosition = hv.homeAnchoredPos + new Vector2(0f, -walkOffset);
++                if (hv.animator != null) hv.animator.Play("Idle", 0, 0f);
++            }
++            // Keep flashOverlay above newly built enemy visuals; force layout update so the
++            // first fade-in frame doesn't show a 1-frame pop of un-rebuilt rects.
++            if (flashOverlay != null) flashOverlay.transform.SetAsLastSibling();
++            if (fightBanner != null) fightBanner.transform.SetAsLastSibling();
++            Canvas.ForceUpdateCanvases();
++
++            yield return FadeOverlay(1f, 0f, FadeInDuration);
++
++            yield return WalkInAlive(wasAlive, walkOffset);
++
++            yield return ShowFightBanner();
++
++            // Hand off to combat. RunLiveCombat sets isPlayingFloor=true on entry and =false on
++            // exit; we yield it so the transition coroutine spans the full floor.
++            yield return RunLiveCombat(enemies);
++        }
++
++        float GetWalkOffsetY()
++        {
++            if (combatPanel == null) return 800f;
++            return combatPanel.rect.height + WalkOffsetMargin;
++        }
++
++        IEnumerator WalkOutAlive(bool[] wasAlive, float walkOffset)
++        {
++            int n = wasAlive.Length;
++            var starts = new Vector2[n];
++            for (int i = 0; i < n; i++)
++            {
++                if (heroVisuals[i] != null && heroVisuals[i].root != null)
++                    starts[i] = heroVisuals[i].root.anchoredPosition;
++            }
++            StartDustForAlive(wasAlive);
++            // 2x toggle accelerates the walk too (duration / SpeedMultiplier).
++            float duration = WalkOutDuration / Mathf.Max(0.01f, SpeedMultiplier);
++            float t = 0f;
++            while (t < duration)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / duration);
++                for (int i = 0; i < n; i++)
++                {
++                    if (!wasAlive[i]) continue;
++                    var hv = heroVisuals[i];
++                    if (hv == null || hv.root == null) continue;
++                    hv.root.anchoredPosition = starts[i] + new Vector2(0f, walkOffset * u);
++                }
++                yield return null;
++            }
++            StopDustAll();
++        }
++
++        IEnumerator WalkInAlive(bool[] wasAlive, float walkOffset)
++        {
++            int n = wasAlive.Length;
++            var starts = new Vector2[n];
++            for (int i = 0; i < n; i++)
++            {
++                if (heroVisuals[i] != null && heroVisuals[i].root != null)
++                    starts[i] = heroVisuals[i].root.anchoredPosition;
++            }
++            StartDustForAlive(wasAlive);
++            float duration = WalkInDuration / Mathf.Max(0.01f, SpeedMultiplier);
++            float t = 0f;
++            while (t < duration)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / duration);
++                for (int i = 0; i < n; i++)
++                {
++                    if (!wasAlive[i]) continue;
++                    var hv = heroVisuals[i];
++                    if (hv == null || hv.root == null) continue;
++                    hv.root.anchoredPosition = Vector2.Lerp(starts[i], hv.homeAnchoredPos, u);
++                }
++                yield return null;
++            }
++            StopDustAll();
++            // Snap to exact home — avoids float drift after lerp.
++            for (int i = 0; i < n; i++)
++            {
++                if (!wasAlive[i]) continue;
++                var hv = heroVisuals[i];
++                if (hv != null && hv.root != null)
++                    hv.root.anchoredPosition = hv.homeAnchoredPos;
++            }
++        }
++
++        IEnumerator FadeOverlay(float fromAlpha, float toAlpha, float duration)
++        {
++            if (flashOverlay == null) yield break;
++            // Force black for the room-swap fade. flashOverlay is reused for damage flashes,
++            // but those set their own RGB before flashing, so leaving it black is harmless.
++            var c = flashOverlay.color;
++            c.r = 0f; c.g = 0f; c.b = 0f; c.a = fromAlpha;
++            flashOverlay.color = c;
++            float t = 0f;
++            while (t < duration)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / duration);
++                c.a = Mathf.Lerp(fromAlpha, toAlpha, u);
++                flashOverlay.color = c;
++                yield return null;
++            }
++            c.a = toAlpha;
++            flashOverlay.color = c;
++        }
++
++        // Plays the cast banner for one ability: portrait + display name + 1s real-time pause.
++        // Caller (RunLiveCombat) yields on this coroutine, blocking the combat tick loop for its
++        // full duration. Cast EFFECTS are applied BEFORE this coroutine is yielded — so the
++        // target's HP/mana bars already reflect the cast when the banner punches in (visual
++        // coherence). This coroutine is presentation-only and never mutates combat state.
++        IEnumerator ShowCastBanner(int casterSlotIdx, string abilityId)
++        {
++            // Resolve display payload. Fallbacks handle: missing portrait → colored block in
++            // hero's HeroData.color; unknown abilityId → "???" (matches spec §5.5 failure rule).
++            HeroData hero = (run != null && casterSlotIdx >= 0 && casterSlotIdx < run.PartyData.Count)
++                ? run.PartyData[casterSlotIdx] : null;
++            Sprite portrait = (meta != null && hero != null) ? meta.GetPortrait(hero.id) : null;
++            var def = AbilityRegistry.Get(abilityId);
++            string displayName;
++            if (def == null || string.IsNullOrEmpty(def.displayName) || def.displayName == "None")
++                displayName = "???";
++            else
++                displayName = def.displayName;
++
++            if (castBannerPortrait != null)
++            {
++                if (portrait != null)
++                {
++                    castBannerPortrait.sprite = portrait;
++                    castBannerPortrait.color = Color.white;
++                    castBannerPortrait.gameObject.SetActive(true);
++                    if (castBannerPortraitFallback != null)
++                        castBannerPortraitFallback.gameObject.SetActive(false);
++                }
++                else
++                {
++                    castBannerPortrait.gameObject.SetActive(false);
++                    if (castBannerPortraitFallback != null)
++                    {
++                        castBannerPortraitFallback.color = hero != null ? hero.color : new Color(0.5f, 0.5f, 0.5f, 1f);
++                        castBannerPortraitFallback.gameObject.SetActive(true);
++                    }
++                }
++            }
++            if (castBannerName != null) castBannerName.text = displayName.ToUpperInvariant();
++
++            isCastBannerActive = true;
++            if (castBannerInputBlocker != null) castBannerInputBlocker.gameObject.SetActive(true);
++
++            if (castBannerRoot == null)
++            {
++                yield return new WaitForSecondsRealtime(CastBannerInTime + CastBannerHold + CastBannerOut);
++                if (castBannerInputBlocker != null) castBannerInputBlocker.gameObject.SetActive(false);
++                isCastBannerActive = false;
++                yield break;
++            }
++
++            castBannerRoot.gameObject.SetActive(true);
++            castBannerRoot.SetAsLastSibling();
++
++            // Punch-in: scale 1.4 → 1.0, alpha 0 → 1
++            float t = 0f;
++            while (t < CastBannerInTime)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / CastBannerInTime);
++                castBannerRoot.localScale = Vector3.Lerp(new Vector3(1.4f, 1.4f, 1f), Vector3.one, u);
++                SetCastBannerAlpha(u);
++                yield return null;
++            }
++            castBannerRoot.localScale = Vector3.one;
++            SetCastBannerAlpha(1f);
++
++            yield return new WaitForSecondsRealtime(CastBannerHold);
++
++            t = 0f;
++            while (t < CastBannerOut)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / CastBannerOut);
++                SetCastBannerAlpha(1f - u);
++                yield return null;
++            }
++            SetCastBannerAlpha(1f); // restore for next time
++            castBannerRoot.localScale = Vector3.one;
++            castBannerRoot.gameObject.SetActive(false);
++            if (castBannerInputBlocker != null) castBannerInputBlocker.gameObject.SetActive(false);
++            isCastBannerActive = false;
++        }
++
++        void SetCastBannerAlpha(float a)
++        {
++            if (castBannerBg != null) { var c = castBannerBg.color; c.a = a * 0.85f; castBannerBg.color = c; }
++            if (castBannerPortrait != null) { var c = castBannerPortrait.color; c.a = a; castBannerPortrait.color = c; }
++            if (castBannerPortraitFallback != null && castBannerPortraitFallback.gameObject.activeSelf)
++            { var c = castBannerPortraitFallback.color; c.a = a; castBannerPortraitFallback.color = c; }
++            if (castBannerName != null) { var c = castBannerName.color; c.a = a; castBannerName.color = c; }
++        }
++
++        IEnumerator ShowFightBanner()
++        {
++            if (fightBanner == null) yield break;
++            var rt = fightBanner.rectTransform;
++            fightBanner.gameObject.SetActive(true);
++
++            // Punch-in: scale 1.4 → 1.0, alpha 0 → 1
++            float t = 0f;
++            while (t < FightBannerInTime)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / FightBannerInTime);
++                rt.localScale = Vector3.Lerp(new Vector3(1.4f, 1.4f, 1f), Vector3.one, u);
++                var col = fightBanner.color; col.a = u; fightBanner.color = col;
++                yield return null;
++            }
++            rt.localScale = Vector3.one;
++            { var col = fightBanner.color; col.a = 1f; fightBanner.color = col; }
++
++            // Subscribers (audio etc.) hook here; isolate so a future thrower can't brick the run.
++            try { OnFightBannerShown?.Invoke(); }
++            catch (System.Exception e) { Debug.LogException(e); }
++
++            // Hold (real-time so timeScale=0 doesn't freeze it)
++            yield return new WaitForSecondsRealtime(FightBannerHold);
++
++            // Fade out
++            t = 0f;
++            while (t < FightBannerOut)
++            {
++                t += Time.unscaledDeltaTime;
++                float u = Mathf.Clamp01(t / FightBannerOut);
++                var col = fightBanner.color; col.a = 1f - u; fightBanner.color = col;
++                yield return null;
++            }
++            fightBanner.gameObject.SetActive(false);
++            { var col = fightBanner.color; col.a = 1f; fightBanner.color = col; } // restore for next time
++            rt.localScale = Vector3.one;
+         }
+ 
+         void OnBankClicked()
+         {
+             if (isPlayingFloor) return;
++            // Mirror the synchronous lock in OnDescendClicked — closes the same-frame
++            // Bank-vs-Descend race. Bank exits to the RunBanked screen, where the flag
++            // is no longer consulted.
++            isPlayingFloor = true;
+             StopDescendTimer();
++            descendButton.interactable = false;
++            bankButton.interactable = false;
+             run.Bank();
+         }
+ 
+@@ -1240,12 +1786,36 @@ namespace DiverDungeon.Prototype
+             var enemies = new List<EnemyStats>(enemyTemplate);
+             var rng = new System.Random(floor * 1000 + heroes.Count);
+ 
++            // Status bags (Shield / DoT / Buff / Debuff per-target). Parallel to heroes/enemies.
++            // Shared with CombatResolver via the public live API so cast effects, DoT ticks,
++            // and shield absorption use exactly one implementation. Cleared at floor start
++            // (parent ability spec Q5).
++            var heroStatuses = new List<List<ActiveStatus>>(heroes.Count);
++            for (int i = 0; i < heroes.Count; i++) heroStatuses.Add(new List<ActiveStatus>(2));
++            var enemyStatuses = new List<List<ActiveStatus>>(enemies.Count);
++            for (int i = 0; i < enemies.Count; i++) enemyStatuses.Add(new List<ActiveStatus>(2));
++
++            // Floor-start mana reset (matches CombatResolver.RunFloor — see character-special-abilities v1 spec).
++            for (int i = 0; i < heroes.Count; i++)
++            {
++                var h = heroes[i];
++                h.mana = h.startingMana;
++                h.manaLockTicksRemaining = 0;
++                heroes[i] = h;
++            }
++
+             for (int i = 0; i < heroes.Count; i++)
++            {
+                 UpdateHeroHpBar(i, heroes[i].hp, heroes[i].maxHp);
++                UpdateHeroManaBar(i, heroes[i].mana, heroes[i].maxMana);
++            }
+             for (int i = 0; i < enemies.Count; i++)
+                 if (i < enemyVisuals.Count && enemyVisuals[i].hpLabel != null)
+                     enemyVisuals[i].hpLabel.text = enemies[i].hp.ToString();
+ 
++            // Floor-start cast: handles startingMana >= maxMana case (mirrors resolver).
++            yield return DrainCastQueue(heroes, heroStatuses, enemies, enemyStatuses);
++
+             const float basePerTick = 0.845f; // 0.65s × 1.3 — additional 30% slower
+ 
+             while (AnyAliveHero(heroes) && AnyAliveEnemy(enemies))
+@@ -1261,8 +1831,13 @@ namespace DiverDungeon.Prototype
+ 
+                     int dmg = System.Math.Max(1, heroes[hi].atk - enemies[targetIdx].def);
+                     var e = enemies[targetIdx]; e.hp -= dmg; enemies[targetIdx] = e;
+-                    if (targetIdx < enemyVisuals.Count && enemyVisuals[targetIdx].hpLabel != null)
+-                        enemyVisuals[targetIdx].hpLabel.text = Mathf.Max(0, enemies[targetIdx].hp).ToString();
++
++                    // Mana on attack (post-damage) — see Character Special Abilities v1 spec.
++                    if (heroes[hi].maxMana > 0 && heroes[hi].manaPerAttack > 0)
++                    {
++                        CombatResolver.GainHeroManaLive(heroes, hi, heroes[hi].manaPerAttack);
++                        UpdateHeroManaBar(hi, heroes[hi].mana, heroes[hi].maxMana);
++                    }
+ 
+                     var hv = heroVisuals[hi];
+                     var ev = enemyVisuals[targetIdx];
+@@ -1274,9 +1849,15 @@ namespace DiverDungeon.Prototype
+                         hv.animator.Play("attack", 0, 0f);
+                         yield return new WaitForSeconds(AttackAnimLead);
+                     }
++                    int capturedTargetIdx = targetIdx;
++                    System.Action onEnemyHit = () =>
++                    {
++                        if (capturedTargetIdx < enemyVisuals.Count && enemyVisuals[capturedTargetIdx].hpLabel != null)
++                            enemyVisuals[capturedTargetIdx].hpLabel.text = Mathf.Max(0, enemies[capturedTargetIdx].hp).ToString();
++                    };
+                     yield return PlayAttack(hv.root, hv.homeAnchoredPos, ev.root, ev.homeAnchoredPos,
+                         ev.sprite, ev.baseColor, dmg, false, perTick,
+-                        heroRanged, hv.sprite, hv.baseColor);
++                        heroRanged, hv.sprite, hv.baseColor, onEnemyHit);
+                     if (hv.animator != null)
+                     {
+                         hv.animator.speed = 1f;
+@@ -1294,8 +1875,14 @@ namespace DiverDungeon.Prototype
+                             UpdateFocusVisuals();
+                         }
+                     }
++
++                    // Cast resolution after every atomic action (parent ability spec Q1).
++                    yield return DrainCastQueue(heroes, heroStatuses, enemies, enemyStatuses);
++                    if (!AnyAliveEnemy(enemies)) break;
++                    if (!AnyAliveHero(heroes)) break;
+                 }
+                 if (!AnyAliveEnemy(enemies)) break;
++                if (!AnyAliveHero(heroes)) break;
+ 
+                 // Mis-focus penalty for the upcoming enemy salvo: if Tide is alive and player isn't focusing it,
+                 // every enemy hit on this round scales by misFocusDamageMultiplier.
+@@ -1332,34 +1919,69 @@ namespace DiverDungeon.Prototype
+ 
+                     int rawDmg = System.Math.Max(1, enemies[ei].atk - heroes[targetIdx].def);
+                     int dmg = System.Math.Max(1, Mathf.RoundToInt(rawDmg * dmgMult));
+-                    var h = heroes[targetIdx]; h.hp = System.Math.Max(0, h.hp - dmg); heroes[targetIdx] = h;
+-                    UpdateHeroHpBar(targetIdx, heroes[targetIdx].hp, heroes[targetIdx].maxHp);
++
++                    // Shield absorption (e.g. Knight's Bulwark). Pre-mitigation `rawDmg` still
++                    // feeds mana-on-hit so a hero who took a fully-absorbed hit doesn't lose
++                    // their mana economy. Mirrors CombatResolver enemy-attack body.
++                    int absorbed = CombatResolver.AbsorbWithShieldLive(heroStatuses, targetIdx, dmg);
++                    int hpDamage = dmg - absorbed;
++                    var h = heroes[targetIdx]; h.hp = System.Math.Max(0, h.hp - hpDamage); heroes[targetIdx] = h;
++
++                    // Mana on hit — flat manaPerHit + pre-mitigation rawDmg, capped at manaPerHitCap.
++                    if (heroes[targetIdx].maxMana > 0)
++                    {
++                        var hHit = heroes[targetIdx];
++                        int manaGain = hHit.manaPerHit + rawDmg;
++                        if (hHit.manaPerHitCap > 0 && manaGain > hHit.manaPerHitCap)
++                            manaGain = hHit.manaPerHitCap;
++                        if (manaGain > 0)
++                            CombatResolver.GainHeroManaLive(heroes, targetIdx, manaGain);
++                    }
+ 
+                     var ev = enemyVisuals[ei];
+                     var hv = heroVisuals[targetIdx];
+                     bool enemyRanged = enemies[ei].attackType == AttackType.Ranged;
++                    int capturedHeroIdx = targetIdx;
++                    System.Action onHeroHit = () =>
++                    {
++                        UpdateHeroHpBar(capturedHeroIdx, heroes[capturedHeroIdx].hp, heroes[capturedHeroIdx].maxHp);
++                        UpdateHeroManaBar(capturedHeroIdx, heroes[capturedHeroIdx].mana, heroes[capturedHeroIdx].maxMana);
++                    };
+                     yield return PlayAttack(ev.root, ev.homeAnchoredPos, hv.root, hv.homeAnchoredPos,
+                         hv.sprite, hv.baseColor, dmg, true, perTick,
+-                        enemyRanged, ev.sprite, ev.baseColor);
++                        enemyRanged, ev.sprite, ev.baseColor, onHeroHit);
+ 
+                     if (heroes[targetIdx].hp <= 0)
+                     {
+                         if (hv.sprite != null) hv.sprite.color = new Color(0.25f, 0.25f, 0.30f, 0.45f);
+                         if (hv.animator != null) hv.animator.Play("Defeat", 0, 0f);
+                     }
+-                }
+-            }
+ 
+-            // Settle outcome
+-            var hpAfter = new int[heroes.Count];
+-            for (int i = 0; i < heroes.Count; i++) hpAfter[i] = heroes[i].hp;
+-            var outcome = AnyAliveHero(heroes) ? FloorOutcome.Cleared : FloorOutcome.Wiped;
+-            run.ApplyFloorOutcome(hpAfter, outcome);
++                    yield return DrainCastQueue(heroes, heroStatuses, enemies, enemyStatuses);
++                    if (!AnyAliveHero(heroes)) break;
++                    if (!AnyAliveEnemy(enemies)) break;
++                }
+ 
+-            UpdateCounters();
+-            for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
+-                UpdateHeroHpBar(i, run.Party[i].hp, run.Party[i].maxHp);
++                // End-of-round: DoT damage applies, then status durations decrement, mana locks tick down,
++                // and any cast that comes online from those events fires before the next round starts.
++                if (AnyAliveHero(heroes) && AnyAliveEnemy(enemies))
++                {
++                    var heroDot = new int[heroes.Count];
++                    var enemyDot = new int[enemies.Count];
++                    CombatResolver.TickAndPruneStatusesLive(heroes, heroStatuses, enemies, enemyStatuses,
++                        heroDot, enemyDot);
++                    CombatResolver.DecrementHeroManaLocksLive(heroes);
++                    RefreshAllCombatBars(heroes, enemies);
++                    MarkDeadVisuals(heroes, enemies);
++                    bool anyDot = false;
++                    for (int i = 0; i < heroDot.Length; i++) if (heroDot[i] > 0) { anyDot = true; break; }
++                    if (!anyDot) for (int i = 0; i < enemyDot.Length; i++) if (enemyDot[i] > 0) { anyDot = true; break; }
++                    if (anyDot) yield return new WaitForSecondsRealtime(0.25f); // brief beat so DoT damage is legible
++                    yield return DrainCastQueue(heroes, heroStatuses, enemies, enemyStatuses);
++                }
++            }
+ 
++            FloorOutcome outcome = SettleFloor(heroes);
+             StopDescendTimer();
+             if (outcome == FloorOutcome.Wiped)
+             {
+@@ -1387,6 +2009,94 @@ namespace DiverDungeon.Prototype
+             isPlayingFloor = false;
+         }
+ 
++        // Walks heroes in slot order and yields a banner for every cast that fires; also refreshes
++        // bars so the post-cast state is visible while the banner is up. Uses
++        // CombatResolver.TryResolveOneCastLive so the cast effects, mana reset, and lock arming
++        // happen inside the resolver's shared logic — no second copy of cast resolution lives here.
++        IEnumerator DrainCastQueue(
++            List<HeroStats> heroes, List<List<ActiveStatus>> heroStatuses,
++            List<EnemyStats> enemies, List<List<ActiveStatus>> enemyStatuses)
++        {
++            int slot = 0;
++            int safety = 0;
++            while (true)
++            {
++                if (++safety > 64)
++                {
++                    Debug.LogError("[UIController] DrainCastQueue safety break");
++                    yield break;
++                }
++                bool fired = CombatResolver.TryResolveOneCastLive(
++                    heroes, heroStatuses, enemies, enemyStatuses,
++                    run.FocusEnemyIndex, slot,
++                    out int casterSlot, out string abilityId, out int _magnitude);
++                if (!fired) yield break;
++
++                // Apply visual side-effects of the cast BEFORE banner so the player sees
++                // the result land while the portrait flash is up (spec §5.3 / D5-A).
++                RefreshAllCombatBars(heroes, enemies);
++                MarkDeadVisuals(heroes, enemies);
++                yield return ShowCastBanner(casterSlot, abilityId);
++                slot = casterSlot + 1;
++                if (!AnyAliveEnemy(enemies)) yield break;
++                if (!AnyAliveHero(heroes)) yield break;
++            }
++        }
++
++        void RefreshAllCombatBars(List<HeroStats> heroes, List<EnemyStats> enemies)
++        {
++            for (int i = 0; i < heroes.Count && i < heroVisuals.Count; i++)
++            {
++                UpdateHeroHpBar(i, heroes[i].hp, heroes[i].maxHp);
++                UpdateHeroManaBar(i, heroes[i].mana, heroes[i].maxMana);
++            }
++            for (int i = 0; i < enemies.Count && i < enemyVisuals.Count; i++)
++            {
++                if (enemyVisuals[i].hpLabel != null)
++                    enemyVisuals[i].hpLabel.text = System.Math.Max(0, enemies[i].hp).ToString();
++            }
++        }
++
++        void MarkDeadVisuals(List<HeroStats> heroes, List<EnemyStats> enemies)
++        {
++            for (int i = 0; i < enemies.Count && i < enemyVisuals.Count; i++)
++            {
++                if (enemies[i].hp <= 0 && enemyVisuals[i].sprite != null)
++                    enemyVisuals[i].sprite.color = new Color(0.4f, 0.1f, 0.1f, 0.35f);
++            }
++            for (int i = 0; i < heroes.Count && i < heroVisuals.Count; i++)
++            {
++                if (heroes[i].hp <= 0 && heroVisuals[i].sprite != null)
++                {
++                    heroVisuals[i].sprite.color = new Color(0.25f, 0.25f, 0.30f, 0.45f);
++                    if (heroVisuals[i].animator != null) heroVisuals[i].animator.Play("Defeat", 0, 0f);
++                }
++            }
++            // If the focused enemy is dead, drop focus the same way the hero-attack path does.
++            if (run != null && run.FocusEnemyIndex >= 0 && run.FocusEnemyIndex < enemies.Count
++                && enemies[run.FocusEnemyIndex].hp <= 0)
++            {
++                run.ClearFocus();
++                UpdateFocusVisuals();
++            }
++        }
++
++        // Settles the floor and propagates HP back to RunController. Returns the outcome the
++        // caller can branch on for post-fight UI. Single source of truth for the cleared/wiped
++        // determination so both the normal exit and a future early-exit branch use the same rule.
++        FloorOutcome SettleFloor(List<HeroStats> heroes)
++        {
++            var hpAfter = new int[heroes.Count];
++            for (int i = 0; i < heroes.Count; i++) hpAfter[i] = heroes[i].hp;
++            var outcome = AnyAliveHero(heroes) ? FloorOutcome.Cleared : FloorOutcome.Wiped;
++            run.ApplyFloorOutcome(hpAfter, outcome);
++
++            UpdateCounters();
++            for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
++                UpdateHeroHpBar(i, run.Party[i].hp, run.Party[i].maxHp);
++            return outcome;
++        }
++
+         static bool AnyAliveHero(List<HeroStats> hs)
+         {
+             for (int i = 0; i < hs.Count; i++) if (hs[i].hp > 0) return true;
+@@ -1401,7 +2111,8 @@ namespace DiverDungeon.Prototype
+         IEnumerator PlayAttack(RectTransform actor, Vector2 actorHome,
+             RectTransform target, Vector2 targetHome, Graphic targetImg, Color targetBase,
+             int dmg, bool targetIsHero, float slice,
+-            bool ranged = false, Graphic actorImg = null, Color actorBase = default)
++            bool ranged = false, Graphic actorImg = null, Color actorBase = default,
++            System.Action onImpact = null)
+         {
+             if (slice <= 0f) slice = 0.5f;
+             float lungeOut = Mathf.Min(0.2535f, slice * 0.351f); // tackle additional 30% slower
+@@ -1419,8 +2130,10 @@ namespace DiverDungeon.Prototype
+ 
+                 if (actorImg != null) actorImg.color = Color.white;
+                 if (targetImg != null) targetImg.color = new Color(1f, 0.15f, 0.15f, 1f);
++                onImpact?.Invoke();
+                 if (target != null)
+                 {
++                    SpawnSparkBurst(target.position);
+                     SpawnDamageNumber(target.position, dmg, targetIsHero ? new Color(1f, 0.4f, 0.4f) : Color.white);
+                     target.anchoredPosition = targetHome + Vector2.zero;  // no push for ranged
+                     target.localScale = new Vector3(0.86f, 0.86f, 1f);
+@@ -1480,8 +2193,10 @@ namespace DiverDungeon.Prototype
+             }
+ 
+             if (targetImg != null) targetImg.color = new Color(1f, 0.15f, 0.15f, 1f);
++            onImpact?.Invoke();
+             if (target != null)
+             {
++                SpawnSparkBurst(target.position);
+                 SpawnDamageNumber(target.position, dmg, targetIsHero ? new Color(1f, 0.4f, 0.4f) : Color.white);
+                 target.anchoredPosition = targetHome + pushOffset;
+                 target.localScale = new Vector3(0.86f, 0.86f, 1f);
+@@ -1540,6 +2255,7 @@ namespace DiverDungeon.Prototype
+             descendButton.onClick.AddListener(ReturnToDungeonSelect);
+             descendButton.interactable = true;
+             bankButton.interactable = false;
++            isPlayingFloor = false;
+         }
+ 
+         IEnumerator Flash(Color c)
+@@ -1597,6 +2313,47 @@ namespace DiverDungeon.Prototype
+             StartCoroutine(FloatAndFade(rt, t));
+         }
+ 
++        void SpawnSparkBurst(Vector3 worldPos, int count = 12)
++        {
++            if (damageLayer == null) return;
++            for (int i = 0; i < count; i++)
++            {
++                var go = new GameObject("Spark", typeof(RectTransform), typeof(Image));
++                go.transform.SetParent(damageLayer, false);
++                var img = go.GetComponent<Image>();
++                img.color = Color.white;
++                img.raycastTarget = false;
++                var rt = (RectTransform)go.transform;
++                float size = UnityEngine.Random.Range(6f, 12f);
++                rt.sizeDelta = new Vector2(size, size);
++                rt.position = worldPos;
++                rt.localRotation = Quaternion.Euler(0, 0, UnityEngine.Random.Range(0f, 360f));
++                float angle = UnityEngine.Random.Range(0f, Mathf.PI * 2f);
++                float dist = UnityEngine.Random.Range(55f, 130f);
++                Vector3 endOffset = new Vector3(Mathf.Cos(angle) * dist, Mathf.Sin(angle) * dist, 0f);
++                float dur = UnityEngine.Random.Range(0.22f, 0.32f);
++                StartCoroutine(SparkRoutine(rt, img, worldPos, endOffset, dur));
++            }
++        }
++
++        IEnumerator SparkRoutine(RectTransform rt, Image img, Vector3 startWorld, Vector3 endOffset, float dur)
++        {
++            float t = 0f;
++            Vector3 endWorld = startWorld + endOffset;
++            Vector3 startScale = rt.localScale;
++            while (t < dur && rt != null)
++            {
++                t += Time.deltaTime;
++                float p = Mathf.Clamp01(t / dur);
++                float ease = 1f - (1f - p) * (1f - p);
++                rt.position = Vector3.Lerp(startWorld, endWorld, ease);
++                if (img != null) img.color = new Color(1f, 1f, 1f, 1f - p);
++                rt.localScale = startScale * (1f - 0.6f * p);
++                yield return null;
++            }
++            if (rt != null) Destroy(rt.gameObject);
++        }
++
+         IEnumerator FloatAndFade(RectTransform rt, Text t)
+         {
+             float dur = 0.5f;
+@@ -1641,6 +2398,18 @@ namespace DiverDungeon.Prototype
+                 hv.hpLabel.text = $"{hp}/{max}";
+         }
+ 
++        void UpdateHeroManaBar(int slot, int mana, int max)
++        {
++            if (slot >= heroVisuals.Count) return;
++            var hv = heroVisuals[slot];
++            if (hv.manaBg != null)
++                hv.manaBg.gameObject.SetActive(max > 0);
++            if (max <= 0) return;
++            float t = Mathf.Clamp01((float)mana / max);
++            if (hv.manaFill != null)
++                hv.manaFill.rectTransform.localScale = new Vector3(t, 1f, 1f);
++        }
++
+         // --------------------------------------------------------------------
+         // UI builders (shared)
+         // --------------------------------------------------------------------
+
+══════════════════════════════════════════════════════════════════
+DELIVERABLE
+══════════════════════════════════════════════════════════════════
+
+Cada modelo: review focada e específica. Cite arquivo:linha. Aborde:
+- §1 Bugs / regressões / divergências entre resolver e live
+- §2 Race conditions em corotinas, input gating durante banner
+- §3 Edge cases não cobertos
+- §4 Falhas em CSV failure modes
+- §5 Performance (PreviewNextFloor cost, banner cost)
+- §6 Sugestões de melhoria que NÃO sejam scope creep
+
+End com verdict: **APPROVE** / **APPROVE_WITH_NITS** / **REJECT**.

@@ -1,0 +1,248 @@
+TAREFA: revisar PRÉ-CODE o plano de implementação da feature **"Multiple Dungeons"** no projeto **DiverDungeon** (jogo Unity, C#, party-based dungeon crawler em prototipagem inicial).
+
+Esta é a **rodada 1 de pré-code**. O usuário aprovou um spec PM completo. Antes de codar, queremos que vocês:
+1. Apontem riscos, edge cases e bugs latentes do plano
+2. Critiquem decisões de design/arquitetura que vão envenenar manutenção
+3. Sugiram simplificações onde houver overengineering
+4. Validem determinismo e save migration
+
+Idioma da resposta: PT ou EN (use o que for mais natural pra você). Máx ~400 palavras cada.
+
+---
+
+## 1. CONTEXTO DO PROJETO
+
+- Unity 6, C#, single-scene prototype.
+- Pasta de scripts: `Assets/Prototype/Scripts/`
+- Tuning vive em ScriptableObject (`TuningConfig.asset`) **e** num CSV recém-criado em `Balance/balance_general.csv` na raiz do repo (CSV é o source-of-truth canônico para balance daqui pra frente — ainda sem loader implementado).
+- Single hero combat → expandiu para party (1–4 heroes) já implementado.
+- Save: `PlayerPrefs` + `JsonUtility.ToJson(SaveBundle)`. Versão atual: `version = 1`.
+- Determinismo: combate é função pura de `(party, enemies, focusIdx, seed)`.
+
+---
+
+## 2. SPEC RESUMIDO — Multiple Dungeons (v1)
+
+**Objetivo:** 3 dungeons distintas; jogador escolhe qual rodar a cada sessão. Cada uma força composições/decisões diferentes via stat profile + regra de focus-targeting.
+
+### Lineup v1 (final)
+
+| ID | Nome | Unlock | Focus rule | Stat profile |
+|---|---|---|---|---|
+| `vault` | The Vault | sempre | **Standard** (toca enemy → party concentra fogo; sem focus → cada hero escolhe random) | balanceado, defaults |
+| `hollow` | The Hollow | clear Vault Floor 10 | **No-Focus** (botão de focus DESABILITADO) | swarm: mais inimigos, HP menor cada |
+| `drowned_crypt` | The Drowned Crypt | clear Vault Floor 20 | **Forced-Focus** (1 inimigo "Tide" por floor; se focus ≠ Tide enquanto Tide vivo → todos inimigos causam **+50% damage**) | elite-anchored: 1 anchor com HP×3 + 2–3 supports |
+
+"Reached Floor N" = `deepestFloorByDungeon[id] >= N` (banked OR wiped, ambos contam — alcançou a floor é alcançou).
+
+### Mudanças de fluxo
+- App agora abre em **Dungeon Select** (canvas novo). 3 cards. Lock card = shake + tooltip.
+- Card mostra **focus rule verbatim** + **pressure hint genérico**. SEM hints de comp/synergy (gated até existir Cartographer building).
+- Jogador toca card unlocked → vai DIRETO pro Party Select (sem confirm panel — PM-default Q9). Banner do dungeon no Party Select.
+- Bank/wipe → volta pra Dungeon Select (não pro Party Select).
+- Per-dungeon **deepest floor** trackeado; gold é **shared wallet** (sem mudança).
+- "New" badge em dungeon recém-unlocked, limpa após visualização ou após rodar a dungeon.
+
+### Save migration (v1 → v2)
+- `dungeonsUnlocked = { "vault" }` (default).
+- `deepestFloorByDungeon = { "vault": existing global deepestFloor }` (preserva progresso).
+- `seenJustUnlocked = {}`.
+- `seenDungeonFocusExplanation = {}` (pra mostrar tooltip do No-Focus/Forced-Focus apenas na 1ª vez).
+- Save corrupto → fallback graceful pra defaults (Vault-only). Não crashar.
+
+### Tide enemy (Drowned Crypt) — determinismo
+- Tide enemy index = função pura de `(dungeonId, floor, enemyCount)`. PM-default: `tideIdx = hash(dungeonId, floor) % enemyCount`.
+- Anchor enemy (Tide) tem `hp = baseHp × anchorEnemyHpMultiplier` (default 3.0).
+- Mis-focus penalty: `enemy_dmg × 1.5` em qualquer tick onde `focusIdx != tideIdx` E Tide vivo.
+- `PreviewNextFloor` **deve** retornar a mesma Tide designation que a floor real terá (não um random).
+
+### Asset shape (decisão tomada)
+- Dungeon definitions vivem em CSV (`Balance/balance_dungeons.csv`), 1 row por dungeon. Loader popula um registry SO em runtime/edit-time. Designer edita CSV.
+- Colunas: `id, displayName, sortIndex, themeColor, themeIconRef, focusRule, cardFocusRuleText, cardPressureHintText, unlockRule, enemyHpBase, enemyHpGrowth, enemyAtkBase, enemyAtkGrowth, enemyCountBase, enemyCountStep, goldBase, goldGrowth, floorClearTimeBase, floorClearTimePerFloor, anchorEnemyHpMultiplier, misFocusDamageMultiplier`.
+
+### Não-fazer (out of scope v1)
+- Spire (single-hero dungeon)
+- Branching paths
+- Hero synergy tags
+- Modifiers (Volatile/Reflective/Necrotic/etc)
+- Boss floors
+- Dungeon difficulty tiers
+- Per-dungeon currency
+- Echoes/Sanctum/prestige
+
+---
+
+## 3. CÓDIGO ATUAL (relevante para a feature)
+
+### `RunController.cs` (resumo das partes que precisam mudar)
+
+```csharp
+public class RunController : MonoBehaviour
+{
+    public TuningConfig config;  // SO global hoje — vai precisar ser per-dungeon
+
+    public RunState State { get; private set; } = RunState.Idle;
+    public int CurrentFloor { get; private set; } = 0;
+    public int Gold { get; private set; } = 0;
+    public int FocusEnemyIndex { get; private set; } = -1;
+    public void SetFocus(int idx) { FocusEnemyIndex = idx; }
+    public void ClearFocus() { FocusEnemyIndex = -1; }
+
+    public List<HeroStats> Party { get; private set; } = new List<HeroStats>();
+
+    public void StartRun(List<HeroData> partyData)  // ← vai virar StartRun(party, dungeon)
+    {
+        // ... PartyData = partyData; CurrentFloor = 0; Gold = 0; ...
+    }
+
+    public List<EnemyStats> BeginFloor()
+    {
+        CurrentFloor++;
+        return BuildEnemiesForFloor(CurrentFloor);
+        // ← também precisa designar Tide enemy se dungeon for Crypt
+    }
+
+    public List<EnemyStats> BuildEnemiesForFloor(int floor)
+    {
+        int count = EnemyCountBase + (Mathf.Max(0, floor - 1) / Mathf.Max(1, EnemyCountStep));
+        int hp = Mathf.RoundToInt(EnemyHpBase * Mathf.Pow(EnemyHpGrowth, floor - 1));
+        int atk = Mathf.RoundToInt(EnemyAtkBase * Mathf.Pow(EnemyAtkGrowth, floor - 1));
+        var list = new List<EnemyStats>(count);
+        for (int i = 0; i < count; i++)
+            list.Add(new EnemyStats { hp = hp, atk = atk, def = 0 });
+        return list;
+        // ← Hollow precisa count maior + hp/atk customizado
+        // ← Crypt precisa anchor com HP×multiplier no slot tideIdx
+    }
+
+    public FloorPreview PreviewNextFloor()
+    {
+        int floor = CurrentFloor + 1;
+        var enemies = BuildEnemiesForFloor(floor);
+        int seed = floor * 1000 + Party.Count;
+        var sim = CombatResolver.Resolve(Party, enemies, FocusEnemyIndex, seed);
+        // ← se Crypt, sim precisa receber tideIdx + misFocusMultiplier
+        // ← determinismo: preview e run real precisam dar resultado idêntico
+    }
+}
+```
+
+### `MetaState.cs` (resumo)
+
+```csharp
+public class MetaState : MonoBehaviour
+{
+    public int metaGold = 0;
+    public int totalRuns = 0;
+    public int deepestFloor = 0;  // ← global. PM-default: vira getter derivado de deepestFloorByDungeon.
+
+    // CAMPOS NOVOS:
+    // public HashSet<string> dungeonsUnlocked;
+    // public Dictionary<string,int> deepestFloorByDungeon;
+    // public HashSet<string> seenJustUnlocked;
+    // public HashSet<string> seenDungeonFocusExplanation;
+
+    public void RecordRunEnd(int floorReached, int goldBanked)
+    {
+        // ← vai virar RecordRunEnd(dungeonId, floorReached, goldBanked)
+        totalRuns++;
+        metaGold += goldBanked;
+        if (floorReached > deepestFloor) deepestFloor = floorReached;
+        Save();
+    }
+
+    [Serializable]
+    class SaveBundle
+    {
+        public int version = 1;  // ← bump para 2
+        public List<HeroData> roster;
+        public List<int> partyIds;
+        public int metaGold;
+        public int totalRuns;
+        public int deepestFloor;
+        // ← novos campos perto disso
+    }
+
+    // Save = JsonUtility.ToJson(bundle); PlayerPrefs.SetString(...).
+    // Load = parse JSON, fallback graceful em exception.
+    // ATENÇÃO: JsonUtility NÃO serializa Dictionary nem HashSet. Vai precisar shim
+    //          (ex: List<string> dungeonsUnlocked + List<DungeonProgress>{id, floor}).
+}
+```
+
+### `CombatResolver.cs` (resumo)
+
+```csharp
+public static class CombatResolver
+{
+    public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
+        int focusEnemyIndex = -1, int seed = 0)
+    {
+        // Ordem: Hero0..N-1 atacam → Enemy0..M-1 atacam → repete.
+        // Hero target: PickHeroTarget(focusEnemyIndex, enemies, rng):
+        //   - se focusIdx vivo → todos heroes batem nele
+        //   - senão → cada hero escolhe random independente
+        // Enemy target: PickEnemyTarget = primeiro hero vivo? Não — random alive hero.
+        // ← VAI PRECISAR: receber dungeonRule (focus rule + tideIdx + misFocusMult)
+        //   - NoFocus → ignora focusEnemyIndex (sempre trata como -1)
+        //   - ForcedFocus → se focus != tideIdx e Tide vivo, todo enemy.atk × 1.5 nesse tick
+    }
+}
+```
+
+### `UIController.cs` (resumo dos hooks relevantes)
+
+- `Awake()`: `BuildMainMenu(); BuildRoster(); BuildCombat();` — nada constrói Dungeon Select hoje.
+- `Start()`: `ShowScreen(Screen.MainMenu); RefreshMainMenu();` — abre direto no main menu.
+- `enum Screen { MainMenu, Roster, Combat }` — falta `DungeonSelect`.
+- `BeginDungeonRun()`: chama `run.StartRun(party);` — único call site.
+- `RefreshMainMenu()`: lê `meta.deepestFloor` (1 read site).
+- `OnRunBanked` / `OnRunWiped` callbacks → `ReturnToMainMenu()` → `ShowScreen(MainMenu)`. Vai virar `ShowScreen(DungeonSelect)`.
+- Focus button: `run.SetFocus(captured)` no tap do enemy. Vai precisar respeitar dungeon rule (hidden em Hollow, visível com Tide marker em Crypt).
+
+### `TuningConfig.cs` (existente — SO global)
+
+Campos: `heroMaxHp, heroAtk, heroDef, heroRegenPerFloor, enemyHpBase, enemyHpGrowth, enemyAtkBase, enemyAtkGrowth, enemyCountBase, enemyCountStep, goldBase, goldGrowth, floorClearTimeBase, floorClearTimePerFloor`.
+
+→ Per-dungeon override de TODOS esses (exceto hero* que ficam globais).
+
+### `Balance/balance_general.csv` (recém-criado, source-of-truth)
+
+```
+key,value,type,group,notes
+hero_max_hp,100,int,Hero,...
+enemy_hp_base,20,float,EnemyCurve,...
+enemy_count_base,2,int,EnemyCount,...
+gold_base,10,float,Loot,...
+floor_clear_time_base,3,float,Pacing,...
+```
+
+(Ainda não tem loader. A feature de Multiple Dungeons vai introduzir um CSV-loader minimalista que serve tanto pra `balance_general.csv` quanto pra `balance_dungeons.csv`.)
+
+---
+
+## 4. PLANO DE IMPLEMENTAÇÃO PROPOSTO
+
+1. **CSV → SO loader** minimalista em `Assets/Prototype/Scripts/Balance/CsvLoader.cs`. Lê `Balance/balance_general.csv` e `Balance/balance_dungeons.csv` em edit-time (via `[InitializeOnLoad]`) e popula SOs em `Assets/Prototype/Tuning/`. Roda em runtime fallback se SOs faltarem.
+2. **`DungeonDefinition.cs`** SO: 1 SO por dungeon (gerado pelo loader). Campos = colunas do CSV.
+3. **`DungeonRegistry.cs`** SO: lista de DungeonDefinitions, ordenada por sortIndex.
+4. **`RunController.StartRun(party, dungeon)`**: parameteriza curve readers pelo dungeon ativo. Mantém defaults globais como fallback.
+5. **`CombatResolver.Resolve(...)`** ganha parâmetro `DungeonRule` (struct: focusRule enum + tideIdx + misFocusMultiplier). Standard = today's behavior. NoFocus força focusIdx=-1. ForcedFocus aplica ×1.5 quando focus≠tide e Tide vivo.
+6. **`MetaState`**: novos campos persistidos como List<string> + List<{id,int}> (JsonUtility-friendly), métodos `IsUnlocked(id)`, `GetDeepest(id)`, `RecordRunEnd(id, floor, gold)`, `MarkSeenJustUnlocked(id)`, `EvaluateUnlocks()`. Save bump para v2 com migração.
+7. **Dungeon Select screen** novo no UIController (`Screen.DungeonSelect`). 3 cards horizontais. Lock card = shake. Tap unlocked = direct nav pro Roster com banner do dungeon.
+8. **Combat UI**: focus button respeita `dungeon.focusRule`. Tide enemy ring (azul) em Crypt floors. Tooltip "Mis-focus penalty active" sutil quando aplicável.
+9. **Bank/wipe** → `ReturnToDungeonSelect()` (substitui `ReturnToMainMenu`).
+
+---
+
+## 5. O QUE QUEREMOS DE VOCÊS
+
+Para cada IA, com base no SEU papel/nicho:
+
+- **Aponte** bugs, edge cases, riscos (especialmente: determinismo Tide, save migration, JsonUtility com Dictionary, race entre `EvaluateUnlocks()` e `OnRunBanked`)
+- **Critique** o plano: o que está overengineered? O que está faltando?
+- **Sugira** ordem de implementação que minimiza retrabalho
+- **Valide** que o plano não introduz regressões nos testes existentes do prototype
+- Se propuser código C#, mantenha consistente com o style atual (PascalCase props, camelCase fields, namespace `DiverDungeon.Prototype`)
+
+Critério de sucesso para o plano: pequena mudança, zero novos bugs, fácil de iterar tuning via CSV.

@@ -1,0 +1,445 @@
+TASK: pre-code review of the v1 implementation plan for the **Cast Banner + 5-Hero Ability Activation** feature in DiverDungeon (Unity 6, C#, turn-based deterministic party combat). Surface determinism risks, sync bugs, edge cases, performance concerns, and extensibility holes BEFORE Claude writes the code.
+
+A previous AI-pipeline run shipped the v1 ability framework on the deterministic resolver side (`CombatResolver.cs` already has full mana/cast wiring). The PM-Feature-Definer phase-2 spec for THIS feature is at `product/specs/character-ability-cast-banner.md`. The user has explicitly said: "Make sure it's built to accommodate more characters in the future." That is a load-bearing constraint — flag any decision that would force a code change to add hero #6.
+
+══════════════════════════════════════════════════════════════════
+PROJECT CONTEXT
+══════════════════════════════════════════════════════════════════
+
+- **Engine:** Unity 6, C# (no async/await in resolver — pure synchronous per-tick loop).
+- **Pillar 2 — battles are deterministic.** Same `(party, dungeon, focus, floor)` MUST yield byte-identical resolver output every time. The resolver uses a single seeded `System.Random(seed)` for enemy targeting. Anything new must remain a pure function of state. NO `Time.deltaTime`, NO `UnityEngine.Random`, NO non-deterministic dictionary iteration, NO floating-point order-of-operations divergence.
+- **Combat model:** Strict turn-cycling. Hero0 attacks → ... → HeroN-1 attacks → Enemy0 attacks → ... → EnemyM-1 attacks → end-of-round status tick → repeat. Each "atomic action" = one hero attack OR one enemy attack OR end-of-round step.
+- **Two combat code paths exist today:**
+  1. `CombatResolver.Resolve(...)` — pure C#, deterministic, used by `RunController.PreviewNextFloor()` to project floor outcomes. Has full mana/cast/status wiring. Returns a `CombatResult` with a `List<TickEvent>` log including `TickEventKind.Cast` events.
+  2. `UIController.RunLiveCombat(...)` — animation-driven coroutine that re-implements the same combat for the player to watch. **Currently does mana gain locally but does NOT call ResolvePendingCasts and does NOT apply cast effects.** This is the main thing this feature must fix.
+- **CSV-driven tuning is mandatory.** Hardcoded constants for tunable values are not acceptable.
+- **Roster:** seeded in code today (`MetaState.SeedDefaultRoster`). 5 heroes wired: Knight (id=1), Rogue (id=2), Mage (id=3), Cleric (id=4), Ranger (id=5). 9 more hero prefabs exist in `Assets/CharacterPrefabs/` but are not yet registered. **Design decision under review:** how to wire ability/mana profiles for the 5 wired heroes in a way that scales to all 14 (and beyond) without a code change.
+
+══════════════════════════════════════════════════════════════════
+WHAT THE PM SPEC LOCKS
+══════════════════════════════════════════════════════════════════
+
+(Full spec at `product/specs/character-ability-cast-banner.md`.)
+
+1. **5 abilities for the 5 wired heroes:**
+   - Knight → `bulwark` (Self Shield, CasterMaxHp×0.2, 10 ticks)
+   - Rogue → `hemorrhage` (FocusedEnemy DoT, CasterAtk×0.35/tick, 8 ticks)
+   - Mage → `arcane_bolt` (FirstAliveEnemy FlatDamage, CasterAtk×2.2)
+   - Cleric → `mending_light` (LowestHpAliveAlly FlatHeal, CasterAtk×0.4)
+   - Ranger → `mark_for_death` (FocusedEnemy DEF debuff, CasterAtk×0.4, 8 ticks)
+2. **Per-hero mana profile (maxMana/startingMana/manaPerAttack/manaPerHit/manaPerHitCap):**
+   - Knight: 40/0/5/10/15
+   - Rogue: 60/0/12/8/15
+   - Mage: 110/0/12/6/12
+   - Cleric: 80/20/10/20/25
+   - Ranger: 70/10/12/8/15
+3. **CSV diff for `Balance/balance_abilities.csv`** — add 3 rows: `hemorrhage`, `mark_for_death`, `arcane_bolt`. Existing rows (`mending_light`, `cinderburst`, `bulwark`) stay.
+4. **Cast banner UI (full-screen-ish, center, ~1200×400):**
+   - Triggered when any of the 5 heroes' ability fires in live combat.
+   - Shows the casting hero's portrait (`MetaState.GetPortrait(heroId)`) + ability display name from `AbilityRegistry.Get(abilityId).displayName`.
+   - Animates: scale 1.4 → 1.0, alpha 0 → 1 over 0.15s → hold 0.7s → alpha 1 → 0 over 0.15s → hidden. Total = 1.0s.
+   - **Real-time pause** (`WaitForSecondsRealtime(1.0f)`), NOT scaled by SpeedMultiplier.
+   - At 2× speed, banner still pauses for 1.0s (legibility decision — locked).
+5. **Multi-cast queue:** if multiple heroes hit max mana in the same atomic-action boundary, banners play sequentially in party-slot order (matches `ResolvePendingCasts`). 1.0s × N. No overlap.
+6. **Determinism invariant:** `PreviewNextFloor` MUST stay byte-identical to a pauseless run. The banner is presentation-only.
+7. **Failure modes:** missing portrait → fallback to colored block. Unknown abilityId → banner still plays for full 1.0s with `displayName="???"`. Combat ends mid-banner → banner finishes, then end-of-fight UI takes over (do NOT cut the banner short).
+
+══════════════════════════════════════════════════════════════════
+KEY DESIGN DECISIONS UNDER REVIEW (flag tradeoffs / risks)
+══════════════════════════════════════════════════════════════════
+
+**D1. RunLiveCombat: replicate cast logic vs consume resolver log.**
+Two options:
+- (A) Add inline `ResolvePendingCasts`-equivalent in `RunLiveCombat`, mirroring the resolver's logic. Pro: keeps the existing animation-driven structure. Con: now there are TWO copies of the cast logic; drift is inevitable.
+- (B) Refactor `RunLiveCombat` to consume the deterministic resolver's `TickEvent` log: call `Resolve(...)` once at floor start, then animate the log entry-by-entry. Pro: single source of truth. Con: bigger change; must reconcile animation pacing with log-driven playback.
+
+**The current implementation is closer to (A).** Mana gain is already inlined locally (UIController.cs lines 1654–1660 and 1738–1750). What's missing is the cast-resolution call.
+
+**D2. Banner trigger: derived from local state vs resolver event.**
+- (A) After every atomic action in `RunLiveCombat`, scan heroes for `mana >= maxMana` and trigger the banner inline. Apply the cast effect inline (mirroring `CombatResolver.CastAbility`).
+- (B) Run the deterministic resolver in advance for this floor; iterate its `TickEvent` log; when a `TickEventKind.Cast` event is reached, pause animation and play the banner.
+
+**D3. Hero ability data: where does it live?**
+The user explicitly wants future-proof. Options:
+- (A) Set fields directly in `MetaState.SeedDefaultRoster` per hero (e.g., add an extra arg to `BuildHero` or assign fields after construction). Adding a new hero = code edit.
+- (B) New CSV `Balance/balance_heroes.csv` with columns `heroId,maxMana,startingMana,manaPerAttack,manaPerHit,manaPerHitCap,manaLockTicks,abilityId`. `MetaState` loads this after seeding the roster and overlays the values. Adding a new hero = CSV row only.
+- (C) Add the ability columns to a single `balance_heroes.csv` that ALSO carries the base stats (heroName/baseHp/baseAtk/etc.). Replace the in-code `SeedDefaultRoster` entirely.
+**Spec recommends (B) for v1** (smallest change that is still data-driven), with (C) as a future migration. **Open question: is (B) the right ceiling, or is (C) worth doing now since we're touching the file?**
+
+**D4. Banner placement in scene hierarchy.**
+The existing combat HUD lives on `combatPanel` (single Canvas, sortingOrder 0). Spec recommends adding `CastBannerRoot` as a sibling of `fightBanner` so default sibling order puts it on top. Risk: future modal dialogs may need their own canvas; banner may need its own canvas to avoid sibling-order conflicts.
+
+**D5. Cast effect timing relative to banner.**
+- (A) Apply the cast effect (HP delta, status add, mana reset) at banner-start. Pro: target HP bar updates while banner is up — visual coherence. Con: if combat is "supposed to end" on the cast, the end-of-fight check might fire while the banner is still up.
+- (B) Apply at banner-end. Pro: banner is purely a "pre-show" curtain. Con: feels disconnected — the player watches the banner finish, then the heal lands.
+**Spec recommends (A) (apply at banner-start).** The end-of-fight check is gated until the banner queue drains; the existing `RunLiveCombat` settle path handles this naturally.
+
+**D6. Multi-cast queue blocking the resolver state.**
+During banner queue drain (1s × N), the live combat is paused but the deterministic resolver state is locked at "post-N-casts." The next atomic action resumes from there. Concern: if the player force-closes the app mid-banner, no save state captures "we were 1 banner into a 3-banner queue." Spec accepts this — banner queue is in-memory transient.
+
+══════════════════════════════════════════════════════════════════
+MANA → CAST FLOW (locked by parent spec, already implemented in CombatResolver.cs)
+══════════════════════════════════════════════════════════════════
+
+```
+on_floor_start:
+  for each alive hero h: h.mana = h.startingMana; h.statuses.Clear()
+  for each enemy e: e.statuses.Clear()
+  ResolvePendingCasts()              // honors startingMana >= maxMana
+
+loop while AnyAliveHero AND AnyAliveEnemy:
+  for hi in 0..heroCount-1:
+    if hero[hi].hp <= 0: continue
+    PerformHeroAttack(hi)             // existing path
+    hero[hi].mana += manaPerAttack[hi] (clamped)
+    ResolvePendingCasts()             // <-- NEW
+    if !AnyAliveEnemy: break
+
+  if !AnyAliveEnemy: break
+
+  for ei in 0..enemyCount-1:
+    if enemy[ei].hp <= 0: continue
+    rawDmg = ComputePreMitigationDamage(...)
+    ApplyEnemyAttack(...)             // updates target.hp
+    if hero[target].hp > 0:
+      hero[target].mana += min(rawDmg + manaPerHit, manaPerHitCap)
+    ResolvePendingCasts()             // <-- NEW
+    if !AnyAliveHero: break
+
+  TickAndPruneStatuses()              // DoT + decrement + prune
+  DecrementManaLocks()
+  ResolvePendingCasts()
+
+ResolvePendingCasts:
+  for hi in 0..heroCount-1 (slot order):
+    if hero[hi].hp <= 0: continue
+    if IsInterrupted(hi): continue
+    if hero[hi].manaLockTicksRemaining > 0: continue
+    if hero[hi].maxMana <= 0: continue
+    if hero[hi].mana < hero[hi].maxMana: continue
+    CastAbility(hi)                   // applies effect via target-type resolution
+    hero[hi].mana = 0
+    if !AnyAliveEnemy: return
+    if !AnyAliveHero: return
+```
+
+══════════════════════════════════════════════════════════════════
+EXISTING CODE — RELEVANT EXTRACTS
+══════════════════════════════════════════════════════════════════
+
+### Assets/Prototype/Scripts/CombatResolver.cs (full ResolvePendingCasts + CastAbility — 705 lines total)
+
+```csharp
+public static class CombatResolver
+{
+    public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
+        int focusEnemyIndex, int seed, DungeonRule rule)
+    {
+        // ... seeds rng, builds parallel status lists, calls ResolvePendingCasts at floor start ...
+        // ... main loop applies hero attacks → mana gain → ResolvePendingCasts ...
+        // ... enemy attacks → mana gain → ResolvePendingCasts ...
+        // ... end-of-round TickAndPruneStatuses + DecrementManaLocks + ResolvePendingCasts ...
+    }
+
+    static void ResolvePendingCasts(List<HeroStats> heroList, ..., List<TickEvent> log)
+    {
+        for (int hi = 0; hi < heroList.Count; hi++)
+        {
+            if (heroList[hi].hp <= 0) continue;
+            if (IsInterrupted(hi)) continue;
+            if (heroList[hi].manaLockTicksRemaining > 0) continue;
+            if (heroList[hi].maxMana <= 0) continue;
+            if (heroList[hi].mana < heroList[hi].maxMana) continue;
+
+            CastAbility(hi, ...);
+            var h = heroList[hi];
+            h.mana = 0;
+            if (h.manaLockTicks > 0) h.manaLockTicksRemaining = h.manaLockTicks;
+            heroList[hi] = h;
+
+            if (!AnyAliveEnemy(enemyList)) return;
+            if (!AnyAliveHero(heroList)) return;
+        }
+    }
+
+    static void CastAbility(int hi, ..., List<TickEvent> log)
+    {
+        var def = AbilityRegistry.Get(heroList[hi].abilityId);
+        int magnitude = ComputeMagnitude(heroList[hi], def);
+
+        tick++;
+        log.Add(new TickEvent {
+            tick = tick,
+            kind = TickEventKind.Cast,
+            actor = $"Hero{hi}",
+            target = def.targetType.ToString(),
+            damage = magnitude,
+            actorHpAfter = heroList[hi].hp,
+            targetHpAfter = 0
+        });
+
+        if (def.effectType == AbilityEffectType.None || magnitude == 0) return;
+
+        switch (def.targetType) {
+            case AbilityTargetType.SelfOnly:        ApplyEffectToHero(hi, hi, def, magnitude, ...); break;
+            case AbilityTargetType.FocusedEnemy:    /* fallback to FirstAliveEnemy */ break;
+            case AbilityTargetType.FirstAliveEnemy: /* ... */ break;
+            case AbilityTargetType.FirstAliveAlly:  /* fallback to SelfOnly */ break;
+            case AbilityTargetType.LowestHpAliveAlly: /* fallback to SelfOnly */ break;
+            case AbilityTargetType.AllEnemies:      /* iterate enemies */ break;
+            case AbilityTargetType.AllAllies:       /* iterate allies */ break;
+        }
+    }
+
+    static int ComputeMagnitude(HeroStats caster, AbilityDef def)
+    {
+        int basis = def.scale == AbilityScale.CasterMaxHp ? caster.maxHp : caster.atk;
+        long m = (long)basis * def.magnitudeCoeffMilli / 1000L;     // fixed-point milli to avoid float
+        if (m < 0) m = 0;
+        if (m > int.MaxValue) m = int.MaxValue;
+        return (int)m;
+    }
+}
+```
+
+### Assets/Prototype/Scripts/HeroData.cs (already has ability fields, lines 26-32)
+
+```csharp
+public int maxMana = 0;            // 0 = no ability
+public int startingMana = 0;
+public int manaPerAttack = 0;
+public int manaPerHit = 0;
+public int manaPerHitCap = 0;
+public int manaLockTicks = 0;
+public string abilityId = "";
+
+public HeroStats ToStats() {
+    int safeMaxMana = Math.Max(0, maxMana);
+    int safeStartingMana = Mathf.Clamp(startingMana, 0, safeMaxMana);
+    // ... validation warnings ...
+    return new HeroStats { hp=MaxHp, maxHp=MaxHp, atk=Atk, def=Def, attackType=attackType,
+        mana=safeStartingMana, maxMana=safeMaxMana, startingMana=safeStartingMana,
+        manaPerAttack=Math.Max(0, manaPerAttack), manaPerHit=Math.Max(0, manaPerHit),
+        manaPerHitCap=Math.Max(0, manaPerHitCap), manaLockTicks=Math.Max(0, manaLockTicks),
+        manaLockTicksRemaining=0, abilityId=abilityId ?? "" };
+}
+```
+
+### Assets/Prototype/Scripts/MetaState.cs — SeedDefaultRoster (lines 59-78)
+
+```csharp
+void SeedDefaultRoster()
+{
+    roster.Add(BuildHero(1, "Knight", new Color(0.25f, 0.55f, 0.95f), 50, 8, 22, 3, 2, AttackType.Melee));
+    roster.Add(BuildHero(2, "Rogue",  new Color(0.95f, 0.70f, 0.25f), 32, 5, 30, 4, 1, AttackType.Melee));
+    roster.Add(BuildHero(3, "Mage",   new Color(0.60f, 0.30f, 0.85f), 28, 4, 28, 5, 1, AttackType.Ranged));
+    roster.Add(BuildHero(4, "Cleric", new Color(0.95f, 0.95f, 0.55f), 40, 6, 14, 2, 3, AttackType.Melee));
+    roster.Add(BuildHero(5, "Ranger", new Color(0.40f, 0.85f, 0.40f), 36, 5, 20, 3, 2, AttackType.Ranged));
+    partyIds.Add(1);
+}
+
+static HeroData BuildHero(int id, string name, Color c, int hp, int hpPerLvl, int atk, int atkPerLvl, int def, AttackType attackType)
+{
+    return new HeroData {
+        id = id, heroName = name, color = c, level = 1,
+        baseHp = hp, hpPerLevel = hpPerLvl,
+        baseAtk = atk, atkPerLevel = atkPerLvl,
+        baseDef = def, defPerLevel = 0,
+        attackType = attackType
+    };
+}
+```
+
+### Assets/Prototype/Scripts/UIController.cs — RunLiveCombat (lines 1607-1808, 200 lines, key extracts)
+
+```csharp
+IEnumerator RunLiveCombat(List<EnemyStats> enemyTemplate)
+{
+    isPlayingFloor = true;
+    int floor = run.CurrentFloor;
+    var heroes = new List<HeroStats>(run.Party);
+    var enemies = new List<EnemyStats>(enemyTemplate);
+    var rng = new System.Random(floor * 1000 + heroes.Count);
+
+    // Floor-start mana reset (mirrors resolver)
+    for (int i = 0; i < heroes.Count; i++) {
+        var h = heroes[i]; h.mana = h.startingMana; h.manaLockTicksRemaining = 0; heroes[i] = h;
+    }
+
+    // ... HP/mana bar init ...
+
+    const float basePerTick = 0.845f;
+    while (AnyAliveHero(heroes) && AnyAliveEnemy(enemies))
+    {
+        // Hero side
+        for (int hi = 0; hi < heroes.Count; hi++) {
+            if (heroes[hi].hp <= 0) continue;
+            int targetIdx = CombatResolver.PickHeroTarget(run.FocusEnemyIndex, enemies, rng);
+            int dmg = Math.Max(1, heroes[hi].atk - enemies[targetIdx].def);
+            // ... apply damage to enemy ...
+
+            // Mana on attack — already wired (lines 1654-1660)
+            if (heroes[hi].maxMana > 0 && heroes[hi].manaPerAttack > 0) {
+                var hAtk = heroes[hi];
+                hAtk.mana = Math.Min(hAtk.maxMana, hAtk.mana + hAtk.manaPerAttack);
+                heroes[hi] = hAtk;
+                UpdateHeroManaBar(hi, heroes[hi].mana, heroes[hi].maxMana);
+            }
+
+            // ... animation: hero lunges, attack VFX, enemy HP label updates ...
+            yield return PlayAttack(...);
+            // <-- MISSING: ResolvePendingCasts call HERE
+        }
+
+        // Enemy side
+        for (int ei = 0; ei < enemies.Count; ei++) {
+            if (enemies[ei].hp <= 0) continue;
+            int targetIdx = ...;       // random alive hero
+            int rawDmg = Math.Max(1, enemies[ei].atk - heroes[targetIdx].def);
+            int dmg = Math.Max(1, RoundToInt(rawDmg * dmgMult));
+            var h = heroes[targetIdx]; h.hp = Math.Max(0, h.hp - dmg); heroes[targetIdx] = h;
+
+            // Mana on hit — already wired (lines 1738-1750)
+            if (heroes[targetIdx].maxMana > 0) {
+                var hHit = heroes[targetIdx];
+                int manaGain = hHit.manaPerHit + rawDmg;
+                if (hHit.manaPerHitCap > 0 && manaGain > hHit.manaPerHitCap) manaGain = hHit.manaPerHitCap;
+                if (manaGain > 0) {
+                    hHit.mana = Math.Min(hHit.maxMana, hHit.mana + manaGain);
+                    heroes[targetIdx] = hHit;
+                }
+            }
+
+            // ... animation: enemy attacks, hero HP/mana bar update ...
+            yield return PlayAttack(...);
+            // <-- MISSING: ResolvePendingCasts call HERE
+        }
+
+        // <-- MISSING: TickAndPruneStatuses + DecrementManaLocks + ResolvePendingCasts at end of round
+    }
+
+    // Settle outcome
+    var hpAfter = new int[heroes.Count];
+    for (int i = 0; i < heroes.Count; i++) hpAfter[i] = heroes[i].hp;
+    var outcome = AnyAliveHero(heroes) ? FloorOutcome.Cleared : FloorOutcome.Wiped;
+    run.ApplyFloorOutcome(hpAfter, outcome);
+    // ... post-fight UI updates ...
+    isPlayingFloor = false;
+}
+```
+
+### Assets/Prototype/Scripts/HeroClassRegistry.cs (full)
+
+```csharp
+[CreateAssetMenu(fileName = "HeroClassRegistry", menuName = "DiverDungeon/Hero Class Registry")]
+public class HeroClassRegistry : ScriptableObject
+{
+    [Serializable] public class Entry { public int id; public string heroName; public GameObject prefab; public Sprite portrait; }
+    public Entry[] entries;
+    public Entry GetById(int id) { /* linear scan */ }
+    public GameObject GetPrefab(int id) => GetById(id)?.prefab;
+    public Sprite GetPortrait(int id) => GetById(id)?.portrait;
+}
+```
+
+Registry asset has 5 entries (id 1-5) with prefabs AND portraits assigned.
+
+### Assets/Prototype/Scripts/RunController.cs — PreviewNextFloor (line 248)
+
+```csharp
+public FloorPreview PreviewNextFloor() {
+    // ... clones state, computes seed = floor * 1000 + Party.Count ...
+    var sim = CombatResolver.Resolve(Party, enemies, previewFocus, seed, previewRule);
+    // ... derives projectedTotalDamageTaken, projectedHeroesAlive ...
+}
+```
+
+### Balance/balance_abilities.csv (current)
+
+```csv
+abilityId,displayName,targetType,effectType,scale,magnitudeCoeffMilli,durationTicks,description
+mending_light,Mending Light,LowestHpAliveAlly,FlatHeal,CasterAtk,400,0,Restore HP to the lowest-HP ally (or self if alone).
+cinderburst,Cinderburst,AllEnemies,FlatDamage,CasterAtk,1500,0,Deal fire damage to every alive enemy.
+bulwark,Bulwark,SelfOnly,Shield,CasterMaxHp,200,10,Gain a shield equal to 20% of max HP for 10 ticks.
+```
+
+### Existing fight banner (UIController.cs, the structural template — lines 1409-onwards)
+
+```csharp
+// FightBannerInTime/FightBannerHold/FightBannerOut constants exist (lines 59-61).
+IEnumerator ShowFightBanner() {
+    fightBanner.gameObject.SetActive(true);
+    // scale-and-fade animation using unscaledDeltaTime
+    yield return new WaitForSecondsRealtime(FightBannerHold);
+    // fade out
+    fightBanner.gameObject.SetActive(false);
+}
+```
+
+══════════════════════════════════════════════════════════════════
+WHAT TO REVIEW
+══════════════════════════════════════════════════════════════════
+
+For each section below, give specific advice. Cite line numbers / file names. Don't be vague.
+
+**§1. Determinism risks**
+- After we add cast resolution to `RunLiveCombat`, is there ANY way the live UI's combat state can diverge from `PreviewNextFloor`'s simulated state for the same `(party, dungeon, focus, floor)`?
+- Specifically: floating-point ordering, dictionary-iteration order, reading mutable struct fields in the wrong order, captured-variable closures in coroutines, `Time.time` vs `Time.unscaledTime` reads in the cast path.
+- The resolver uses `System.Random(seed)` for enemy targeting. The live UI also uses `System.Random(floor*1000 + heroes.Count)` for the same. Will `ResolvePendingCasts` ever consume the rng? (Spoiler: no — the resolver's cast logic is pure-state, no rng.) Confirm.
+- The resolver's `TickEvent` log assigns `tick++` for cast events. The live UI does not currently track ticks. Is that OK? (Yes — ticks are presentation-only for the live path.)
+
+**§2. RunLiveCombat structural change**
+- Should we go with option D1.A (inline cast logic) or D1.B (consume resolver log)? Pros and cons specific to DiverDungeon's situation.
+- If A: where exactly do the `ResolvePendingCasts` calls go inside the existing for-loops? (After hero attack damage — clear. After enemy attack damage — clear. End-of-round status tick — currently MISSING from `RunLiveCombat`. Flag this — the live UI is also missing DoT/Shield/StatBuff tick processing entirely.)
+- If we add status-tick processing to `RunLiveCombat`, that's a much bigger change. Worth flagging that the user only asked for casts, but the resolver does end-of-round status processing — if the live UI doesn't, the bars will be wrong on screen even though the resolver is right.
+
+**§3. Cast banner UI**
+- The spec recommends the banner be a coroutine `RunLiveCombat` yields on. Is `WaitForSecondsRealtime` the right primitive (vs `WaitForSeconds` which scales with `Time.timeScale`)? — Yes, `WaitForSecondsRealtime` is correct for "1s at any game speed."
+- What happens if the player taps the focus button or the descend button while the banner is up? Should we disable input during the banner? (Spec implies `raycastTarget=false` on banner children, but the underlying combatPanel buttons are still active.)
+- If `ShowCastBanner` is `IEnumerator ShowCastBanner(int casterIdx, string abilityId)`, what's the cleanest way to pass the portrait sprite (look up via `MetaState.Instance.GetPortrait(run.PartyData[casterIdx].id)`)?
+
+**§4. Hero ability data wiring (D3 — extensibility)**
+- User explicitly said "built to accommodate more characters in the future."
+- Option (B): new `Balance/balance_heroes.csv` with `heroId,maxMana,startingMana,manaPerAttack,manaPerHit,manaPerHitCap,manaLockTicks,abilityId`. Loaded by `MetaState.SeedDefaultRoster` (after the existing in-code seed runs, overlay CSV values).
+- Option (C): same CSV but include base stats too, replacing `BuildHero` entirely.
+- Recommend the right option for v1. Flag any failure modes (missing CSV, malformed row, heroId in CSV not in registry, etc.).
+- Also: should the CSV use `0` as sentinel for "no ability" (matches today's convention) or an explicit empty-string `abilityId`?
+
+**§5. Edge cases**
+- (a) Hero is at full mana at floor start (Cleric `startingMana=20` is below `maxMana=80`, but a future hero might have `startingMana >= maxMana`). The resolver's `on_floor_start` calls `ResolvePendingCasts` once. Does `RunLiveCombat`? — Currently no; needs to.
+- (b) Cast effect kills the casting hero (`SelfOnly` `FlatDamage` — not in v1 abilities, but the resolver supports it). Spec says no death-cast. Confirm cast-fired hero with hp <= 0 after a self-damage cast is handled correctly.
+- (c) AoE cast clears all enemies. Combat ends. Does the banner finish before "WIPED!" / "CLEARED!" text shows? Spec says yes — banner queue must drain first.
+- (d) Multiple casts queued from the same atomic action (Knight Bulwark + Cleric Mending Light from the same enemy salvo). Banners play 1.0s + 1.0s = 2.0s. Confirm this is acceptable UX (or flag if 0.5s + 0.5s with "stacking" might be needed in playtest).
+- (e) Speed multiplier 4× — combat ticks fly, but each banner is 1.0s real time. Concerning ratio? Risk that the banner becomes the dominant time sink at high speed. Discuss.
+- (f) Missing portrait (e.g., a freshly added hero whose portrait field is null). Fallback rendering — what does it look like?
+- (g) `arcane_bolt` is missing from the existing CSV. The spec calls this out explicitly. Anything else missing?
+- (h) `ToStats()` already validates `startingMana <= maxMana` and warns on misconfigured rows. If the CSV has `startingMana=100` and `maxMana=80`, what happens? — Clamped silently to 80. Should we hard-fail instead?
+
+**§6. Performance**
+- `PreviewNextFloor` runs the resolver. With cast logic, the resolver does more work per floor. Can it stay under 1ms at F50 with 20 enemies?
+- `RunLiveCombat` already mutates a `List<HeroStats>` per atomic action; adding cast resolution will allocate at most (a) one `AbilityDef` lookup (cached in `AbilityRegistry`) per cast, (b) a few list mutations for status effects.
+- The banner UI builds at startup (one-time cost). Triggering banner ≠ instantiating UI; just `gameObject.SetActive(true)` + image swap + text set.
+
+**§7. Testing & verification plan**
+- Acceptance criteria from spec (14 items). Translate the load-bearing ones into specific test inputs/expected outputs.
+- Determinism check: run a fixed seed party + dungeon + focus + floor, capture `CombatResult.heroHpAfter`, compare to a second run with banner UI active. Must be byte-identical.
+- Manual playtest: descend to F1 with party Knight+Cleric+Mage+Ranger; expect to see banners fire as mana fills.
+
+**§8. Open questions / unknowns**
+- Anything in the spec that contradicts existing code?
+- Anything that would break if we add a 6th hero tomorrow?
+- Anything load-bearing the spec missed?
+
+══════════════════════════════════════════════════════════════════
+DELIVERABLE
+══════════════════════════════════════════════════════════════════
+
+For each model: produce a tight critique organized by §1–§8 above. Specific, file/line-cited, action-oriented. Under 1500 words per model.
+
+**Especially flag:**
+- D1 (inline vs log-driven): give a clear vote.
+- D3 (data shape — CSV vs in-code): give a clear vote tied to the user's "future-proof" constraint.
+- §5(b) Self-damage / KO edge case — Architect-side correctness.
+- §2 status tick missing from RunLiveCombat — is this in scope of THIS feature, or a separate prerequisite?
+
+End your critique with a one-line "BUILD or BLOCK" verdict: should Claude proceed to implementation now, or are there blockers that need the user's input first?

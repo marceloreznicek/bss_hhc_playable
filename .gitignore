@@ -4,6 +4,7 @@
 
 # Build output / generated screenshots (regenerate via qa scripts)
 HeroSwarm/qa/screenshots/
+HeroMerge/qa/screenshots/
 
 # Large binary archives (duplicates of unpacked folder contents)
 HHC_Playable.rar
@@ -17,3 +18,7 @@ desktop.ini
 
 # Local Claude settings
 .claude/settings.local.json
+
+# AI pipeline (OpenRouter key + run outputs — never commit)
+.openrouter.key
+tools/ai-pipeline/runs/

@@ -1,0 +1,202 @@
+PÓS-CODE: Review do diff que corrige o bug do placar final do World Boss (HeroHeroClicker, Unity 6, C#).
+
+## CONTEXTO DO BUG
+
+Tela "TOP HERÓIS ÚLTIMO BOSS" do GlobalBossManager exibia:
+- 1º Myth (SarcasticKhush): 161.55M dano
+- 2º Ryota (sxRyota):       162.12M dano  ← MAIOR que o 1º!
+- 3º Medallian (MedallianX):158.55M dano
+
+O nó "Tops" no Firebase (https://hero-hero-clicker-world-boss-room.firebaseio.com/Tops.json) é populado por servidor externo (Unity headless em Oracle Cloud, código fora deste repo) na ordem dos índices [1], [2], [3] derivada do nó "Positions". Essas Positions estão dessincronizadas com o dano real (verificado lendo Players.json e Positions.json — pos=1 tem 163M, pos=2 tem 167M, pos=3 tem 179M, pos=4 tem 180M).
+
+## ARQUIVO MODIFICADO
+
+`Assets/Scripts/Behaviour/GlobalBossManager.cs` (único arquivo, ~2960 linhas)
+
+## DIFF REAL (git diff)
+
+```diff
+diff --git a/Assets/Scripts/Behaviour/GlobalBossManager.cs b/Assets/Scripts/Behaviour/GlobalBossManager.cs
+index 26ba9a7d1..1d9433bec 100644
+--- a/Assets/Scripts/Behaviour/GlobalBossManager.cs
++++ b/Assets/Scripts/Behaviour/GlobalBossManager.cs
+@@ -684,6 +684,12 @@ public class GlobalBossManager : MonoBehaviour
+             // Calcula top 3 valores (pela ordem das chaves como no Firebase)
+             var topValues = ExtractTopValues(root, 3);
+
++            // Defesa contra ordering inconsistente do servidor: re-ordena por dano DESC.
++            // O nó "Tops" no Firebase é populado por servidor externo a partir de "Positions",
++            // que pode estar dessincronizado com o dano real. Reordenamos aqui pelo
++            // dealtDamage embutido em parts[2] de cada entrada "uid;nome;dealtDamage".
++            topValues = SortTopValuesByDamageDesc(topValues);
++
+             for (int i = 0; i < 3; i++)
+             {
+                 //Debug.LogError(i + " = topValues[i]: " + topValues[i]);
+@@ -2778,6 +2784,55 @@ public class GlobalBossManager : MonoBehaviour
+         return result;
+     }
+
++    // Reordena os top values por dealtDamage DESC, com tie-breaker estável (índice original).
++    // Entradas inválidas ("null", vazias, parts < 3, dano negativo ou não numérico) são empurradas para o fim.
++    // Loga um Warning quando a ordem do servidor diverge do dano — indica bug no servidor.
++    private static List<string> SortTopValuesByDamageDesc(List<string> topValues)
++    {
++        if (topValues == null || topValues.Count == 0)
++            return new List<string>();
++
++        var ordered = topValues
++            .Select((value, index) => new
++            {
++                Value = value,
++                Damage = ParseDamageFromTop(value),
++                OriginalIndex = index
++            })
++            .OrderByDescending(x => x.Damage)
++            .ThenBy(x => x.OriginalIndex)
++            .Select(x => x.Value)
++            .ToList();
++
++        for (int i = 0; i < ordered.Count; i++)
++        {
++            if (ordered[i] != topValues[i])
++            {
++                Debug.LogWarning("[WorldBoss] Tops do servidor com ordem inconsistente. Original: ["
++                    + string.Join(" | ", topValues) + "] -> Reordenado por dano DESC: ["
++                    + string.Join(" | ", ordered) + "]");
++                break;
++            }
++        }
++
++        return ordered;
++    }
++
++    private static System.Numerics.BigInteger ParseDamageFromTop(string topLine)
++    {
++        if (string.IsNullOrWhiteSpace(topLine) || topLine == "null" || topLine == "0")
++            return System.Numerics.BigInteger.MinusOne;
++
++        var parts = SafeSplit(topLine, ';');
++        if (parts.Length < 3)
++            return System.Numerics.BigInteger.MinusOne;
++
++        if (System.Numerics.BigInteger.TryParse(parts[2], out var damage) && damage >= 0)
++            return damage;
++
++        return System.Numerics.BigInteger.MinusOne;
++    }
++
+     private static void SetImgSpriteEnable(Transform root, string path, string spritePath, bool enable)
+     {
+         var img = GetImg(root, path);
+```
+
+## CÓDIGO RELEVANTE (CONTEXTO PRÉ-EXISTENTE não modificado)
+
+### `OnTopsUpdate` (chama o helper novo):
+```csharp
+void OnTopsUpdate(object sender, ValueChangedEventArgs args)
+{
+    try
+    {
+        var root = AsDict(args?.Snapshot?.Value);
+        var topValues = ExtractTopValues(root, 3);
+        topValues = SortTopValuesByDamageDesc(topValues); // ← NOVO
+        for (int i = 0; i < 3; i++)
+        {
+            try
+            {
+                var v = topValues[i];
+                if (string.IsNullOrEmpty(v) || v == "0")
+                    BattleBehaviour.instance.StartCoroutine(BuildTopPlayer(i, "null"));
+                else
+                    BattleBehaviour.instance.StartCoroutine(BuildTopPlayer(i, v));
+            }
+            catch
+            {
+                BattleBehaviour.instance.StartCoroutine(BuildTopPlayer(i, "null"));
+            }
+        }
+    }
+    catch (Exception e) { Debug.LogError("Erro ao atualizar tops: " + e); ... }
+    finally { var s = args?.Snapshot; if (s != null) s.SafeDispose(); }
+}
+```
+
+### `ExtractTopValues` (existente, retorna sempre `count` itens, preenchendo com "null"):
+```csharp
+private static List<string> ExtractTopValues(Dictionary<string, object> dict, int count)
+{
+    var result = new List<string>(count);
+    if (dict == null || dict.Count == 0)
+        return Enumerable.Repeat("null", count).ToList();
+    var ordered = dict.Select(...).OrderBy(...).ThenBy(...);
+    foreach (var e in ordered)
+    {
+        if (e.IsNum && e.Num == 0) continue; // pula índice 0 (placeholder)
+        if (e.Value == null) continue;
+        var s = e.Value.ToString();
+        if (string.IsNullOrEmpty(s) || s == "0") continue;
+        result.Add(s);
+        if (result.Count >= count) break;
+    }
+    while (result.Count < count) result.Add("null");
+    return result;
+}
+```
+
+### `SafeSplit` (existente):
+```csharp
+private static string[] SafeSplit(string s, char sep)
+    => string.IsNullOrEmpty(s) ? Array.Empty<string>() : s.Split(sep);
+```
+
+### `BuildTopPlayer` (existente, lê parts[2] como dealtDamage):
+```csharp
+var parts = SafeSplit(userName, ';');
+string dealtDamage = (parts.Length >= 3) ? parts[2] : "0";
+// ... exibe BigInteger.Parse(dealtDamage)
+```
+
+## REVIEW PEDIDO
+
+Por favor analisem o DIFF acima focando em:
+
+### Para GPT-5.4 Mini (bugs/edge cases/perf/regressões):
+1. Há bugs lógicos no `SortTopValuesByDamageDesc` ou `ParseDamageFromTop`?
+2. Edge case: `topValues` sempre tem 3 itens (preenchido com "null"). O sort está OK com isso?
+3. Performance: aceitável (apenas 3 parses)? LINQ chaining tem GC pressure preocupante?
+4. Regressão: o método é privado e só é chamado em 1 ponto novo. Risco baixo, certo?
+5. O log de divergência usa `string.Join` de toda a lista. Em produção, esse log roda em todo update do nó "Tops" (1x por boss kill). Aceitável?
+
+### Para GPT-5.4 (reasoning sobre o diff, bugs lógicos sutis):
+1. Alguma sutileza com `BigInteger.MinusOne` como sentinela? (Edge: dano legítimo pode ser 0 — `ExtractTopValues` filtra "0" antes, então só chega aqui valores não-zero positivos — confere?)
+2. Tie-breaker `ThenBy(OriginalIndex)`: garante estabilidade entre updates consecutivos?
+3. Há cenário em que reordenar pode CORROMPER algum estado externo (algum outro listener/UI que assume índice = posição original)?
+4. Sugere alguma mudança no helper para ficar mais defensivo/limpo?
+
+### Para Gemini 3.1 Pro (crash/ANR/performance profunda):
+1. O `OnTopsUpdate` roda em qual thread? (Vem do Firebase callback via SafeDispose visível.) `Debug.LogWarning` na thread Firebase pode causar problema no Unity?
+2. Há risco de NRE (NullReferenceException) com a lógica nova? Especificamente: `topValues` pode ser null vindo de `ExtractTopValues`? (Não, pois a função sempre retorna lista não nula.)
+3. Performance no path crítico — `Select(...).OrderByDescending(...).ThenBy(...).Select(...).ToList()` cria múltiplas alocações intermediárias. Em Mobile (IL2CPP arm64) isso é problema? (Roda 1x por boss kill, ~6h frequência, então provavelmente irrelevante.)
+4. Risco de ANR? (Sync work, ~3 BigInteger.Parse + LINQ chain — deve ser <1ms.)
+5. Há alguma armadilha conhecida do IL2CPP com `.OrderByDescending` + anonymous types?
+
+### Para Grok 4.20 (cross-file, regressões):
+1. Há outros listeners do nó "Tops" no projeto? (Já verificado: apenas `topsUpdateRef` em `GlobalBossManager.cs`.)
+2. Há outros usuários do método `ExtractTopValues`? (Já verificado: apenas linha 685, dentro do mesmo `OnTopsUpdate`.)
+3. Há código em `BattleBehaviour.cs` ou `MainBehaviour.cs` que depende da ordem original do nó "Tops"?
+4. As recompensas (500/250/100 chifres na imagem) são distribuídas pelo SERVIDOR baseadas em "Positions"/"Tops" originais. Reordenar no cliente cria divergência UI vs recompensa real. Risco de tickets de suporte? Sugere mitigação?
+
+### Para MiniMax M2.7 (validação A/B / checklist):
+- Cheguei a esta solução: helper estático `SortTopValuesByDamageDesc` chamado uma vez em `OnTopsUpdate` antes do loop de `BuildTopPlayer`.
+- Implementei com tie-breaker estável (OriginalIndex), validação de edge cases (null, vazio, parts<3, negativo), log de divergência via Debug.LogWarning.
+- NÃO implementei feature-toggle (decisão: simplicidade > flexibilidade — o conserto é seguro e não precisa ser desligável).
+- NÃO implementei MaxSaneDamage (decisão: o servidor é o único que escreve "Tops" via auth restrito; cap arbitrário no cliente seria security-theater).
+- NÃO implementei lookup adicional no nó "Players" para ranking ao vivo (decisão: "ÚLTIMO BOSS" deve ser snapshot final, não ao vivo).
+
+Validem se esses trade-offs estão corretos, e gerem checklist de smoke test.
+
+## RELEASE NOTES (será anexado em releasenotes-new.txt)
+
+`* Correção: Placar final do World Boss (TOP HERÓIS ÚLTIMO BOSS) agora exibe os 3 jogadores ordenados por dano causado em ordem decrescente, mesmo quando o servidor envia a lista em ordem inconsistente.`

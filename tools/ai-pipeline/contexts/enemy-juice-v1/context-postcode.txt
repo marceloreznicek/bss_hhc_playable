@@ -1,0 +1,268 @@
+TASK: pos-code review do feature **Enemy Visual Juice v1** em DiverDungeon (Unity 6, C#, prototype mobile turn-based). Reviewers já fizeram precode (consenso: scheduler central, motionPivot child, scale composto, healthbar inline, phase determinístico). A implementação abaixo aplicou esse consenso. Procure regressões, bugs no diff aplicado, edge cases não cobertos, e violações dos invariantes do projeto.
+
+══════════════════════════════════════════════════════════════════
+ESCOPO DO QUE FOI IMPLEMENTADO (v1)
+══════════════════════════════════════════════════════════════════
+
+✅ Implementado:
+- 1.5× escala base (270 px) com clamp `Mathf.Min(270f, (maxW - gap*(n-1))/n)` para caber 8 inimigos no Hollow
+- Bob (vertical sin) + weave (horizontal sin) por-frame
+- Breathe (uniform scale pulse 0.97–1.03)
+- Z-tilt sway (±~3°)
+- Hit punch (scale punch 1.18→1.0 sobre 0.12s, ease-out)
+- Death wilt (rotaciona 90° + fade alpha sobre 0.4s, terminal)
+- Tide pulse (brilho ±10% no inimigo Tide-marker, gated em `isAlive`)
+- Healthbar (fill bar acima do sprite) com cor graduada por HP% (verde ≥60, amarelo 30–60, vermelho <30) + shake na bar root no dano
+- Phases determinísticas via PCG-hash de `(slotIndex, salt)` (não usa `UnityEngine.Random`, não usa `string.GetHashCode`)
+- Per-archetype tuning (`ArchetypeProfile.ForArchetype`): Swarm/Bruiser/Ranged/Caster/Anchor/Grunt
+- Hierarquia: `root` (layout, owned by walk-in/walk-out + lunge) → `motionPivot` (child, owned by scheduler) → `Sprite` (Image). `hpBarRoot` é sibling de motionPivot (não filho), para shake independente do bob
+
+⏭️ Diferido para v2 (anotado, não bloqueia v1):
+- P7 Caster wind-up — precisa hooks dentro de `RunLiveCombat` para detectar pré-cast; deferred
+- Sub-canvas otimização para Image dirty notif — mensurar antes de aplicar
+
+══════════════════════════════════════════════════════════════════
+ARQUIVO NOVO: Assets/Prototype/Scripts/EnemyJuice.cs (247 linhas)
+══════════════════════════════════════════════════════════════════
+
+```csharp
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace DiverDungeon.Prototype
+{
+    public enum JuiceMotion
+    {
+        Idle = 0,   // bob/weave/breathe/tilt active
+        Tween = 1,  // attack lunge owned by RunLiveCombat — pause idle motion
+        Dead = 2    // wilted, terminal until widget destroyed
+    }
+
+    [System.Serializable]
+    public class EnemyJuiceState
+    {
+        public RectTransform motionPivot;     // child of widget root, owned by scheduler
+        public Image sprite;                  // color owned by scheduler (composed)
+        public RectTransform hpBarRoot;       // sibling of motionPivot, scheduler shakes localPosition
+        public Image hpFill;                  // fillAmount + color graded by HP%
+        public RectTransform spriteRect;
+        public float phaseBobV, phaseBobH, phaseBreathe, phaseTilt, phasePulse;  // set once
+        public ArchetypeProfile profile;
+        public Color baseSpriteColor = Color.white;
+        public Color baseFillColor   = new Color(0.3f, 0.85f, 0.3f, 1f);
+        public JuiceMotion motion = JuiceMotion.Idle;
+        public float hitPunchUntil;
+        public float wiltStartTime;
+        public bool  isTide;
+        public bool  isAlive = true;
+        public float barShakeUntil;
+        // Cache p/ pular write redundante de cor
+        public float lastFillAmount = -1f;
+        public Color lastFillColor = new Color(0,0,0,0);
+        public Color lastSpriteColor = new Color(0,0,0,0);
+    }
+
+    public struct ArchetypeProfile
+    {
+        public float bobAmpY, bobFreqY, weaveAmpX, weaveFreqX;
+        public float breatheAmp, breatheFreq, tiltDeg, tiltFreq;
+        public static ArchetypeProfile ForArchetype(string archetype) { /* per-archetype tuning */ }
+    }
+
+    public class EnemyJuiceScheduler : MonoBehaviour
+    {
+        public List<EnemyJuiceState> states = new List<EnemyJuiceState>();
+        public int tideIndex = -1;
+        const float TWO_PI = 6.2831853f;
+        const float HitPunchDuration = 0.12f, HitPunchPeak = 1.18f;
+        const float WiltDuration = 0.4f, DeadAlpha = 0.35f;
+        const float TidePulseAmp = 0.10f, TidePulseFreq = 0.55f;
+        const float BarShakeDuration = 0.18f, BarShakeAmp = 4f, BarShakeFreq = 32f;
+
+        void LateUpdate()
+        {
+            float t = Time.unscaledTime;
+            for (int i = 0; i < states.Count; i++)
+            {
+                var s = states[i];
+                if (s == null || s.motionPivot == null) continue;
+                if (s.motion == JuiceMotion.Tween) continue;  // hard pause; lunge owns transform+color
+
+                Vector2 motionOffset = Vector2.zero;
+                float scaleMul = 1f, tiltDeg = 0f;
+                Color spriteColor = s.baseSpriteColor;
+                bool dead = s.motion == JuiceMotion.Dead;
+
+                if (!dead)
+                {
+                    float bobY = Mathf.Sin(t * s.profile.bobFreqY * TWO_PI + s.phaseBobV) * s.profile.bobAmpY;
+                    float weaveX = Mathf.Sin(t * s.profile.weaveFreqX * TWO_PI + s.phaseBobH) * s.profile.weaveAmpX;
+                    motionOffset = new Vector2(weaveX, bobY);
+                    scaleMul *= 1f + Mathf.Sin(t * s.profile.breatheFreq * TWO_PI + s.phaseBreathe) * s.profile.breatheAmp;
+                    tiltDeg = Mathf.Sin(t * s.profile.tiltFreq * TWO_PI + s.phaseTilt) * s.profile.tiltDeg;
+                    if (s.isTide && s.isAlive)
+                    {
+                        float pulse = 1f + Mathf.Sin(t * TidePulseFreq * TWO_PI + s.phasePulse) * TidePulseAmp;
+                        spriteColor = new Color(
+                            Mathf.Clamp01(spriteColor.r * pulse),
+                            Mathf.Clamp01(spriteColor.g * pulse),
+                            Mathf.Clamp01(spriteColor.b * pulse),
+                            spriteColor.a);
+                    }
+                }
+                if (!dead && t < s.hitPunchUntil)
+                {
+                    float u = 1f - Mathf.Clamp01((s.hitPunchUntil - t) / HitPunchDuration);
+                    scaleMul *= Mathf.Lerp(HitPunchPeak, 1f, u);
+                }
+                if (dead)
+                {
+                    float u = Mathf.Clamp01((t - s.wiltStartTime) / WiltDuration);
+                    tiltDeg = Mathf.Lerp(0f, 90f, u);
+                    float a = Mathf.Lerp(s.baseSpriteColor.a, DeadAlpha, u);
+                    spriteColor = new Color(0.5f, 0.15f, 0.15f, a);
+                    motionOffset = Vector2.zero;
+                    scaleMul = 1f;
+                }
+
+                s.motionPivot.localPosition = new Vector3(motionOffset.x, motionOffset.y, 0f);
+                s.motionPivot.localScale = new Vector3(scaleMul, scaleMul, 1f);
+                s.motionPivot.localRotation = Quaternion.Euler(0f, 0f, tiltDeg);
+
+                if (s.sprite != null && !ColorsEqual(spriteColor, s.lastSpriteColor))
+                {
+                    s.sprite.color = spriteColor;
+                    s.lastSpriteColor = spriteColor;
+                }
+                if (s.hpBarRoot != null)
+                {
+                    if (t < s.barShakeUntil)
+                    {
+                        float decay = Mathf.Clamp01((s.barShakeUntil - t) / BarShakeDuration);
+                        float dx = Mathf.Sin(t * BarShakeFreq) * BarShakeAmp * decay;
+                        s.hpBarRoot.localPosition = new Vector3(dx, s.hpBarRoot.localPosition.y, 0f);
+                    }
+                    else if (s.hpBarRoot.localPosition.x != 0f)
+                        s.hpBarRoot.localPosition = new Vector3(0f, s.hpBarRoot.localPosition.y, 0f);
+                }
+            }
+        }
+
+        public static float DeterministicPhase(int slot, int salt)
+        {
+            unchecked {
+                uint x = (uint)(slot + 1) * 747796405u + (uint)salt * 2891336453u;
+                x = ((x >> 16) ^ x) * 2246822519u;
+                return ((x & 0xFFFFFFu) / 16777216f) * TWO_PI;
+            }
+        }
+    }
+}
+```
+
+══════════════════════════════════════════════════════════════════
+DIFF EM Assets/Prototype/Scripts/UIController.cs (resumo das mudanças)
+══════════════════════════════════════════════════════════════════
+
+1) `EnemyVisual` class — removido `Text hpLabel`, adicionados:
+   `motionPivot, hpBarRoot, hpFill, juice` (`EnemyJuiceState`).
+
+2) Field novo: `EnemyJuiceScheduler enemyJuice;` (lazy-attached em BuildEnemyVisuals).
+
+3) `BuildEnemyVisuals` reescrita:
+   - `each = Mathf.Min(270f, (maxW - gap*(n-1))/n);` (era 180)
+   - Hierarquia: root (RectTransform vazia) → MotionPivot (child) → Sprite (child of pivot)
+   - HpBarRoot é child direto de root (sibling de motionPivot), com HpBg + HpFill (Image.Type.Filled, fillMethod Horizontal)
+   - FocusRing parented to root (steady, não bobs com sprite)
+   - Button on root, raycast target = sprite Image
+   - Per-enemy `EnemyJuiceState` com `phaseBob*/Breathe/Tilt/Pulse` derivadas de
+     `EnemyJuiceScheduler.DeterministicPhase(i, salt)` com salts 11/23/41/67/97
+   - Tide flag setada no init (`isTide = i == tideIdxNow`)
+   - `SetEnemyHpVisual(i, hp, max, suppressShake: true)` chamada uma vez para semear barra
+
+4) Helpers novos:
+   - `string ResolveEnemyArchetype(int enemyDataId)` → lê do EnemyRegistry, fallback "Grunt"
+   - `static Color HpBarColor(float pct01)` → verde/amarelo/vermelho
+   - `void SetEnemyHpVisual(int i, int currentHp, int maxHp, bool suppressShake = false)`
+     atualiza fillAmount, color graded, shake da bar se HP caiu (usa `hpStart` como tracker
+     do último valor exibido), e em hp<=0 dispara wilt (motion=Dead, wiltStartTime=now,
+     hpBarRoot.SetActive(false)).
+   - `void TriggerEnemyHit(int i)` — set `hitPunchUntil = unscaledTime + 0.12f` (gated em isAlive).
+   - `void SetEnemyMotionState(int i, JuiceMotion motion)` — Dead é terminal (no-op se já Dead).
+
+5) Substituições dos 3 callsites do antigo `hpLabel.text`:
+   - Floor-start snapshot (linha ~1958): `for i: SetEnemyHpVisual(i, enemies[i].hp, enemies[i].maxHp, suppressShake: true);`
+   - onEnemyHit lambda (linha ~2014): `SetEnemyHpVisual(targetIdx, hp, maxHp); TriggerEnemyHit(targetIdx);`
+   - End-of-round refresh (`RefreshAllCombatBars`): chama `SetEnemyHpVisual` por inimigo.
+
+6) Tint manual de inimigo morto (linha ~2030 e `MarkDeadVisuals` linha ~2265):
+   - Removido `if (ev.sprite != null) ev.sprite.color = new Color(0.4f, 0.1f, 0.1f, 0.35f);`
+   - Substituído por `SetEnemyHpVisual(i, 0, maxHp);` que dispara wilt automaticamente.
+
+7) Wrap nos dois sites de `PlayAttack` que envolvem inimigo:
+   - Hero attacks enemy (linha ~2187):
+     ```
+     SetEnemyMotionState(targetIdx, JuiceMotion.Tween);
+     yield return PlayAttack(...);
+     SetEnemyMotionState(targetIdx, JuiceMotion.Idle);
+     ```
+   - Enemy attacks hero (linha ~2314):
+     ```
+     SetEnemyMotionState(ei, JuiceMotion.Tween);
+     yield return PlayAttack(...);
+     SetEnemyMotionState(ei, JuiceMotion.Idle);
+     ```
+   Razão: PlayAttack escreve `actor.localScale`, `target.localScale`, `target.anchoredPosition`,
+   `targetImg.color` (para flash vermelho de impacto) durante o lunge. Sem o gate de Tween,
+   o scheduler em LateUpdate sobrescreve essas writes (last-write-wins).
+
+8) `UpdateFocusVisuals` atualiza `juice.isTide` por inimigo + `enemyJuice.tideIndex` (para futura
+   leitura).
+
+══════════════════════════════════════════════════════════════════
+INVARIANTES A VERIFICAR
+══════════════════════════════════════════════════════════════════
+
+I1. **Determinismo do resolver intacto.** Scheduler vive em UI Update path; resolver e PreviewNextFloor não dependem de transforms. Confirmar que nenhuma novidade introduz `Time.*` ou `UnityEngine.Random` em path determinístico.
+
+I2. **Walk-in/walk-out (linhas 1480–1571) escrevem só `root.anchoredPosition`.** Scheduler escreve apenas `motionPivot.localPosition / .localScale / .localRotation` e `sprite.color` e `hpBarRoot.localPosition`. Não há overlap.
+
+I3. **PlayAttack sob Tween:** scheduler é hard-paused para o slot durante `yield return PlayAttack(...)`. Após retorno, motion volta para Idle e scheduler reassume.
+
+I4. **Wilt é terminal:** `SetEnemyMotionState` rejeita transições de Dead → outro estado. `SetEnemyHpVisual` em hp<=0 dispara o wilt e desativa hpBarRoot.
+
+I5. **Tide pulse gated em isAlive:** wilt seta isAlive=false; pulse para imediatamente.
+
+I6. **hp/maxHp clamp:** `SetEnemyHpVisual` faz `Mathf.Max(1, maxHp)` e `Mathf.Max(0, currentHp)` antes do divide.
+
+I7. **Phase determinístico cross-platform:** PCG mix usa multiplicações 32-bit unchecked. Sem GetHashCode. Verificar se o overflow é consistente entre IL2CPP/Mono/Editor.
+
+══════════════════════════════════════════════════════════════════
+O QUE PROCURAR (POR REVIEWER)
+══════════════════════════════════════════════════════════════════
+
+Para cada item, severidade (BLOCKER / MAJOR / MINOR / NIT) + 1 linha de fix:
+
+1. **Bugs no diff aplicado** — assinaturas, lifetime, inits faltando, ordem de operações em LateUpdate vs Update, NaN em Mathf.Sin com phase/freq=0, branch onde isAlive nunca volta para true após `BuildEnemyVisuals` re-build (deveria ser fresh em cada floor — verificar).
+
+2. **Regressões cross-file** — outros lugares que esperavam `EnemyVisual.hpLabel` (já buscamos, mas confirmar). Lugares que liam `enemyVisuals[i].sprite.color` para detectar morte (`color.a < 0.5f` no botão onClick — agora é via `juice.isAlive` flag, ok?).
+
+3. **Edge case 8 inimigos no Hollow:** clamp `Mathf.Min(270f, (maxW - gap*(n-1))/n)` cobre o pior caso? Como fica visualmente quando `each` cai abaixo de 100?
+
+4. **PlayAttack ranged (linhas 2492–2528):** o caminho ranged escreve `target.localScale = (0.86, 0.86, 1)` e tween de retorno. Mesmo problema do melee — está coberto pelo wrap Tween/Idle? Verificar que ambos os call sites no PlayAttack (ranged e melee) ficam dentro do gate.
+
+5. **Cast banner / DrainCastQueue (chama `RefreshAllCombatBars`):** `RefreshAllCombatBars` agora chama `SetEnemyHpVisual` em loop. Se um inimigo já está dead durante a cast queue, `SetEnemyHpVisual(i, 0, max)` dispara wilt **de novo** (resseta `wiltStartTime`)? Verificar guard: `if (safeCur <= 0 && ev.juice.isAlive)` — bom, double-call não re-dispara.
+
+6. **`hpStart` reused como "last displayed HP" tracker:** anteriormente era "HP no início do floor" (usado pra logging?). Agora vira "último HP exibido" — verificar se algum outro caller depende do significado original.
+
+7. **Mobile perf:**
+   - 8 enemies × 6 transform writes/frame + 8 sin reads + 1 LateUpdate iteração — fine?
+   - Image.color cache evita writes redundantes; mas a invalidação é por slot (não por canvas). OK?
+   - hpBarRoot localPosition writes mesmo quando shake terminou (volta para zero). Adicionar guard early-out se já está em 0?
+
+8. **Determinism risk mitigations dos reviewers do precode** — algum BLOCKER do precode passou despercebido?
+
+9. **Algo faltando** — P7 wind-up está deferido; ok? Outras feature gaps?
+
+Output: lista numerada por seção, conciso. 1–2 sentenças por achado.

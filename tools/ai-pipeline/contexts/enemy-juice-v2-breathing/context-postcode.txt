@@ -1,0 +1,126 @@
+TASK: pos-code review of the **Enemy Visual Juice v2-breathing** patch in DiverDungeon (Unity 6, C#). Precode (8 reviewers) reached consensus; this code applied the consensus + 4 specific findings (BLOCKER death-breathe init, MAJOR last-breath lerp, MAJOR uniform punch, MINOR Caster bump). Look for regressions, edge cases the precode missed, and arithmetic mistakes in the new compose stack.
+
+══════════════════════════════════════════════════════════════════
+SCOPE OF v2 PATCH (now applied)
+══════════════════════════════════════════════════════════════════
+
+Files touched:
+- `Assets/Prototype/Scripts/EnemyJuice.cs` — `ArchetypeProfile.ForArchetype` table rewrite + `LateUpdate` compose-stack refactor + new `EnemyJuiceState.deathBreatheValue` field
+- `Assets/Prototype/Scripts/UIController.cs` — `phaseBreathe` salt change + capture of `deathBreatheValue` at the wilt-trigger inside `SetEnemyHpVisual`
+
+Concrete changes:
+
+1. **Asymmetric breathe** — replaces `localScale = (s, s)` with:
+   ```
+   scaleX = (baseScale / breathe) * punch
+   scaleY = (baseScale * breathe) * punch
+   ```
+   `breathe` is `1 + sin(...)*amp`. `(1/s)*s = 1` always → silhouette area constant.
+
+2. **Uniform hit punch** — punch is now multiplied AFTER the X/Y split (was inside `scaleMul` before split in v1). Punch peak (1.18×) hits both axes equally regardless of breath phase.
+
+3. **Phase coupling** — `phaseBreathe = DeterministicPhase(i, 11)` (was salt 41). Same salt as `phaseBobV` so bob-Y high point aligns with breathe inhale peak per enemy.
+
+4. **Per-archetype tuning** — see table; weave/tilt cut for Grunt/Ranged/Caster, breathe amp ~3× larger and freq slowed to 0.18–0.45 Hz. `bobFreqY = breatheFreq` for non-Swarm archetypes (frequency-locked coherent cycle).
+
+5. **Death "last breath"** — `ev.juice.deathBreatheValue` captured at wilt-trigger using current sin(t * breatheFreq + phase) value. Wilt branch lerps `breathe = Lerp(deathBreatheValue, 1f, u)` over the 0.45s wilt → no snap-uniform pop.
+
+6. **Death branch initializes `breathe = 1f`** before the alive/dead split (BLOCKER from precode).
+
+7. **Caster bumped** — weave 0.5→0.7, tilt 0.3→0.5 (precode: too still otherwise).
+
+══════════════════════════════════════════════════════════════════
+NEW COMPOSE STACK (LateUpdate)
+══════════════════════════════════════════════════════════════════
+
+```csharp
+Vector2 motionOffset = Vector2.zero;
+float baseScale = 1f;     // shared scale (death wilt writes here)
+float breathe = 1f;       // asymmetric Y/X split factor
+float punch = 1f;         // uniform impact, applied AFTER split
+float tiltDeg = 0f;
+Color spriteColor = s.baseSpriteColor;
+
+bool dead = s.motion == JuiceMotion.Dead;
+bool tween = s.motion == JuiceMotion.Tween;
+
+if (!dead)
+{
+    // bob, weave, tilt as v1
+    breathe = 1f + Mathf.Sin(t * profile.breatheFreq * TWO_PI + s.phaseBreathe) * profile.breatheAmp;
+    // tide pulse on color (gated isAlive && isTide && !tween)
+    if (t < s.hitPunchUntil)
+        punch = Mathf.Lerp(HitPunchPeak, 1f, /*ease-out u*/);
+}
+else
+{
+    float u = Mathf.Clamp01((t - s.wiltStartTime) / WiltDuration);
+    spriteColor = (alpha-faded baseSpriteColor)
+    motionOffset = (0, lerp(0, 18, u))
+    baseScale = lerp(1, 0.78, u)
+    breathe = Mathf.Lerp(s.deathBreatheValue, 1f, u);    // last-breath release
+    tiltDeg = 0f;
+    if (u >= 1f) widgetRoot.SetActive(false);
+}
+
+s.motionPivot.localPosition = (motionOffset.x, motionOffset.y, 0);
+float scaleX = (baseScale / breathe) * punch;
+float scaleY = (baseScale * breathe) * punch;
+s.motionPivot.localScale = (scaleX, scaleY, 1);
+s.motionPivot.localRotation = Quaternion.Euler(0, 0, tiltDeg);
+```
+
+══════════════════════════════════════════════════════════════════
+INVARIANTS THE PATCH PRESERVES (verify each)
+══════════════════════════════════════════════════════════════════
+
+I1. **Determinism**: PCG hash + `Time.unscaledTime` only. No `UnityEngine.Random`. No reads from `EnemyStats`/`CombatResolver`/`RunController` in the scheduler hot path. Resolver and PreviewNextFloor are untouched.
+
+I2. **Tween hard pause for sprite.color**: scheduler still skips sprite.color writes during Tween (PlayAttack owns the impact red flash on the same Image). Bob/breathe/tilt/punch transform writes still apply during Tween (they live on motionPivot child, distinct from PlayAttack's root.localScale writes).
+
+I3. **Death is terminal**: `SetEnemyMotionState` rejects `Dead → Idle/Tween`. Once dead, scheduler stays in the dead branch and eventually deactivates `widgetRoot`.
+
+I4. **Float safety**: `breathe ∈ [0.945, 1.055]` for max amp (Anchor 0.055). `1/breathe ∈ [0.948, 1.058]`. No NaN/Inf risk. No clamp needed.
+
+I5. **Hit punch composes uniformly**: at breathe peak (1.055) + punch (1.18): `scaleX = (1 / 1.055) * 1.18 = 1.118`, `scaleY = (1 * 1.055) * 1.18 = 1.245`. Ratio Y/X = 1.114. NOTE — this is intentional asymmetry from breathe; the precode flagged this and we accepted that "punch on top of breath looks like the punch inflates the chest more" reads as natural.
+
+══════════════════════════════════════════════════════════════════
+WHAT TO REVIEW
+══════════════════════════════════════════════════════════════════
+
+1. **Compose-stack arithmetic**
+   - Confirm `scaleX = (baseScale / breathe) * punch, scaleY = (baseScale * breathe) * punch` is the intended order. (baseScale wraps wilt shrink; breathe is the live respiration; punch is uniform impact.)
+   - At death, `baseScale` lerps 1→0.78. `breathe` lerps `deathBreatheValue → 1`. With deathBreatheValue=1.05 (peak inhale) and u=0.5: baseScale=0.89, breathe=1.025, scaleX=0.868, scaleY=0.913. Reads as "shrinking + relaxing exhale". Verify nothing weird in this.
+
+2. **deathBreatheValue capture**
+   - Captured in `SetEnemyHpVisual` using current Time.unscaledTime + same formula. Verify formula matches scheduler's exactly (`t * breatheFreq * 6.2831853f + phaseBreathe`). TWO_PI literal `6.2831853f` matches `EnemyJuiceScheduler.TWO_PI`.
+   - If the wilt fires while motion was Tween (bug case: hero kills with damage tick mid-lunge), is deathBreatheValue still meaningful? At Tween, scheduler had been writing breathe normally, so the captured value reflects current state. OK.
+
+3. **Phase coupling regression**
+   - `phaseBreathe = phaseBobV` for all enemies. Per-slot PCG still staggers them; verify by mental simulation: 4 Grunts at slots 0/1/2/3 produce DeterministicPhase(0,11), (1,11), (2,11), (3,11) — should all differ. No "marching in step" risk.
+   - Frequency lock for non-Swarm archetypes: every Grunt has same `breatheFreq=0.28` and `bobFreqY=0.28`. Same archetype enemies in adjacent slots have identical freq but different per-slot phase → still staggered.
+
+4. **Per-archetype balance check**
+   - Grunt: weave 0.4, tilt 0.4, breathe 0.045@0.28Hz, bob amp 2.5px @ 0.28Hz → reads as "slow chest breathing with very subtle sway". Right?
+   - Bruiser: weave 2.0 + tilt 0.8 + breathe 0.040@0.22Hz, bob 3.0px @ 0.22Hz → heavy weight-shift. Still reads as Bruiser?
+   - Anchor: weave 3.0, breathe 0.055@0.18Hz (5.55s period), bob 1.8px @ 0.18Hz → biggest sway, slowest breath. Imposing?
+   - Caster (post-bump): weave 0.7, tilt 0.5, breathe 0.050@0.30Hz → eerie hover. OK?
+   - Swarm: bob/breathe deliberately decoupled in freq (1.0Hz bob vs 0.45Hz breathe). Reads as twitchy?
+   - Ranged: weave 0.5, tilt 0.4, breathe 0.040@0.32Hz → near-still ranged shooter. Boring? Acceptable since archers stand stiller.
+
+5. **Edge cases**
+   - Hit punch lands EXACTLY at breathe peak: scaleY = 1.245. Sprite is at 1.5×original size (216 px in UIController). Worst-case absolute height = 216 * 1.245 = ~269 px. Healthbar above sprite at 12 px height + 14 px gap = ~32 px headroom. Risk: punch + inhale could clip the healthbar. Verify.
+   - Death lands at breathe peak: deathBreatheValue=1.055. Initial wilt frame: u=0, baseScale=1, breathe=1.055 → scaleX=0.948, scaleY=1.055. Then over 0.45s, breathe lerps to 1 and baseScale lerps to 0.78. Smooth.
+   - Tween mode + death: PlayAttack writes target.localScale=(0.86, 0.86) on root. Scheduler writes motionPivot.localScale = (scaleX, scaleY) where dead is true so it computes wilt values. Composite is `(0.86 * scaleX, 0.86 * scaleY)`. The lunge push is just additionally scaled — minor visual squish at impact. Verify acceptable.
+   - tween && dead: PlayAttack tween still owns sprite.color (we skip color writes when tween). But scheduler computes spriteColor with fade alpha. The fade alpha never reaches the sprite during Tween, so the corpse stays opaque until Tween clears (PlayAttack ends, ~0.3s post-impact). Then fade resumes. Acceptable lag, but worth noting.
+
+6. **Mobile perf**
+   - Per-enemy per-frame: 4 sin (bob, weave, breathe, tilt) + 1 div + 4 muls + 1 lerp. ~30 FLOPs/enemy. 8 enemies = 240 FLOPs/frame. Negligible.
+   - No allocations. No LINQ. No GetComponent. ✓
+
+7. **What might the patch have missed?**
+   - The user complained "wobbly". Did the weave/tilt cuts go far enough? Or too far?
+   - Will frequency-locking 5/6 archetypes make the screen "feel synchronized" globally? Per-slot phase should prevent this, but mental check.
+   - Anything else readable as "alive" we should ship in the same patch?
+
+Output: numbered terse findings with severity. ≤2 sentences each.

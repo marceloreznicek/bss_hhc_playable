@@ -1,0 +1,2208 @@
+TAREFA: revisar PÓS-CODE o diff aplicado para a feature 'Multiple Dungeons'.
+
+Esta é a ETAPA 3 do pipeline. O plano de Kimi (síntese das 8 IAs do precode) foi seguido. Agora vocês recebem:
+  (1) o plano síntese, (2) a lista de arquivos, (3) o diff completo dos arquivos modificados, (4) o conteúdo dos arquivos novos.
+
+Critérios de revisão (pós-code):
+  - bugs introduzidos pelo diff (regressões nos sistemas existentes)
+  - violações de determinismo (Tide, save migration, preview vs run real)
+  - JsonUtility serialization (Dictionary/HashSet — deve estar ausente, só List)
+  - race conditions na transação de RecordRunEnd
+  - leaks de UI (Texts/Images/Buttons criados sem destroy)
+  - violações do escopo v1 (algo que deveria estar fora do scope v1 e foi implementado mesmo assim)
+  - se o diff aplica o que Kimi consolidou ou se desviou silenciosamente
+
+Idioma: PT ou EN. Cada IA com seu papel/nicho. Máx 400 palavras.
+
+## PLANO ORIGINAL (Kimi K2.6 — síntese aprovada pelo usuário)
+
+# Kimi K2.6
+
+- Modelo: `moonshotai/kimi-k2.6`
+
+---
+
+ 1. **Causa raiz consolidada**
+A feature fragmenta a fonte de verdade entre CSV, SOs gerados e estado legado não serializável por `JsonUtility`, enquanto expõe o cálculo do `tideIdx` e o desbloqueio de dungeons a condições de corrida entre preview, execução e persistência.
+
+2. **Plano priorizado**
+1. **Save v2 atômico**: Substituir `deepestFloor` global por `List<DungeonProgressEntry>` serializável, rebuild de `Dictionary` em `Load()`, e encapsular atualização de deepest + unlocks + `seenJustUnlocked` em `FinalizeRunTransaction()` com único `Save()` antes de disparar callbacks de UI.
+2. **Tide determinístico**: Criar `GetTideIndex(dungeonId, floor, enemyCount)` pura com hash FNV-1a (nunca `string.GetHashCode()`); garantir que `PreviewNextFloor` e `BeginFloor` invoquem a mesma função com argumentos idênticos.
+3. **Registry runtime simples**: Parser direto de CSV para `Dictionary<string, DungeonDef>` no bootstrap, sem `[InitializeOnLoad]` nem geração de SO; validar ranges e IDs únicos no parse.
+4. **CombatResolver com regra injetada**: Passar `DungeonRule` imutável; aplicar mis-focus por tick no ataque inimigo sem mutar `EnemyStats`; resetar `FocusEnemyIndex = -1` a cada `StartRun`/floor; bloquear foco em `NoFocus` tanto na UI quanto no resolver.
+5. **UI por último**: Implementar Dungeon Select e badge "New" somente após validar persistência e determinismo; badge limpa ao entrar no roster do dungeon.
+
+3. **Conflitos entre IAs**
+- **Gerar SO em edit-time vs parser runtime**: Opus/Gemini sugerem SOs + reimportação manual; Qwen/KAT/GPT55 defendem parser runtime puro. O lado runtime tem mais evidência técnica para protótipo: elimina race de domain reload, merge conflicts e duplicação de verdade.
+- **HMAC/checksum no save**: Sonnet/Grok exigem hash hardcoded; outras tratam como dívida técnica futura. Como não há backend nem monetização ainda, a evidência favorece protótipo sem checksum, mas deve ser registrado como débito crítico antes de rankings ou recompensas.
+- **Interface `IDungeonTuning` vs struct**: KAT propõe interface para desacoplar; maioria (Opus, GPT55, Qwen) prefere struct/enum puro. Struct é mais adequada por ser serializável, imutável e sem overhead de alocação no loop de combate.
+
+4. **Convergências**
+- **Serialização JsonUtility**: todas as 8 IAs concordam em abandonar `Dictionary`/HashSet direto e usar `List<DungeonProgressEntry>` com rebuild em `Load()`, sanitizando duplicatas.
+- **Transação atômica**: consenso absoluto de que unlock/deepest/gold devem ser computados e salvos em bloco único antes de qualquer callback de UI, evitando perda de estado em crash ou force-close.
+- **Hash estável do Tide**: unanimidade em rejeitar `string.GetHashCode()` e centralizar cálculo em função pura compartilhada entre preview e run real.
+- **Isolamento de estado**: concordam que `FocusEnemyIndex` deve resetar a cada run/floor e que `CombatResolver` não pode depender de estado mutável de `RunController` para decidir regras.
+
+---
+
+## ARQUIVOS NOVOS
+
+
+### NEW FILE: `Balance/balance_dungeons.csv`
+```
+id,displayName,sortIndex,themeColorHex,focusRule,cardFocusRuleText,cardPressureHintText,unlockKind,unlockGateDungeonId,unlockGateFloor,enemyHpBase,enemyHpGrowth,enemyAtkBase,enemyAtkGrowth,enemyCountBase,enemyCountStep,goldBase,goldGrowth,floorClearTimeBase,floorClearTimePerFloor,anchorEnemyHpMultiplier,misFocusDamageMultiplier
+vault,The Vault,0,#9C8E70,Standard,"Focus an enemy to make your party concentrate fire. No focus → each hero chooses on their own.","A balanced dungeon. Bring whoever you've got.",AlwaysUnlocked,,,20,1.12,4,1.10,2,4,10,1.5,3,0.5,1,1
+hollow,The Hollow,1,#382F44,NoFocus,"Focus is disabled here. Your heroes pick their own targets.","Many enemies, weaker each. Faster floors. Punishes wipes harder.",ClearFloor,vault,10,14,1.10,4,1.10,4,3,10,1.5,2,0.5,1,1
+drowned_crypt,The Drowned Crypt,2,#2A6B7A,ForcedFocus,"Focus the glowing Tide enemy. Wrong target — your party takes +50% damage.","One tough enemy per floor, plus support. Burst it down or pay the price.",ClearFloor,vault,20,14,1.12,4,1.10,3,5,10,1.5,4,0.5,3,1.5
+```
+
+### NEW FILE: `Assets/Prototype/Scripts/DungeonDefinition.cs`
+```
+using System;
+using UnityEngine;
+
+namespace DiverDungeon.Prototype
+{
+    public enum FocusRule
+    {
+        Standard = 0,
+        NoFocus = 1,
+        ForcedFocus = 2
+    }
+
+    public enum UnlockKind
+    {
+        AlwaysUnlocked = 0,
+        ClearFloor = 1
+    }
+
+    [Serializable]
+    public class DungeonDefinition
+    {
+        public string id;
+        public string displayName;
+        public int sortIndex;
+        public Color themeColor = Color.white;
+
+        public FocusRule focusRule = FocusRule.Standard;
+        public string cardFocusRuleText;
+        public string cardPressureHintText;
+
+        public UnlockKind unlockKind = UnlockKind.AlwaysUnlocked;
+        public string unlockGateDungeonId;
+        public int unlockGateFloor;
+
+        public float enemyHpBase = 20f;
+        public float enemyHpGrowth = 1.12f;
+        public float enemyAtkBase = 4f;
+        public float enemyAtkGrowth = 1.10f;
+        public int enemyCountBase = 2;
+        public int enemyCountStep = 4;
+        public float goldBase = 10f;
+        public float goldGrowth = 1.5f;
+        public float floorClearTimeBase = 3f;
+        public float floorClearTimePerFloor = 0.5f;
+
+        public float anchorEnemyHpMultiplier = 1f;
+        public float misFocusDamageMultiplier = 1f;
+    }
+
+    public struct DungeonRule
+    {
+        public FocusRule focusRule;
+        public int tideEnemyIndex;
+        public float misFocusDamageMultiplier;
+
+        public static DungeonRule Standard => new DungeonRule
+        {
+            focusRule = FocusRule.Standard,
+            tideEnemyIndex = -1,
+            misFocusDamageMultiplier = 1f
+        };
+    }
+}
+```
+
+### NEW FILE: `Assets/Prototype/Scripts/CsvLoader.cs`
+```
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using UnityEngine;
+
+namespace DiverDungeon.Prototype
+{
+    public static class CsvLoader
+    {
+        public static List<Dictionary<string, string>> LoadFile(string fileName)
+        {
+            string path = ResolveCsvPath(fileName);
+            if (path == null)
+            {
+                Debug.LogWarning($"[CsvLoader] CSV not found: {fileName}");
+                return new List<Dictionary<string, string>>();
+            }
+            string text;
+            try { text = File.ReadAllText(path, Encoding.UTF8); }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[CsvLoader] Read failed for {path}: {e.Message}");
+                return new List<Dictionary<string, string>>();
+            }
+            return Parse(text);
+        }
+
+        public static string ResolveCsvPath(string fileName)
+        {
+            string streaming = Path.Combine(Application.streamingAssetsPath, "Balance", fileName);
+            if (File.Exists(streaming)) return streaming;
+
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            string atRoot = Path.Combine(projectRoot, "Balance", fileName);
+            if (File.Exists(atRoot)) return atRoot;
+
+            return null;
+        }
+
+        // Minimal RFC 4180-ish parser: supports quoted fields with embedded commas and ""-escaped quotes.
+        public static List<Dictionary<string, string>> Parse(string text)
+        {
+            var result = new List<Dictionary<string, string>>();
+            if (string.IsNullOrEmpty(text)) return result;
+
+            var rows = new List<List<string>>();
+            var currentRow = new List<string>();
+            var currentField = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (inQuotes)
+                {
+                    if (c == '"')
+                    {
+                        if (i + 1 < text.Length && text[i + 1] == '"') { currentField.Append('"'); i++; }
+                        else inQuotes = false;
+                    }
+                    else currentField.Append(c);
+                }
+                else
+                {
+                    if (c == '"') inQuotes = true;
+                    else if (c == ',') { currentRow.Add(currentField.ToString()); currentField.Length = 0; }
+                    else if (c == '\n')
+                    {
+                        currentRow.Add(currentField.ToString()); currentField.Length = 0;
+                        rows.Add(currentRow); currentRow = new List<string>();
+                    }
+                    else if (c == '\r') { /* skip */ }
+                    else currentField.Append(c);
+                }
+            }
+            if (currentField.Length > 0 || currentRow.Count > 0)
+            {
+                currentRow.Add(currentField.ToString());
+                rows.Add(currentRow);
+            }
+
+            if (rows.Count < 2) return result;
+            var headers = rows[0];
+            for (int r = 1; r < rows.Count; r++)
+            {
+                var row = rows[r];
+                if (row.Count == 1 && string.IsNullOrEmpty(row[0])) continue;
+                var dict = new Dictionary<string, string>(headers.Count);
+                for (int c = 0; c < headers.Count; c++)
+                {
+                    string key = headers[c].Trim();
+                    string val = c < row.Count ? row[c] : string.Empty;
+                    dict[key] = val;
+                }
+                result.Add(dict);
+            }
+            return result;
+        }
+
+        public static int GetInt(Dictionary<string, string> row, string key, int fallback = 0)
+        {
+            if (row != null && row.TryGetValue(key, out var s) && int.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var v))
+                return v;
+            return fallback;
+        }
+
+        public static float GetFloat(Dictionary<string, string> row, string key, float fallback = 0f)
+        {
+            if (row != null && row.TryGetValue(key, out var s) && float.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v))
+                return v;
+            return fallback;
+        }
+
+        public static string GetString(Dictionary<string, string> row, string key, string fallback = "")
+        {
+            return row != null && row.TryGetValue(key, out var s) ? s : fallback;
+        }
+
+        public static Color ParseHexColor(string hex, Color fallback)
+        {
+            if (string.IsNullOrEmpty(hex)) return fallback;
+            if (ColorUtility.TryParseHtmlString(hex, out var c)) return c;
+            return fallback;
+        }
+    }
+}
+```
+
+### NEW FILE: `Assets/Prototype/Scripts/DungeonRegistry.cs`
+```
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace DiverDungeon.Prototype
+{
+    public static class DungeonRegistry
+    {
+        const string CsvFile = "balance_dungeons.csv";
+
+        static List<DungeonDefinition> _dungeons;
+        static Dictionary<string, DungeonDefinition> _byId;
+
+        public static IReadOnlyList<DungeonDefinition> All
+        {
+            get { EnsureLoaded(); return _dungeons; }
+        }
+
+        public static DungeonDefinition GetById(string id)
+        {
+            EnsureLoaded();
+            return id != null && _byId.TryGetValue(id, out var d) ? d : null;
+        }
+
+        public static void Reload()
+        {
+            _dungeons = null;
+            _byId = null;
+            EnsureLoaded();
+        }
+
+        static void EnsureLoaded()
+        {
+            if (_dungeons != null) return;
+            _dungeons = new List<DungeonDefinition>();
+            _byId = new Dictionary<string, DungeonDefinition>();
+
+            var rows = CsvLoader.LoadFile(CsvFile);
+            if (rows.Count == 0)
+            {
+                Debug.LogWarning($"[DungeonRegistry] {CsvFile} missing/empty — using built-in Vault fallback only.");
+                _dungeons.Add(BuildVaultFallback());
+                _byId[_dungeons[0].id] = _dungeons[0];
+                return;
+            }
+
+            var seenIds = new HashSet<string>();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var d = ParseRow(rows[i]);
+                if (d == null) continue;
+                if (string.IsNullOrEmpty(d.id))
+                {
+                    Debug.LogWarning($"[DungeonRegistry] row {i + 1}: missing id — skipping.");
+                    continue;
+                }
+                if (!seenIds.Add(d.id))
+                {
+                    Debug.LogWarning($"[DungeonRegistry] duplicate id '{d.id}' at row {i + 1} — skipping.");
+                    continue;
+                }
+                _dungeons.Add(d);
+                _byId[d.id] = d;
+            }
+
+            _dungeons.Sort((a, b) => a.sortIndex.CompareTo(b.sortIndex));
+
+            if (_dungeons.Count == 0)
+            {
+                Debug.LogWarning("[DungeonRegistry] no valid dungeons parsed — using built-in Vault fallback.");
+                _dungeons.Add(BuildVaultFallback());
+                _byId[_dungeons[0].id] = _dungeons[0];
+            }
+        }
+
+        static DungeonDefinition ParseRow(Dictionary<string, string> row)
+        {
+            var d = new DungeonDefinition
+            {
+                id = CsvLoader.GetString(row, "id"),
+                displayName = CsvLoader.GetString(row, "displayName"),
+                sortIndex = CsvLoader.GetInt(row, "sortIndex"),
+                themeColor = CsvLoader.ParseHexColor(CsvLoader.GetString(row, "themeColorHex"), Color.white),
+                cardFocusRuleText = CsvLoader.GetString(row, "cardFocusRuleText"),
+                cardPressureHintText = CsvLoader.GetString(row, "cardPressureHintText"),
+                unlockGateDungeonId = CsvLoader.GetString(row, "unlockGateDungeonId"),
+                unlockGateFloor = CsvLoader.GetInt(row, "unlockGateFloor"),
+                enemyHpBase = CsvLoader.GetFloat(row, "enemyHpBase", 20f),
+                enemyHpGrowth = CsvLoader.GetFloat(row, "enemyHpGrowth", 1.12f),
+                enemyAtkBase = CsvLoader.GetFloat(row, "enemyAtkBase", 4f),
+                enemyAtkGrowth = CsvLoader.GetFloat(row, "enemyAtkGrowth", 1.10f),
+                enemyCountBase = CsvLoader.GetInt(row, "enemyCountBase", 2),
+                enemyCountStep = CsvLoader.GetInt(row, "enemyCountStep", 4),
+                goldBase = CsvLoader.GetFloat(row, "goldBase", 10f),
+                goldGrowth = CsvLoader.GetFloat(row, "goldGrowth", 1.5f),
+                floorClearTimeBase = CsvLoader.GetFloat(row, "floorClearTimeBase", 3f),
+                floorClearTimePerFloor = CsvLoader.GetFloat(row, "floorClearTimePerFloor", 0.5f),
+                anchorEnemyHpMultiplier = CsvLoader.GetFloat(row, "anchorEnemyHpMultiplier", 1f),
+                misFocusDamageMultiplier = CsvLoader.GetFloat(row, "misFocusDamageMultiplier", 1f)
+            };
+
+            string focusRuleStr = CsvLoader.GetString(row, "focusRule");
+            d.focusRule = ParseFocusRule(focusRuleStr);
+
+            string unlockKindStr = CsvLoader.GetString(row, "unlockKind");
+            d.unlockKind = ParseUnlockKind(unlockKindStr);
+
+            return d;
+        }
+
+        static FocusRule ParseFocusRule(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return FocusRule.Standard;
+            switch (s.Trim())
+            {
+                case "Standard": return FocusRule.Standard;
+                case "NoFocus": return FocusRule.NoFocus;
+                case "ForcedFocus": return FocusRule.ForcedFocus;
+                default:
+                    Debug.LogWarning($"[DungeonRegistry] unknown focusRule '{s}' — defaulting to Standard.");
+                    return FocusRule.Standard;
+            }
+        }
+
+        static UnlockKind ParseUnlockKind(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return UnlockKind.AlwaysUnlocked;
+            switch (s.Trim())
+            {
+                case "AlwaysUnlocked": return UnlockKind.AlwaysUnlocked;
+                case "ClearFloor": return UnlockKind.ClearFloor;
+                default:
+                    Debug.LogWarning($"[DungeonRegistry] unknown unlockKind '{s}' — defaulting to AlwaysUnlocked.");
+                    return UnlockKind.AlwaysUnlocked;
+            }
+        }
+
+        static DungeonDefinition BuildVaultFallback()
+        {
+            return new DungeonDefinition
+            {
+                id = "vault",
+                displayName = "The Vault",
+                sortIndex = 0,
+                themeColor = new Color(0.61f, 0.55f, 0.44f),
+                focusRule = FocusRule.Standard,
+                cardFocusRuleText = "Focus an enemy to make your party concentrate fire. No focus → each hero chooses on their own.",
+                cardPressureHintText = "A balanced dungeon. Bring whoever you've got.",
+                unlockKind = UnlockKind.AlwaysUnlocked
+            };
+        }
+
+        // Pure deterministic Tide-enemy designation. Same inputs → same index, across preview and live run.
+        // FNV-1a 32-bit; do not replace with string.GetHashCode (runtime-randomized).
+        public static int GetTideIndex(string dungeonId, int floor, int enemyCount)
+        {
+            if (enemyCount <= 0) return -1;
+            uint hash = 2166136261u;
+            if (!string.IsNullOrEmpty(dungeonId))
+            {
+                for (int i = 0; i < dungeonId.Length; i++)
+                {
+                    hash ^= dungeonId[i];
+                    hash *= 16777619u;
+                }
+            }
+            unchecked
+            {
+                hash ^= (uint)floor;
+                hash *= 16777619u;
+            }
+            return (int)(hash % (uint)enemyCount);
+        }
+    }
+}
+```
+
+---
+
+## DIFF DOS ARQUIVOS MODIFICADOS
+
+### `Assets/Prototype/Scripts/CombatResolver.cs`
+```diff
+diff --git a/Assets/Prototype/Scripts/CombatResolver.cs b/Assets/Prototype/Scripts/CombatResolver.cs
+index e64c55a..d512445 100644
+--- a/Assets/Prototype/Scripts/CombatResolver.cs
++++ b/Assets/Prototype/Scripts/CombatResolver.cs
+@@ -3,12 +3,19 @@ using System.Text;
+ 
+ namespace DiverDungeon.Prototype
+ {
++    public enum AttackType
++    {
++        Melee = 0,
++        Ranged = 1
++    }
++
+     public struct HeroStats
+     {
+         public int hp;
+         public int maxHp;
+         public int atk;
+         public int def;
++        public AttackType attackType;
+     }
+ 
+     public struct EnemyStats
+@@ -16,6 +23,7 @@ namespace DiverDungeon.Prototype
+         public int hp;
+         public int atk;
+         public int def;
++        public AttackType attackType;
+     }
+ 
+     public enum FloorOutcome
+@@ -52,6 +60,12 @@ namespace DiverDungeon.Prototype
+         // Continue until one side is fully wiped.
+         public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
+             int focusEnemyIndex = -1, int seed = 0)
++        {
++            return Resolve(heroes, enemies, focusEnemyIndex, seed, DungeonRule.Standard);
++        }
++
++        public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
++            int focusEnemyIndex, int seed, DungeonRule rule)
+         {
+             var heroList = new List<HeroStats>(heroes);
+             var enemyList = new List<EnemyStats>(enemies);
+@@ -59,6 +73,8 @@ namespace DiverDungeon.Prototype
+             var rng = new System.Random(seed);
+             int tick = 0;
+ 
++            if (rule.focusRule == FocusRule.NoFocus) focusEnemyIndex = -1;
++
+             while (AnyAliveHero(heroList) && AnyAliveEnemy(enemyList))
+             {
+                 // Hero side
+@@ -85,13 +101,21 @@ namespace DiverDungeon.Prototype
+                 if (!AnyAliveEnemy(enemyList)) break;
+ 
+                 // Enemy side — each enemy independently picks a random alive hero.
++                bool tideAlive = rule.focusRule == FocusRule.ForcedFocus
++                                 && rule.tideEnemyIndex >= 0
++                                 && rule.tideEnemyIndex < enemyList.Count
++                                 && enemyList[rule.tideEnemyIndex].hp > 0;
++                bool misFocusActive = tideAlive && focusEnemyIndex != rule.tideEnemyIndex;
++                float dmgMult = misFocusActive ? rule.misFocusDamageMultiplier : 1f;
++
+                 for (int ei = 0; ei < enemyList.Count; ei++)
+                 {
+                     if (enemyList[ei].hp <= 0) continue;
+                     int tIdx = PickEnemyTarget(heroList, rng);
+                     if (tIdx < 0) break;
+                     tick++;
+-                    int dmg = System.Math.Max(1, enemyList[ei].atk - heroList[tIdx].def);
++                    int rawDmg = System.Math.Max(1, enemyList[ei].atk - heroList[tIdx].def);
++                    int dmg = System.Math.Max(1, (int)System.Math.Round(rawDmg * dmgMult));
+                     var h = heroList[tIdx];
+                     h.hp -= dmg;
+                     heroList[tIdx] = h;
+```
+
+### `Assets/Prototype/Scripts/RunController.cs`
+```diff
+diff --git a/Assets/Prototype/Scripts/RunController.cs b/Assets/Prototype/Scripts/RunController.cs
+index cded411..7e07fc8 100644
+--- a/Assets/Prototype/Scripts/RunController.cs
++++ b/Assets/Prototype/Scripts/RunController.cs
+@@ -6,7 +6,7 @@ namespace DiverDungeon.Prototype
+ {
+     public static class Tuning
+     {
+-        public const int HeroRegenPerFloor = 15;
++        public const int HeroRegenPerFloor = 0;
+         public const float EnemyHpBase = 20f;
+         public const float EnemyHpGrowth = 1.12f;
+         public const float EnemyAtkBase = 4f;
+@@ -35,9 +35,17 @@ namespace DiverDungeon.Prototype
+         public int CurrentFloor { get; private set; } = 0;
+         public int Gold { get; private set; } = 0;
+         public int FocusEnemyIndex { get; private set; } = -1;
+-        public void SetFocus(int idx) { FocusEnemyIndex = idx; }
++        public void SetFocus(int idx)
++        {
++            if (ActiveRule.focusRule == FocusRule.NoFocus) return;
++            FocusEnemyIndex = idx;
++        }
+         public void ClearFocus() { FocusEnemyIndex = -1; }
+ 
++        public DungeonDefinition ActiveDungeon { get; private set; }
++        public DungeonRule ActiveRule { get; private set; } = DungeonRule.Standard;
++        public int CurrentTideIndex { get; private set; } = -1;
++
+         // Party — index = slot. Aligned with the ordered HeroData list passed to StartRun.
+         public List<HeroStats> Party { get; private set; } = new List<HeroStats>();
+         public List<HeroData> PartyData { get; private set; } = new List<HeroData>();
+@@ -48,31 +56,46 @@ namespace DiverDungeon.Prototype
+         public event Action<int, int> OnRunWiped;
+ 
+         public int HeroRegen => config != null ? config.heroRegenPerFloor : Tuning.HeroRegenPerFloor;
+-        public float EnemyHpBase => config != null ? config.enemyHpBase : Tuning.EnemyHpBase;
+-        public float EnemyHpGrowth => config != null ? config.enemyHpGrowth : Tuning.EnemyHpGrowth;
+-        public float EnemyAtkBase => config != null ? config.enemyAtkBase : Tuning.EnemyAtkBase;
+-        public float EnemyAtkGrowth => config != null ? config.enemyAtkGrowth : Tuning.EnemyAtkGrowth;
+-        public int EnemyCountBase => config != null ? config.enemyCountBase : Tuning.EnemyCountBase;
+-        public int EnemyCountStep => config != null ? config.enemyCountStep : Tuning.EnemyCountStep;
+-        public float GoldBase => config != null ? config.goldBase : Tuning.GoldBase;
+-        public float GoldGrowth => config != null ? config.goldGrowth : Tuning.GoldGrowth;
+-        public float FloorClearTimeBase => config != null ? config.floorClearTimeBase : Tuning.FloorClearTimeBase;
+-        public float FloorClearTimePerFloor => config != null ? config.floorClearTimePerFloor : Tuning.FloorClearTimePerFloor;
+-
+-        public void StartRun(List<HeroData> partyData)
++
++        public float EnemyHpBase => ActiveDungeon != null ? ActiveDungeon.enemyHpBase
++            : (config != null ? config.enemyHpBase : Tuning.EnemyHpBase);
++        public float EnemyHpGrowth => ActiveDungeon != null ? ActiveDungeon.enemyHpGrowth
++            : (config != null ? config.enemyHpGrowth : Tuning.EnemyHpGrowth);
++        public float EnemyAtkBase => ActiveDungeon != null ? ActiveDungeon.enemyAtkBase
++            : (config != null ? config.enemyAtkBase : Tuning.EnemyAtkBase);
++        public float EnemyAtkGrowth => ActiveDungeon != null ? ActiveDungeon.enemyAtkGrowth
++            : (config != null ? config.enemyAtkGrowth : Tuning.EnemyAtkGrowth);
++        public int EnemyCountBase => ActiveDungeon != null ? ActiveDungeon.enemyCountBase
++            : (config != null ? config.enemyCountBase : Tuning.EnemyCountBase);
++        public int EnemyCountStep => ActiveDungeon != null ? ActiveDungeon.enemyCountStep
++            : (config != null ? config.enemyCountStep : Tuning.EnemyCountStep);
++        public float GoldBase => ActiveDungeon != null ? ActiveDungeon.goldBase
++            : (config != null ? config.goldBase : Tuning.GoldBase);
++        public float GoldGrowth => ActiveDungeon != null ? ActiveDungeon.goldGrowth
++            : (config != null ? config.goldGrowth : Tuning.GoldGrowth);
++        public float FloorClearTimeBase => ActiveDungeon != null ? ActiveDungeon.floorClearTimeBase
++            : (config != null ? config.floorClearTimeBase : Tuning.FloorClearTimeBase);
++        public float FloorClearTimePerFloor => ActiveDungeon != null ? ActiveDungeon.floorClearTimePerFloor
++            : (config != null ? config.floorClearTimePerFloor : Tuning.FloorClearTimePerFloor);
++
++        public void StartRun(List<HeroData> partyData, DungeonDefinition dungeon)
+         {
+             if (partyData == null || partyData.Count == 0)
+             {
+                 Debug.LogWarning("[Run] StartRun called with empty party.");
+                 return;
+             }
++            ActiveDungeon = dungeon;
++            ActiveRule = BuildRuleForDungeon(dungeon, -1);
+             PartyData = new List<HeroData>(partyData);
+             Party.Clear();
+             for (int i = 0; i < partyData.Count; i++) Party.Add(partyData[i].ToStats());
+             CurrentFloor = 0;
++            CurrentTideIndex = -1;
++            FocusEnemyIndex = -1;
+             Gold = 0;
+             State = RunState.Idle;
+-            Debug.Log($"[Run] Started with party of {Party.Count}.");
++            Debug.Log($"[Run] Started dungeon='{dungeon?.id}' party={Party.Count}.");
+         }
+ 
+         // Step-driven flow: caller uses BeginFloor → runs combat itself (tick by tick) → ApplyFloorOutcome.
+@@ -82,7 +105,9 @@ namespace DiverDungeon.Prototype
+             CurrentFloor++;
+             State = RunState.FloorInProgress;
+             FocusEnemyIndex = -1;
+-            return BuildEnemiesForFloor(CurrentFloor);
++            var enemies = BuildEnemiesForFloor(CurrentFloor);
++            ApplyTideForFloor(enemies, CurrentFloor);
++            return enemies;
+         }
+ 
+         public void ApplyFloorOutcome(int[] partyHpAfter, FloorOutcome outcome)
+@@ -138,6 +163,36 @@ namespace DiverDungeon.Prototype
+             return list;
+         }
+ 
++        // Designates the Tide enemy (deterministic) and applies the anchor HP multiplier.
++        // Pure function of (dungeonId, floor, count); preview and real run share this path.
++        void ApplyTideForFloor(List<EnemyStats> enemies, int floor)
++        {
++            int tideIdx = -1;
++            if (ActiveDungeon != null && ActiveDungeon.focusRule == FocusRule.ForcedFocus && enemies.Count > 0)
++            {
++                tideIdx = DungeonRegistry.GetTideIndex(ActiveDungeon.id, floor, enemies.Count);
++                if (tideIdx >= 0 && tideIdx < enemies.Count && ActiveDungeon.anchorEnemyHpMultiplier > 1f)
++                {
++                    var anchor = enemies[tideIdx];
++                    anchor.hp = Mathf.Max(1, Mathf.RoundToInt(anchor.hp * ActiveDungeon.anchorEnemyHpMultiplier));
++                    enemies[tideIdx] = anchor;
++                }
++            }
++            CurrentTideIndex = tideIdx;
++            ActiveRule = BuildRuleForDungeon(ActiveDungeon, tideIdx);
++        }
++
++        static DungeonRule BuildRuleForDungeon(DungeonDefinition d, int tideIdx)
++        {
++            if (d == null) return DungeonRule.Standard;
++            return new DungeonRule
++            {
++                focusRule = d.focusRule,
++                tideEnemyIndex = tideIdx,
++                misFocusDamageMultiplier = d.misFocusDamageMultiplier
++            };
++        }
++
+         public int ComputeFloorGold(int floor)
+         {
+             return Mathf.RoundToInt(GoldBase * Mathf.Pow(GoldGrowth, floor - 1));
+@@ -154,6 +209,7 @@ namespace DiverDungeon.Prototype
+             public int enemyCount;
+             public int enemyHpEach;
+             public int enemyAtkEach;
++            public int tideEnemyIndex;
+             public int projectedHeroesAlive;
+             public int projectedTotalDamageTaken;
+             public int projectedTicks;
+@@ -166,8 +222,27 @@ namespace DiverDungeon.Prototype
+         {
+             int floor = CurrentFloor + 1;
+             var enemies = BuildEnemiesForFloor(floor);
++
++            int tideIdx = -1;
++            DungeonRule previewRule = DungeonRule.Standard;
++            if (ActiveDungeon != null)
++            {
++                if (ActiveDungeon.focusRule == FocusRule.ForcedFocus && enemies.Count > 0)
++                {
++                    tideIdx = DungeonRegistry.GetTideIndex(ActiveDungeon.id, floor, enemies.Count);
++                    if (tideIdx >= 0 && tideIdx < enemies.Count && ActiveDungeon.anchorEnemyHpMultiplier > 1f)
++                    {
++                        var anchor = enemies[tideIdx];
++                        anchor.hp = Mathf.Max(1, Mathf.RoundToInt(anchor.hp * ActiveDungeon.anchorEnemyHpMultiplier));
++                        enemies[tideIdx] = anchor;
++                    }
++                }
++                previewRule = BuildRuleForDungeon(ActiveDungeon, tideIdx);
++            }
++
+             int seed = floor * 1000 + Party.Count;
+-            var sim = CombatResolver.Resolve(Party, enemies, FocusEnemyIndex, seed);
++            int previewFocus = previewRule.focusRule == FocusRule.NoFocus ? -1 : FocusEnemyIndex;
++            var sim = CombatResolver.Resolve(Party, enemies, previewFocus, seed, previewRule);
+ 
+             int alive = 0, totalDmg = 0;
+             for (int i = 0; i < Party.Count; i++)
+@@ -177,11 +252,15 @@ namespace DiverDungeon.Prototype
+                 totalDmg += Mathf.Max(0, Party[i].hp - after);
+             }
+ 
++            int firstEnemyHp = enemies.Count > 0 ? enemies[0].hp : 0;
++            int firstEnemyAtk = enemies.Count > 0 ? enemies[0].atk : 0;
++
+             return new FloorPreview {
+                 floor = floor,
+                 enemyCount = enemies.Count,
+-                enemyHpEach = enemies.Count > 0 ? enemies[0].hp : 0,
+-                enemyAtkEach = enemies.Count > 0 ? enemies[0].atk : 0,
++                enemyHpEach = firstEnemyHp,
++                enemyAtkEach = firstEnemyAtk,
++                tideEnemyIndex = tideIdx,
+                 projectedHeroesAlive = alive,
+                 projectedTotalDamageTaken = totalDmg,
+                 projectedTicks = sim.totalTicks,
+```
+
+### `Assets/Prototype/Scripts/MetaState.cs`
+```diff
+diff --git a/Assets/Prototype/Scripts/MetaState.cs b/Assets/Prototype/Scripts/MetaState.cs
+index df9166e..ce641b9 100644
+--- a/Assets/Prototype/Scripts/MetaState.cs
++++ b/Assets/Prototype/Scripts/MetaState.cs
+@@ -4,27 +4,52 @@ using UnityEngine;
+ 
+ namespace DiverDungeon.Prototype
+ {
++    [Serializable]
++    public class DungeonProgressEntry
++    {
++        public string id;
++        public int deepestFloor;
++    }
++
+     public class MetaState : MonoBehaviour
+     {
+         public static MetaState Instance { get; private set; }
+ 
++        [SerializeField] HeroClassRegistry classRegistry;
++
+         public List<HeroData> roster = new List<HeroData>();
+         public List<int> partyIds = new List<int>();
+         public int metaGold = 0;
+         public int totalRuns = 0;
+-        public int deepestFloor = 0;
++
++        // Per-dungeon meta. Persisted as Lists (JsonUtility-compatible); rebuilt into runtime sets/maps on Load.
++        public List<string> dungeonsUnlocked = new List<string>();
++        public List<DungeonProgressEntry> deepestByDungeon = new List<DungeonProgressEntry>();
++        public List<string> seenJustUnlocked = new List<string>();
++        public List<string> seenDungeonFocusExplanation = new List<string>();
++
++        // Legacy global; retained as derived getter (max across per-dungeon records) so older read sites keep working.
++        public int deepestFloor => MaxDeepestAcrossDungeons();
++
++        public HeroClassRegistry ClassRegistry => classRegistry;
++        public Sprite GetPortrait(int heroId) => classRegistry != null ? classRegistry.GetPortrait(heroId) : null;
++        public GameObject GetPrefab(int heroId) => classRegistry != null ? classRegistry.GetPrefab(heroId) : null;
+ 
+         public const int MaxParty = 4;
+-        public const int LevelUpBaseCost = 50; // L1→L2 cost; each subsequent level costs +base more.
++        public const int LevelUpBaseCost = 50;
+         const string PrefsKey = "DiverDungeon.MetaState.v1";
++        const int CurrentSaveVersion = 2;
+ 
+         public event Action OnGoldChanged;
++        public event Action<string> OnDungeonUnlocked;
+ 
+         void Awake()
+         {
+             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+             Instance = this;
++            if (classRegistry == null) classRegistry = Resources.Load<HeroClassRegistry>("HeroClassRegistry");
+             if (roster.Count == 0) SeedDefaultRoster();
++            EnsureVaultUnlocked();
+             Load();
+         }
+ 
+@@ -33,11 +58,11 @@ namespace DiverDungeon.Prototype
+ 
+         void SeedDefaultRoster()
+         {
+-            roster.Add(BuildHero(1, "Knight", new Color(0.25f, 0.55f, 0.95f), 140, 20, 22, 3, 2));
+-            roster.Add(BuildHero(2, "Rogue",  new Color(0.95f, 0.70f, 0.25f),  90, 12, 30, 4, 1));
+-            roster.Add(BuildHero(3, "Mage",   new Color(0.60f, 0.30f, 0.85f),  80, 10, 28, 5, 1));
+-            roster.Add(BuildHero(4, "Cleric", new Color(0.95f, 0.95f, 0.55f), 110, 16, 14, 2, 3));
+-            roster.Add(BuildHero(5, "Ranger", new Color(0.40f, 0.85f, 0.40f), 100, 14, 20, 3, 2));
++            roster.Add(BuildHero(1, "Knight", new Color(0.25f, 0.55f, 0.95f), 50, 8, 22, 3, 2, AttackType.Melee));
++            roster.Add(BuildHero(2, "Rogue",  new Color(0.95f, 0.70f, 0.25f), 32, 5, 30, 4, 1, AttackType.Melee));
++            roster.Add(BuildHero(3, "Mage",   new Color(0.60f, 0.30f, 0.85f), 28, 4, 28, 5, 1, AttackType.Ranged));
++            roster.Add(BuildHero(4, "Cleric", new Color(0.95f, 0.95f, 0.55f), 40, 6, 14, 2, 3, AttackType.Melee));
++            roster.Add(BuildHero(5, "Ranger", new Color(0.40f, 0.85f, 0.40f), 36, 5, 20, 3, 2, AttackType.Ranged));
+             partyIds.Add(1);
+         }
+ 
+@@ -87,7 +112,6 @@ namespace DiverDungeon.Prototype
+         }
+ 
+         // Linear: cost to go from level L to L+1 = LevelUpBaseCost * L.
+-        // L1→L2 = 50, L2→L3 = 100, L3→L4 = 150, ...
+         public int CostToLevelUp(int heroId)
+         {
+             var h = GetById(heroId);
+@@ -118,36 +142,162 @@ namespace DiverDungeon.Prototype
+             return true;
+         }
+ 
+-        public void RecordRunEnd(int floorReached, int goldBanked)
++        // Atomic run-end: deepest + unlocks + gold + run count update in one block, single Save() before
++        // any UI callback fires. A force-quit between calls cannot half-commit.
++        public void RecordRunEnd(string dungeonId, int floorReached, int goldBanked)
+         {
+             totalRuns++;
+             metaGold += goldBanked;
+-            if (floorReached > deepestFloor) deepestFloor = floorReached;
++            if (!string.IsNullOrEmpty(dungeonId) && floorReached > 0)
++                SetDeepestForDungeon(dungeonId, floorReached);
++            var newlyUnlocked = EvaluateUnlocks();
++            Save();
+             OnGoldChanged?.Invoke();
++            if (newlyUnlocked != null)
++            {
++                for (int i = 0; i < newlyUnlocked.Count; i++)
++                    OnDungeonUnlocked?.Invoke(newlyUnlocked[i]);
++            }
++        }
++
++        public bool IsUnlocked(string dungeonId)
++        {
++            if (string.IsNullOrEmpty(dungeonId)) return false;
++            return dungeonsUnlocked.Contains(dungeonId);
++        }
++
++        public int GetDeepestForDungeon(string dungeonId)
++        {
++            if (string.IsNullOrEmpty(dungeonId)) return 0;
++            for (int i = 0; i < deepestByDungeon.Count; i++)
++                if (deepestByDungeon[i] != null && deepestByDungeon[i].id == dungeonId)
++                    return deepestByDungeon[i].deepestFloor;
++            return 0;
++        }
++
++        void SetDeepestForDungeon(string dungeonId, int floor)
++        {
++            for (int i = 0; i < deepestByDungeon.Count; i++)
++            {
++                if (deepestByDungeon[i] != null && deepestByDungeon[i].id == dungeonId)
++                {
++                    if (floor > deepestByDungeon[i].deepestFloor) deepestByDungeon[i].deepestFloor = floor;
++                    return;
++                }
++            }
++            deepestByDungeon.Add(new DungeonProgressEntry { id = dungeonId, deepestFloor = floor });
++        }
++
++        int MaxDeepestAcrossDungeons()
++        {
++            int max = 0;
++            for (int i = 0; i < deepestByDungeon.Count; i++)
++                if (deepestByDungeon[i] != null && deepestByDungeon[i].deepestFloor > max)
++                    max = deepestByDungeon[i].deepestFloor;
++            return max;
++        }
++
++        // Returns the list of dungeon IDs that flipped from locked → unlocked in this evaluation.
++        // Caller fires OnDungeonUnlocked for each *after* Save() commits, never before.
++        List<string> EvaluateUnlocks()
++        {
++            List<string> newlyUnlocked = null;
++            var all = DungeonRegistry.All;
++            for (int i = 0; i < all.Count; i++)
++            {
++                var d = all[i];
++                if (d == null || string.IsNullOrEmpty(d.id)) continue;
++                if (dungeonsUnlocked.Contains(d.id)) continue;
++                if (UnlockSatisfied(d))
++                {
++                    dungeonsUnlocked.Add(d.id);
++                    if (newlyUnlocked == null) newlyUnlocked = new List<string>();
++                    newlyUnlocked.Add(d.id);
++                }
++            }
++            return newlyUnlocked;
++        }
++
++        bool UnlockSatisfied(DungeonDefinition d)
++        {
++            switch (d.unlockKind)
++            {
++                case UnlockKind.AlwaysUnlocked:
++                    return true;
++                case UnlockKind.ClearFloor:
++                    if (string.IsNullOrEmpty(d.unlockGateDungeonId) || d.unlockGateFloor <= 0) return false;
++                    return GetDeepestForDungeon(d.unlockGateDungeonId) >= d.unlockGateFloor;
++                default:
++                    return false;
++            }
++        }
++
++        public bool IsJustUnlocked(string dungeonId)
++        {
++            if (string.IsNullOrEmpty(dungeonId)) return false;
++            if (!IsUnlocked(dungeonId)) return false;
++            return !seenJustUnlocked.Contains(dungeonId);
++        }
++
++        public void MarkSeenJustUnlocked(string dungeonId)
++        {
++            if (string.IsNullOrEmpty(dungeonId)) return;
++            if (!IsUnlocked(dungeonId)) return;
++            if (seenJustUnlocked.Contains(dungeonId)) return;
++            seenJustUnlocked.Add(dungeonId);
+             Save();
+         }
+ 
++        public bool HasSeenFocusExplanation(string dungeonId)
++        {
++            if (string.IsNullOrEmpty(dungeonId)) return true;
++            return seenDungeonFocusExplanation.Contains(dungeonId);
++        }
++
++        public void MarkSeenFocusExplanation(string dungeonId)
++        {
++            if (string.IsNullOrEmpty(dungeonId)) return;
++            if (seenDungeonFocusExplanation.Contains(dungeonId)) return;
++            seenDungeonFocusExplanation.Add(dungeonId);
++            Save();
++        }
++
++        void EnsureVaultUnlocked()
++        {
++            if (!dungeonsUnlocked.Contains("vault"))
++                dungeonsUnlocked.Add("vault");
++        }
++
+         // ---------------- Persistence ----------------
+ 
+         [Serializable]
+         class SaveBundle
+         {
+-            public int version = 1;
++            public int version = CurrentSaveVersion;
+             public List<HeroData> roster;
+             public List<int> partyIds;
+             public int metaGold;
+             public int totalRuns;
+             public int deepestFloor;
++            public List<string> dungeonsUnlocked;
++            public List<DungeonProgressEntry> deepestByDungeon;
++            public List<string> seenJustUnlocked;
++            public List<string> seenDungeonFocusExplanation;
+         }
+ 
+         public void Save()
+         {
+             var bundle = new SaveBundle {
++                version = CurrentSaveVersion,
+                 roster = roster,
+                 partyIds = partyIds,
+                 metaGold = metaGold,
+                 totalRuns = totalRuns,
+-                deepestFloor = deepestFloor
++                deepestFloor = MaxDeepestAcrossDungeons(),
++                dungeonsUnlocked = dungeonsUnlocked,
++                deepestByDungeon = deepestByDungeon,
++                seenJustUnlocked = seenJustUnlocked,
++                seenDungeonFocusExplanation = seenDungeonFocusExplanation
+             };
+             string json = JsonUtility.ToJson(bundle);
+             PlayerPrefs.SetString(PrefsKey, json);
+@@ -156,15 +306,14 @@ namespace DiverDungeon.Prototype
+ 
+         public void Load()
+         {
+-            if (!PlayerPrefs.HasKey(PrefsKey)) return;
++            if (!PlayerPrefs.HasKey(PrefsKey)) { EnsureVaultUnlocked(); return; }
+             string json = PlayerPrefs.GetString(PrefsKey);
+-            if (string.IsNullOrEmpty(json)) return;
++            if (string.IsNullOrEmpty(json)) { EnsureVaultUnlocked(); return; }
+             try
+             {
+                 var bundle = JsonUtility.FromJson<SaveBundle>(json);
+-                if (bundle == null) return;
++                if (bundle == null) { EnsureVaultUnlocked(); return; }
+ 
+-                // Merge: keep seeded roster's class definitions but overwrite levels from save.
+                 if (bundle.roster != null)
+                 {
+                     for (int i = 0; i < bundle.roster.Count; i++)
+@@ -172,7 +321,7 @@ namespace DiverDungeon.Prototype
+                         var saved = bundle.roster[i];
+                         var live = GetById(saved.id);
+                         if (live != null) live.level = saved.level;
+-                        else roster.Add(saved); // unknown id — keep as-is
++                        else roster.Add(saved);
+                     }
+                 }
+                 if (bundle.partyIds != null && bundle.partyIds.Count > 0)
+@@ -183,14 +332,64 @@ namespace DiverDungeon.Prototype
+                 }
+                 metaGold = bundle.metaGold;
+                 totalRuns = bundle.totalRuns;
+-                deepestFloor = bundle.deepestFloor;
++
++                dungeonsUnlocked = bundle.dungeonsUnlocked != null
++                    ? SanitizeStringList(bundle.dungeonsUnlocked) : new List<string>();
++                deepestByDungeon = bundle.deepestByDungeon != null
++                    ? SanitizeProgressList(bundle.deepestByDungeon) : new List<DungeonProgressEntry>();
++                seenJustUnlocked = bundle.seenJustUnlocked != null
++                    ? SanitizeStringList(bundle.seenJustUnlocked) : new List<string>();
++                seenDungeonFocusExplanation = bundle.seenDungeonFocusExplanation != null
++                    ? SanitizeStringList(bundle.seenDungeonFocusExplanation) : new List<string>();
++
++                if (bundle.version < 2)
++                {
++                    if (bundle.deepestFloor > 0 && GetDeepestForDungeon("vault") < bundle.deepestFloor)
++                        SetDeepestForDungeon("vault", bundle.deepestFloor);
++                }
++
++                EnsureVaultUnlocked();
++                EvaluateUnlocks();
++
+                 OnGoldChanged?.Invoke();
+-                Debug.Log($"[MetaState] Loaded — gold={metaGold} runs={totalRuns} deepest={deepestFloor}");
++                Debug.Log($"[MetaState] Loaded v{bundle.version} → gold={metaGold} runs={totalRuns} unlocked={dungeonsUnlocked.Count}");
+             }
+             catch (Exception e)
+             {
+-                Debug.LogWarning($"[MetaState] Load failed: {e.Message}. Using defaults.");
++                Debug.LogWarning($"[MetaState] Load failed: {e.Message}. Resetting to defaults.");
++                dungeonsUnlocked = new List<string>();
++                deepestByDungeon = new List<DungeonProgressEntry>();
++                seenJustUnlocked = new List<string>();
++                seenDungeonFocusExplanation = new List<string>();
++                EnsureVaultUnlocked();
++            }
++        }
++
++        static List<string> SanitizeStringList(List<string> src)
++        {
++            var dst = new List<string>(src.Count);
++            for (int i = 0; i < src.Count; i++)
++            {
++                var s = src[i];
++                if (string.IsNullOrEmpty(s)) continue;
++                if (dst.Contains(s)) continue;
++                dst.Add(s);
++            }
++            return dst;
++        }
++
++        static List<DungeonProgressEntry> SanitizeProgressList(List<DungeonProgressEntry> src)
++        {
++            var dst = new List<DungeonProgressEntry>(src.Count);
++            var seen = new HashSet<string>();
++            for (int i = 0; i < src.Count; i++)
++            {
++                var e = src[i];
++                if (e == null || string.IsNullOrEmpty(e.id)) continue;
++                if (!seen.Add(e.id)) continue;
++                dst.Add(new DungeonProgressEntry { id = e.id, deepestFloor = Math.Max(0, e.deepestFloor) });
+             }
++            return dst;
+         }
+ 
+         [ContextMenu("Reset Save")]
+@@ -201,8 +400,12 @@ namespace DiverDungeon.Prototype
+             partyIds.Clear();
+             metaGold = 0;
+             totalRuns = 0;
+-            deepestFloor = 0;
++            dungeonsUnlocked = new List<string>();
++            deepestByDungeon = new List<DungeonProgressEntry>();
++            seenJustUnlocked = new List<string>();
++            seenDungeonFocusExplanation = new List<string>();
+             SeedDefaultRoster();
++            EnsureVaultUnlocked();
+             OnGoldChanged?.Invoke();
+             Debug.Log("[MetaState] Save reset.");
+         }
+```
+
+### `Assets/Prototype/Scripts/UIController.cs` (apenas mudanças relevantes — file is 1500+ lines)
+```diff
+diff --git a/Assets/Prototype/Scripts/UIController.cs b/Assets/Prototype/Scripts/UIController.cs
+index a58b4da..10d0a36 100644
+--- a/Assets/Prototype/Scripts/UIController.cs
++++ b/Assets/Prototype/Scripts/UIController.cs
+@@ -7,6 +7,7 @@ namespace DiverDungeon.Prototype
+ {
+     public enum Screen
+     {
++        DungeonSelect,
+         MainMenu,
+         Roster,
+         Combat
+@@ -19,10 +20,18 @@ namespace DiverDungeon.Prototype
+ 
+         Canvas canvas;
+         RectTransform rootRt;
++        RectTransform dungeonSelectPanel;
+         RectTransform mainMenuPanel;
+         RectTransform rosterPanel;
+         RectTransform combatPanel;
+ 
++        DungeonDefinition selectedDungeon;
++        readonly List<DungeonCard> dungeonCards = new List<DungeonCard>();
++        Text dungeonSelectStatus;
++        Text rosterDungeonBanner;
++        Text combatDungeonBanner;
++        Text combatFocusHint;
++
+         // Combat-screen elements
+         Text floorLabel;
+         Text goldLabel;
+@@ -44,6 +53,21 @@ namespace DiverDungeon.Prototype
+         Button menuEnterDungeonBtn;
+         Text menuEnterDungeonLabel;
+ 
++        // Combat speed
++        Button speedButton;
++        Text speedButtonLabel;
++        bool fastSpeedEnabled = false;
++        float SpeedMultiplier => fastSpeedEnabled ? 2f : 1f;
++
++        // Descend/Bank countdown
++        RectTransform descendTimerRoot;
++        Image descendTimerFill;
++        Text descendTimerLabel;
++        Coroutine descendTimerCo;
++        const float DescendDecisionTime = 7f;
++        const float AttackClipLength = 1.8333334f;
++        const float AttackAnimLead = 0.5f;
++
+         // Roster
+         readonly List<RosterCard> rosterCards = new List<RosterCard>();
+         Text rosterPartySummary;
+@@ -54,13 +78,17 @@ namespace DiverDungeon.Prototype
+ 
+         class HeroVisual {
+             public RectTransform root;
+-            public Image sprite;
++            public Graphic sprite;
+             public Image hpFill;
+             public Text hpLabel;
+             public Text nameLabel;
+             public Vector2 homeAnchoredPos;
+             public Color baseColor;
+             public int slot;
++            public GameObject heroInstance;
++            public Camera heroCam;
++            public RenderTexture heroRT;
++            public Animator animator;
+         }
+         class EnemyVisual {
+             public RectTransform root;
+@@ -80,12 +108,28 @@ namespace DiverDungeon.Prototype
+             public Button lvlBtn;
+             public Text lvlBtnLabel;
+         }
++        class DungeonCard {
++            public string dungeonId;
++            public RectTransform root;
++            public Image bg;
++            public Image themeBlock;
++            public Text nameLabel;
++            public Text statusLabel;
++            public Text focusRuleLabel;
++            public Text pressureHintLabel;
++            public Text deepestLabel;
++            public GameObject newBadge;
++            public Button button;
++            public Color baseColor;
++            public Coroutine shakeCo;
++        }
+ 
+         void Awake()
+         {
+             if (run == null) run = FindObjectOfType<RunController>();
+             if (meta == null) meta = FindObjectOfType<MetaState>();
+             BuildCanvas();
++            BuildDungeonSelect();
+             BuildMainMenu();
+             BuildRoster();
+             BuildCombat();
+@@ -96,8 +140,20 @@ namespace DiverDungeon.Prototype
+             run.OnFloorCleared += _ => { /* coroutine-managed */ };
+             run.OnRunBanked += OnRunBanked;
+             run.OnRunWiped += OnRunWiped;
+-            ShowScreen(Screen.MainMenu);
+-            RefreshMainMenu();
++            if (meta != null) meta.OnDungeonUnlocked += OnDungeonUnlocked;
++            EnsureSelectedDungeon();
++            ShowScreen(Screen.DungeonSelect);
++            RefreshDungeonSelect();
++        }
++
++        void OnDestroy()
++        {
++            if (meta != null) meta.OnDungeonUnlocked -= OnDungeonUnlocked;
++        }
++
++        void OnDungeonUnlocked(string dungeonId)
++        {
++            // Refresh cards on next view; nothing to do here besides letting the badge logic surface it.
+         }
+ 
+         // --------------------------------------------------------------------
+@@ -142,6 +198,7 @@ namespace DiverDungeon.Prototype
+         void ShowScreen(Screen s)
+         {
+             currentScreen = s;
++            if (dungeonSelectPanel != null) dungeonSelectPanel.gameObject.SetActive(s == Screen.DungeonSelect);
+             mainMenuPanel.gameObject.SetActive(s == Screen.MainMenu);
+             rosterPanel.gameObject.SetActive(s == Screen.Roster);
+             combatPanel.gameObject.SetActive(s == Screen.Combat);
+@@ -150,6 +207,270 @@ namespace DiverDungeon.Prototype
+         // --------------------------------------------------------------------
+         // Main menu
+         // --------------------------------------------------------------------
++        // --------------------------------------------------------------------
++        // Dungeon Select screen
++        // --------------------------------------------------------------------
++        void BuildDungeonSelect()
++        {
++            dungeonSelectPanel = MakePanel("DungeonSelectPanel");
++
++            var title = MakeText("Title", dungeonSelectPanel, "DIVERDUNGEON", 100, TextAnchor.MiddleCenter);
++            title.color = new Color(0.95f, 0.85f, 0.5f);
++            var tr = title.rectTransform;
++            tr.anchorMin = new Vector2(0.5f, 1f); tr.anchorMax = new Vector2(0.5f, 1f);
++            tr.pivot = new Vector2(0.5f, 1f);
++            tr.anchoredPosition = new Vector2(0, -120);
++            tr.sizeDelta = new Vector2(1000, 140);
++
++            var subtitle = MakeText("Subtitle", dungeonSelectPanel, "Choose a dungeon", 36, TextAnchor.MiddleCenter);
++            subtitle.color = new Color(0.85f, 0.85f, 0.9f);
++            var str2 = subtitle.rectTransform;
++            str2.anchorMin = new Vector2(0.5f, 1f); str2.anchorMax = new Vector2(0.5f, 1f);
++            str2.pivot = new Vector2(0.5f, 1f);
++            str2.anchoredPosition = new Vector2(0, -260);
++            str2.sizeDelta = new Vector2(1000, 50);
++
++            var listGo = new GameObject("DungeonList", typeof(RectTransform));
++            listGo.transform.SetParent(dungeonSelectPanel, false);
++            var list = (RectTransform)listGo.transform;
++            list.anchorMin = new Vector2(0.5f, 1f); list.anchorMax = new Vector2(0.5f, 1f);
++            list.pivot = new Vector2(0.5f, 1f);
++            list.anchoredPosition = new Vector2(0, -340);
++            list.sizeDelta = new Vector2(1000, 1200);
++
++            dungeonCards.Clear();
++            var defs = DungeonRegistry.All;
++            float cardH = 320f, gap = 24f;
++            for (int i = 0; i < defs.Count; i++)
++            {
++                var card = BuildDungeonCard(list, defs[i], new Vector2(0, -i * (cardH + gap)));
++                dungeonCards.Add(card);
++            }
++
++            dungeonSelectStatus = MakeText("MetaStatus", dungeonSelectPanel, "", 30, TextAnchor.MiddleCenter);
++            dungeonSelectStatus.color = new Color(0.85f, 0.85f, 0.9f);
++            var ms = dungeonSelectStatus.rectTransform;
++            ms.anchorMin = new Vector2(0.5f, 0f); ms.anchorMax = new Vector2(0.5f, 0f);
++            ms.pivot = new Vector2(0.5f, 0f);
++            ms.anchoredPosition = new Vector2(0, 220);
++            ms.sizeDelta = new Vector2(1000, 80);
++
++            var manageBtn = MakeButton("ManagePartyBtn", dungeonSelectPanel, "MANAGE PARTY",
++                new Color(0.3f, 0.6f, 0.85f), out _,
++                new Vector2(0, 60), new Vector2(700, 140), anchor: new Vector2(0.5f, 0f));
++            manageBtn.onClick.AddListener(() => {
++                EnsureSelectedDungeon();
++                RefreshRoster();
++                ShowScreen(Screen.Roster);
++            });
++        }
++
++        DungeonCard BuildDungeonCard(RectTransform parent, DungeonDefinition def, Vector2 anchoredPos)
++        {
++            var go = new GameObject($"Dungeon_{def.id}", typeof(RectTransform), typeof(Image));
++            go.transform.SetParent(parent, false);
++            var rt = (RectTransform)go.transform;
++            rt.anchorMin = new Vector2(0.5f, 1f); rt.anchorMax = new Vector2(0.5f, 1f);
++            rt.pivot = new Vector2(0.5f, 1f);
++            rt.anchoredPosition = anchoredPos;
++            rt.sizeDelta = new Vector2(1000, 320);
++            var bg = go.GetComponent<Image>();
++            Color baseColor = new Color(0.18f, 0.18f, 0.22f);
++            bg.color = baseColor;
++
++            var theme = MakeImage("Theme", rt, def.themeColor);
++            var themeRt = theme.rectTransform;
++            themeRt.anchorMin = new Vector2(0f, 0f); themeRt.anchorMax = new Vector2(0f, 1f);
++            themeRt.pivot = new Vector2(0f, 0.5f);
++            themeRt.anchoredPosition = new Vector2(0, 0);
++            themeRt.sizeDelta = new Vector2(180, 0);
++
++            var nameLbl = MakeText("Name", rt, def.displayName, 48, TextAnchor.UpperLeft);
++            nameLbl.color = Color.white;
++            var nlR = nameLbl.rectTransform;
++            nlR.anchorMin = new Vector2(0f, 1f); nlR.anchorMax = new Vector2(1f, 1f);
++            nlR.pivot = new Vector2(0f, 1f);
++            nlR.anchoredPosition = new Vector2(210, -16);
++            nlR.sizeDelta = new Vector2(770, 60);
++
++            var statusLbl = MakeText("Status", rt, "", 26, TextAnchor.UpperLeft);
++            statusLbl.color = new Color(0.85f, 0.85f, 0.95f);
++            var slR = statusLbl.rectTransform;
++            slR.anchorMin = new Vector2(0f, 1f); slR.anchorMax = new Vector2(1f, 1f);
++            slR.pivot = new Vector2(0f, 1f);
++            slR.anchoredPosition = new Vector2(210, -78);
++            slR.sizeDelta = new Vector2(770, 36);
++
++            var focusLbl = MakeText("FocusRule", rt, def.cardFocusRuleText, 24, TextAnchor.UpperLeft);
++            focusLbl.color = new Color(0.95f, 0.85f, 0.5f);
++            var flR = focusLbl.rectTransform;
++            flR.anchorMin = new Vector2(0f, 1f); flR.anchorMax = new Vector2(1f, 1f);
++            flR.pivot = new Vector2(0f, 1f);
++            flR.anchoredPosition = new Vector2(210, -130);
++            flR.sizeDelta = new Vector2(770, 80);
++
++            var pressureLbl = MakeText("PressureHint", rt, def.cardPressureHintText, 24, TextAnchor.UpperLeft);
++            pressureLbl.color = new Color(0.75f, 0.75f, 0.85f);
++            var prR = pressureLbl.rectTransform;
++            prR.anchorMin = new Vector2(0f, 1f); prR.anchorMax = new Vector2(1f, 1f);
++            prR.pivot = new Vector2(0f, 1f);
++            prR.anchoredPosition = new Vector2(210, -210);
++            prR.sizeDelta = new Vector2(770, 60);
++
++            var deepestLbl = MakeText("Deepest", rt, "", 22, TextAnchor.UpperLeft);
++            deepestLbl.color = new Color(0.8f, 0.8f, 0.9f);
++            var dpR = deepestLbl.rectTransform;
++            dpR.anchorMin = new Vector2(0f, 1f); dpR.anchorMax = new Vector2(1f, 1f);
++            dpR.pivot = new Vector2(0f, 1f);
++            dpR.anchoredPosition = new Vector2(210, -270);
++            dpR.sizeDelta = new Vector2(770, 30);
++
++            var newBadge = new GameObject("NewBadge", typeof(RectTransform), typeof(Image));
++            newBadge.transform.SetParent(rt, false);
++            var nbRt = (RectTransform)newBadge.transform;
++            nbRt.anchorMin = new Vector2(1f, 1f); nbRt.anchorMax = new Vector2(1f, 1f);
++            nbRt.pivot = new Vector2(1f, 1f);
++            nbRt.anchoredPosition = new Vector2(-12, -12);
++            nbRt.sizeDelta = new Vector2(110, 44);
++            newBadge.GetComponent<Image>().color = new Color(0.95f, 0.55f, 0.2f);
++            var nbText = MakeText("Lbl", nbRt, "NEW", 22, TextAnchor.MiddleCenter);
++            nbText.color = Color.white;
++            nbText.rectTransform.anchorMin = Vector2.zero; nbText.rectTransform.anchorMax = Vector2.one;
++            nbText.rectTransform.offsetMin = Vector2.zero; nbText.rectTransform.offsetMax = Vector2.zero;
++            newBadge.SetActive(false);
++
++            var btn = go.AddComponent<Button>();
++            btn.targetGraphic = bg;
++            string idCaptured = def.id;
++            btn.onClick.AddListener(() => OnDungeonCardTapped(idCaptured));
++
++            return new DungeonCard {
++                dungeonId = def.id, root = rt, bg = bg, themeBlock = theme, nameLabel = nameLbl,
++                statusLabel = statusLbl, focusRuleLabel = focusLbl, pressureHintLabel = pressureLbl,
++                deepestLabel = deepestLbl, newBadge = newBadge, button = btn, baseColor = baseColor
++            };
++        }
++
++        void OnDungeonCardTapped(string dungeonId)
++        {
++            var def = DungeonRegistry.GetById(dungeonId);
++            if (def == null) return;
++            if (meta != null && !meta.IsUnlocked(dungeonId))
++            {
++                ShakeCard(dungeonId);
++                return;
++            }
++            selectedDungeon = def;
++            if (meta != null && meta.IsJustUnlocked(dungeonId))
++                meta.MarkSeenJustUnlocked(dungeonId);
++            EnsureSelectedDungeon();
++            RefreshRoster();
++            ShowScreen(Screen.Roster);
++        }
++
++        void ShakeCard(string dungeonId)
++        {
++            for (int i = 0; i < dungeonCards.Count; i++)
++            {
++                if (dungeonCards[i].dungeonId == dungeonId)
++                {
++                    if (dungeonCards[i].shakeCo != null) StopCoroutine(dungeonCards[i].shakeCo);
++                    dungeonCards[i].shakeCo = StartCoroutine(ShakeCardRoutine(dungeonCards[i]));
++                    break;
++                }
++            }
++        }
++
++        IEnumerator ShakeCardRoutine(DungeonCard card)
++        {
++            if (card == null || card.root == null) yield break;
++            Vector2 home = card.root.anchoredPosition;
++            float dur = 0.35f;
++            float t = 0f;
++            while (t < dur)
++            {
++                t += Time.deltaTime;
++                float p = t / dur;
++                float ox = Mathf.Sin(p * Mathf.PI * 6f) * (1f - p) * 16f;
++                card.root.anchoredPosition = home + new Vector2(ox, 0);
++                yield return null;
++            }
++            card.root.anchoredPosition = home;
++            card.shakeCo = null;
++        }
++
++        void RefreshDungeonSelect()
++        {
++            for (int i = 0; i < dungeonCards.Count; i++)
++            {
++                var c = dungeonCards[i];
++                var def = DungeonRegistry.GetById(c.dungeonId);
++                if (def == null) continue;
++                bool unlocked = meta != null && meta.IsUnlocked(c.dungeonId);
++                int deepest = meta != null ? meta.GetDeepestForDungeon(c.dungeonId) : 0;
++
++                if (unlocked)
++                {
++                    c.statusLabel.text = "<color=#88dd88>Unlocked</color>";
++                    c.deepestLabel.text = deepest > 0 ? $"Deepest: Floor {deepest}" : "Deepest: —";
++                    c.bg.color = c.baseColor;
++                }
++                else
++                {
++                    c.statusLabel.text = $"<color=#ff8866>Locked — {DescribeUnlockGate(def)}</color>";
++                    c.deepestLabel.text = "";
++                    c.bg.color = new Color(0.10f, 0.10f, 0.12f);
++                }
++
++                bool justUnlocked = meta != null && meta.IsJustUnlocked(c.dungeonId);
++                if (c.newBadge != null) c.newBadge.SetActive(justUnlocked);
++            }
++
++            if (dungeonSelectStatus != null && meta != null)
++            {
++                var party = meta.GetParty();
++                string partyText = party.Count == 0
++                    ? "<color=#ff6464>Party empty — Manage Party first.</color>"
++                    : $"Party: {party.Count}/{MetaState.MaxParty}     Gold: {meta.metaGold}     Runs: {meta.totalRuns}";
++                dungeonSelectStatus.text = partyText;
++            }
++        }
++
++        static string DescribeUnlockGate(DungeonDefinition def)
++        {
++            if (def.unlockKind == UnlockKind.AlwaysUnlocked) return "always";
++            var gate = DungeonRegistry.GetById(def.unlockGateDungeonId);
++            string gateName = gate != null ? gate.displayName : def.unlockGateDungeonId;
++            return $"Clear {gateName} Floor {def.unlockGateFloor}";
++        }
++
++        void EnsureSelectedDungeon()
++        {
++            if (selectedDungeon != null && meta != null && meta.IsUnlocked(selectedDungeon.id))
++                return;
++            var defs = DungeonRegistry.All;
++            for (int i = 0; i < defs.Count; i++)
++            {
++                if (meta != null && meta.IsUnlocked(defs[i].id))
++                {
++                    selectedDungeon = defs[i];
++                    return;
++                }
++            }
++            selectedDungeon = defs.Count > 0 ? defs[0] : null;
++        }
++
++        void UpdateCombatBanner()
++        {
++            if (combatDungeonBanner == null) return;
++            if (selectedDungeon != null)
++            {
++                combatDungeonBanner.text = $"<color=#{ColorUtility.ToHtmlStringRGB(selectedDungeon.themeColor)}>■</color>  " +
++                                           $"<b>{selectedDungeon.displayName}</b>";
++            }
++            else combatDungeonBanner.text = "";
++        }
++
+         void BuildMainMenu()
+         {
+             mainMenuPanel = MakePanel("MainMenuPanel");
+@@ -208,10 +529,14 @@ namespace DiverDungeon.Prototype
+         {
+             var party = meta.GetParty();
+             if (party.Count == 0) return;
+-            run.StartRun(party);
++            EnsureSelectedDungeon();
++            run.StartRun(party, selectedDungeon);
+             BuildHeroVisuals();
+             ShowScreen(Screen.Combat);
++            UpdateCombatBanner();
+             ResetCombatScreen();
++            if (selectedDungeon != null && meta != null && !meta.HasSeenFocusExplanation(selectedDungeon.id))
++                meta.MarkSeenFocusExplanation(selectedDungeon.id);
+         }
+ 
+         // --------------------------------------------------------------------
+@@ -270,7 +595,16 @@ namespace DiverDungeon.Prototype
+             var backBtn = MakeButton("BackBtn", rosterPanel, "BACK",
+                 new Color(0.4f, 0.4f, 0.45f), out _,
+                 new Vector2(260, 180), new Vector2(420, 160), anchor: new Vector2(0.5f, 0f));
+-            backBtn.onClick.AddListener(() => { ShowScreen(Screen.MainMenu); RefreshMainMenu(); });
++            backBtn.onClick.AddListener(() => { ShowScreen(Screen.DungeonSelect); RefreshDungeonSelect(); });
++
++            // Banner showing which dungeon was picked. Driven by RefreshRoster.
++            rosterDungeonBanner = MakeText("DungeonBanner", rosterPanel, "", 28, TextAnchor.MiddleCenter);
++            rosterDungeonBanner.color = new Color(0.85f, 0.85f, 0.95f);
++            var rdb = rosterDungeonBanner.rectTransform;
++            rdb.anchorMin = new Vector2(0.5f, 1f); rdb.anchorMax = new Vector2(0.5f, 1f);
++            rdb.pivot = new Vector2(0.5f, 1f);
++            rdb.anchoredPosition = new Vector2(0, -300);
++            rdb.sizeDelta = new Vector2(1000, 40);
+         }
+ 
+         RosterCard BuildRosterCard(RectTransform parent, HeroData hero, Vector2 anchoredPos)
+@@ -285,13 +619,19 @@ namespace DiverDungeon.Prototype
+             var img = go.GetComponent<Image>();
+             img.color = new Color(0.18f, 0.18f, 0.22f);
+ 
+-            // Hero color square (left)
+-            var sq = MakeImage("ColorBlock", rt, hero.color);
++            // Hero portrait (or color square fallback) on the left
++            var portrait = meta != null ? meta.GetPortrait(hero.id) : null;
++            var sq = MakeImage("ColorBlock", rt, portrait != null ? Color.white : hero.color);
++            if (portrait != null)
++            {
++                sq.sprite = portrait;
++                sq.preserveAspect = true;
++            }
+             var sqRt = sq.rectTransform;
+             sqRt.anchorMin = new Vector2(0f, 0.5f); sqRt.anchorMax = new Vector2(0f, 0.5f);
+             sqRt.pivot = new Vector2(0f, 0.5f);
+             sqRt.anchoredPosition = new Vector2(20, 0);
+-            sqRt.sizeDelta = new Vector2(140, 140);
++            sqRt.sizeDelta = new Vector2(224, 224);
+ 
+             // Name + level
+             var nameTxt = MakeText("Name", rt, hero.heroName, 44, TextAnchor.MiddleLeft);
+@@ -379,6 +719,25 @@ namespace DiverDungeon.Prototype
+             rosterPartySummary.text = $"Selected: {meta.partyIds.Count} / {MetaState.MaxParty}";
+             if (rosterGoldLabel != null) rosterGoldLabel.text = $"GOLD: {meta.metaGold}";
+             rosterBeginBtn.interactable = meta.partyIds.Count > 0;
++            if (rosterDungeonBanner != null)
++            {
++                if (selectedDungeon != null)
++                {
++                    rosterDungeonBanner.text = $"<color=#{ColorUtility.ToHtmlStringRGB(selectedDungeon.themeColor)}>■</color>  " +
++                                               $"<b>{selectedDungeon.displayName}</b>  —  {ShortFocusRuleText(selectedDungeon.focusRule)}";
++                }
++                else rosterDungeonBanner.text = "";
++            }
++        }
++
++        static string ShortFocusRuleText(FocusRule rule)
++        {
++            switch (rule)
++            {
++                case FocusRule.NoFocus: return "no focus";
++                case FocusRule.ForcedFocus: return "forced focus (Tide)";
++                default: return "standard focus";
++            }
+         }
+ 
+         // --------------------------------------------------------------------
+@@ -421,7 +780,7 @@ namespace DiverDungeon.Prototype
+             heroRow.anchorMin = new Vector2(0.5f, 0f); heroRow.anchorMax = new Vector2(0.5f, 0f);
+             heroRow.pivot = new Vector2(0.5f, 0f);
+             heroRow.anchoredPosition = new Vector2(0, 600);
+-            heroRow.sizeDelta = new Vector2(1000, 260);
++            heroRow.sizeDelta = new Vector2(1000, 416);
+ 
+             // Damage layer
+             var damGo = new GameObject("DamageLayer", typeof(RectTransform));
+@@ -446,16 +805,74 @@ namespace DiverDungeon.Prototype
+             prlt.anchoredPosition = new Vector2(0, 380);
+             prlt.sizeDelta = new Vector2(1000, 90);
+ 
+-            // Buttons
++            combatDungeonBanner = MakeText("DungeonBanner", combatPanel, "", 26, TextAnchor.MiddleCenter);
++            combatDungeonBanner.color = new Color(0.9f, 0.9f, 1f);
++            var cdb = combatDungeonBanner.rectTransform;
++            cdb.anchorMin = new Vector2(0.5f, 1f); cdb.anchorMax = new Vector2(0.5f, 1f);
++            cdb.pivot = new Vector2(0.5f, 1f);
++            cdb.anchoredPosition = new Vector2(0, -32);
++            cdb.sizeDelta = new Vector2(1000, 36);
++
++            combatFocusHint = MakeText("FocusHint", combatPanel, "", 22, TextAnchor.MiddleCenter);
++            combatFocusHint.color = new Color(1f, 0.5f, 0.4f);
++            var cfh = combatFocusHint.rectTransform;
++            cfh.anchorMin = new Vector2(0.5f, 1f); cfh.anchorMax = new Vector2(0.5f, 1f);
++            cfh.pivot = new Vector2(0.5f, 1f);
++            cfh.anchoredPosition = new Vector2(0, -68);
++            cfh.sizeDelta = new Vector2(1000, 30);
++
++            // Buttons (BANK on the left, DESCEND on the right)
++            bankButton = MakeButton("BankButton", combatPanel, "BANK",
++                new Color(0.3f, 0.6f, 0.95f), out _,
++                new Vector2(-260, 180), new Vector2(420, 160), anchor: new Vector2(0.5f, 0f));
++            bankButton.onClick.AddListener(OnBankClicked);
++
+             descendButton = MakeButton("DescendButton", combatPanel, "DESCEND",
+                 new Color(0.8f, 0.3f, 0.3f), out descendButtonLabel,
+-                new Vector2(-260, 180), new Vector2(420, 160), anchor: new Vector2(0.5f, 0f));
++                new Vector2(260, 180), new Vector2(420, 160), anchor: new Vector2(0.5f, 0f));
+             descendButton.onClick.AddListener(OnDescendClicked);
+ 
+-            bankButton = MakeButton("BankButton", combatPanel, "BANK",
+-                new Color(0.3f, 0.6f, 0.95f), out _,
+-                new Vector2(260, 180), new Vector2(420, 160), anchor: new Vector2(0.5f, 0f));
+-            bankButton.onClick.AddListener(OnBankClicked);
++            // Descend countdown bar — shows after a floor clears, drains over DescendDecisionTime, then auto-descends
++            var timerGo = new GameObject("DescendTimer", typeof(RectTransform));
++            timerGo.transform.SetParent(combatPanel, false);
++            descendTimerRoot = (RectTransform)timerGo.transform;
++            descendTimerRoot.anchorMin = new Vector2(0.5f, 0f);
++            descendTimerRoot.anchorMax = new Vector2(0.5f, 0f);
++            descendTimerRoot.pivot = new Vector2(0.5f, 0f);
++            descendTimerRoot.anchoredPosition = new Vector2(0, 280);
++            descendTimerRoot.sizeDelta = new Vector2(880, 56);
++
++            var timerBg = MakeImage("Bg", descendTimerRoot, new Color(0.05f, 0.05f, 0.05f, 0.85f));
++            var timerBgRt = timerBg.rectTransform;
++            timerBgRt.anchorMin = Vector2.zero; timerBgRt.anchorMax = Vector2.one;
++            timerBgRt.offsetMin = Vector2.zero; timerBgRt.offsetMax = Vector2.zero;
++            timerBg.raycastTarget = false;
++
++            descendTimerFill = MakeImage("Fill", timerBg.rectTransform, new Color(0.95f, 0.7f, 0.25f));
++            descendTimerFill.raycastTarget = false;
++            var fillRt = descendTimerFill.rectTransform;
++            fillRt.anchorMin = new Vector2(0f, 0f); fillRt.anchorMax = new Vector2(1f, 1f);
++            fillRt.pivot = new Vector2(0f, 0.5f);
++            fillRt.offsetMin = new Vector2(3, 3);
++            fillRt.offsetMax = new Vector2(-3, -3);
++            fillRt.localScale = Vector3.one;
++
++            descendTimerLabel = MakeText("Label", descendTimerRoot, "AUTO DESCEND IN... 7", 28, TextAnchor.MiddleCenter);
++            descendTimerLabel.color = Color.white;
++            descendTimerLabel.raycastTarget = false;
++            descendTimerLabel.rectTransform.anchorMin = Vector2.zero;
++            descendTimerLabel.rectTransform.anchorMax = Vector2.one;
++            descendTimerLabel.rectTransform.offsetMin = Vector2.zero;
++            descendTimerLabel.rectTransform.offsetMax = Vector2.zero;
++
++            descendTimerRoot.gameObject.SetActive(false);
++
++            // 2x speed toggle (top-right)
++            speedButton = MakeButton("SpeedButton", combatPanel, "1x",
++                new Color(0.3f, 0.6f, 0.85f), out speedButtonLabel,
++                new Vector2(-40, -40), new Vector2(160, 100), anchor: new Vector2(1f, 1f));
++            speedButton.onClick.AddListener(ToggleFastSpeed);
++            RefreshSpeedButton();
+ 
+             // Flash overlay (top of combat panel)
+             flashOverlay = MakeImage("FlashOverlay", combatPanel, new Color(1, 0, 0, 0));
+@@ -463,8 +880,32 @@ namespace DiverDungeon.Prototype
+             flashOverlay.raycastTarget = false;
+         }
+ 
++        void ToggleFastSpeed()
++        {
++            fastSpeedEnabled = !fastSpeedEnabled;
++            RefreshSpeedButton();
++        }
++
++        void RefreshSpeedButton()
++        {
++            if (speedButtonLabel != null)
++                speedButtonLabel.text = fastSpeedEnabled ? "2x" : "1x";
++            if (speedButton != null)
++            {
++                var c = speedButton.colors;
++                Color norm = fastSpeedEnabled ? new Color(0.95f, 0.7f, 0.25f) : new Color(0.3f, 0.6f, 0.85f);
++                c.normalColor = norm;
++                c.highlightedColor = Color.Lerp(norm, Color.white, 0.15f);
++                c.pressedColor = Color.Lerp(norm, Color.black, 0.2f);
++                speedButton.colors = c;
++                var img = speedButton.GetComponent<Image>();
++                if (img != null) img.color = norm;
++            }
++        }
++
+         void ResetCombatScreen()
+         {
++            StopDescendTimer();
+             ClearDamageLayer();
+             UpdateCounters();
+             run.ClearFocus();
+@@ -473,27 +914,28 @@ namespace DiverDungeon.Prototype
+             descendButtonLabel.text = "DESCEND";
+             resultLabel.text = $"Press DESCEND to begin Floor 1";
+             previewLabel.text = BuildPreviewLine();
++            if (combatFocusHint != null) combatFocusHint.text = "";
+         }
+ 
+         // Builds hero visuals at the bottom for the active party.
+         void BuildHeroVisuals()
+         {
+             for (int i = heroVisuals.Count - 1; i >= 0; i--)
+-                if (heroVisuals[i].root != null) Destroy(heroVisuals[i].root.gameObject);
++                DisposeHeroVisual(heroVisuals[i]);
+             heroVisuals.Clear();
+ 
+             int n = run.Party.Count;
+             if (n == 0) return;
+             float gap = 30f;
+             float maxW = heroRow.sizeDelta.x;
+-            float each = Mathf.Min(180f, (maxW - gap * (n - 1)) / Mathf.Max(1, n));
++            float each = Mathf.Min(288f, (maxW - gap * (n - 1)) / Mathf.Max(1, n));
+             float total = each * n + gap * (n - 1);
+             float startX = -total / 2f + each / 2f;
+ 
+             for (int i = 0; i < n; i++)
+             {
+                 var hd = run.PartyData[i];
+-                var go = new GameObject($"Hero{i}", typeof(RectTransform), typeof(Image));
++                var go = new GameObject($"Hero{i}", typeof(RectTransform));
+                 go.transform.SetParent(heroRow, false);
+                 var rt = (RectTransform)go.transform;
+                 rt.anchorMin = new Vector2(0.5f, 0.5f); rt.anchorMax = new Vector2(0.5f, 0.5f);
+@@ -501,23 +943,78 @@ namespace DiverDungeon.Prototype
+                 Vector2 home = new Vector2(startX + i * (each + gap), 0);
+                 rt.anchoredPosition = home;
+                 rt.sizeDelta = new Vector2(each, each);
+-                var img = go.GetComponent<Image>();
+-                img.color = hd.color;
+ 
+-                // Name label inside square
+-                var nm = MakeText("Name", rt, hd.heroName.ToUpperInvariant(), 26, TextAnchor.MiddleCenter);
++                Graphic heroGraphic = null;
++                GameObject heroInstance = null;
++                Camera heroCam = null;
++                RenderTexture heroRT = null;
++                Animator heroAnim = null;
++
++                var prefabSrc = meta != null ? meta.GetPrefab(hd.id) : null;
++                if (prefabSrc != null)
++                {
++                    Vector3 stagePos = new Vector3(1000f + i * 10f, 0f, 0f);
++                    heroInstance = Instantiate(prefabSrc, stagePos, Quaternion.identity);
++                    heroInstance.name = $"HeroStage_{hd.heroName}_{i}";
++
++                    heroRT = new RenderTexture(256, 256, 16, RenderTextureFormat.ARGB32);
++                    heroRT.antiAliasing = 2;
++                    heroRT.Create();
++
++                    var camGo = new GameObject($"HeroCam_{i}");
++                    camGo.transform.position = stagePos + new Vector3(0f, 0.85f, -10f);
++                    heroCam = camGo.AddComponent<Camera>();
++                    heroCam.orthographic = true;
++                    heroCam.orthographicSize = 1.65f;
++                    heroCam.clearFlags = CameraClearFlags.SolidColor;
++                    heroCam.backgroundColor = new Color(0f, 0f, 0f, 0f);
++                    heroCam.cullingMask = 1 << 0;
++                    heroCam.targetTexture = heroRT;
++                    heroCam.nearClipPlane = 0.1f;
++                    heroCam.farClipPlane = 100f;
++
++                    heroAnim = heroInstance.GetComponentInChildren<Animator>();
++                    if (heroAnim != null) heroAnim.Play("Idle");
++
++                    var raw = go.AddComponent<RawImage>();
++                    raw.texture = heroRT;
++                    raw.color = Color.white;
++                    raw.raycastTarget = false;
++                    heroGraphic = raw;
++                }
++                else
++                {
++                    var img = go.AddComponent<Image>();
++                    var portrait = meta != null ? meta.GetPortrait(hd.id) : null;
++                    if (portrait != null)
++                    {
++                        img.sprite = portrait;
++                        img.preserveAspect = true;
++                        img.color = Color.white;
++                    }
++                    else
++                    {
++                        img.color = hd.color;
++                    }
++                    heroGraphic = img;
++                }
++
++                // Name + level under the character (below the HP bar)
++                var nm = MakeText("Name", rt, hd.heroName.ToUpperInvariant(), 24, TextAnchor.MiddleCenter);
+                 nm.color = Color.white;
+-                nm.rectTransform.anchorMin = new Vector2(0, 0.55f);
+-                nm.rectTransform.anchorMax = new Vector2(1, 0.95f);
+-                nm.rectTransform.offsetMin = Vector2.zero;
+-                nm.rectTransform.offsetMax = Vector2.zero;
++                var nmRt = nm.rectTransform;
++                nmRt.anchorMin = new Vector2(0f, 0f); nmRt.anchorMax = new Vector2(1f, 0f);
++                nmRt.pivot = new Vector2(0.5f, 1f);
++                nmRt.anchoredPosition = new Vector2(0, -40);
++                nmRt.sizeDelta = new Vector2(0, 30);
+ 
+-                var lvl = MakeText("Lvl", rt, $"L{hd.level}", 22, TextAnchor.MiddleCenter);
++                var lvl = MakeText("Lvl", rt, $"L{hd.level}", 20, TextAnchor.MiddleCenter);
+                 lvl.color = new Color(1f, 1f, 1f, 0.85f);
+-                lvl.rectTransform.anchorMin = new Vector2(0, 0.20f);
+-                lvl.rectTransform.anchorMax = new Vector2(1, 0.50f);
+-                lvl.rectTransform.offsetMin = Vector2.zero;
+-                lvl.rectTransform.offsetMax = Vector2.zero;
++                var lvlRt = lvl.rectTransform;
++                lvlRt.anchorMin = new Vector2(0f, 0f); lvlRt.anchorMax = new Vector2(1f, 0f);
++                lvlRt.pivot = new Vector2(0.5f, 1f);
++                lvlRt.anchoredPosition = new Vector2(0, -72);
++                lvlRt.sizeDelta = new Vector2(0, 24);
+ 
+                 // HP bar under sprite
+                 var hpBg = MakeImage("HpBg", rt, new Color(0.05f, 0.05f, 0.05f));
+@@ -528,28 +1025,39 @@ namespace DiverDungeon.Prototype
+                 hpBgRt.sizeDelta = new Vector2(0, 26);
+ 
+                 var hpFill = MakeImage("HpFill", hpBg.rectTransform, new Color(0.2f, 0.85f, 0.3f));
+-                hpFill.type = Image.Type.Filled;
+-                hpFill.fillMethod = Image.FillMethod.Horizontal;
+-                hpFill.fillAmount = 1f;
++                hpFill.raycastTarget = false;
+                 var hpFillRt = hpFill.rectTransform;
+-                hpFillRt.anchorMin = Vector2.zero; hpFillRt.anchorMax = Vector2.one;
++                hpFillRt.anchorMin = new Vector2(0f, 0f); hpFillRt.anchorMax = new Vector2(1f, 1f);
++                hpFillRt.pivot = new Vector2(0f, 0.5f);
+                 hpFillRt.offsetMin = new Vector2(3, 3);
+                 hpFillRt.offsetMax = new Vector2(-3, -3);
++                hpFillRt.localScale = Vector3.one;
+ 
+                 var hpLbl = MakeText("HpLbl", hpBg.rectTransform, $"{hd.MaxHp}/{hd.MaxHp}", 20, TextAnchor.MiddleCenter);
+                 hpLbl.rectTransform.anchorMin = Vector2.zero; hpLbl.rectTransform.anchorMax = Vector2.one;
+                 hpLbl.rectTransform.offsetMin = Vector2.zero; hpLbl.rectTransform.offsetMax = Vector2.zero;
+ 
+                 heroVisuals.Add(new HeroVisual {
+-                    root = rt, sprite = img, hpFill = hpFill, hpLabel = hpLbl, nameLabel = nm,
+-                    homeAnchoredPos = home, baseColor = hd.color, slot = i
++                    root = rt, sprite = heroGraphic, hpFill = hpFill, hpLabel = hpLbl, nameLabel = nm,
++                    homeAnchoredPos = home, baseColor = heroGraphic != null ? heroGraphic.color : Color.white, slot = i,
++                    heroInstance = heroInstance, heroCam = heroCam, heroRT = heroRT, animator = heroAnim
+                 });
+             }
+         }
+ 
++        void DisposeHeroVisual(HeroVisual hv)
++        {
++            if (hv == null) return;
++            if (hv.heroCam != null) Destroy(hv.heroCam.gameObject);
++            if (hv.heroInstance != null) Destroy(hv.heroInstance);
++            if (hv.heroRT != null) { hv.heroRT.Release(); Destroy(hv.heroRT); }
++            if (hv.root != null) Destroy(hv.root.gameObject);
++        }
++
+         void OnDescendClicked()
+         {
+             if (isPlayingFloor) return;
++            StopDescendTimer();
+             ClearDamageLayer();
+             var enemies = run.BeginFloor();
+             BuildEnemyVisuals(enemies);
+@@ -562,9 +1070,59 @@ namespace DiverDungeon.Prototype
+         void OnBankClicked()
+         {
+             if (isPlayingFloor) return;
++            StopDescendTimer();
+             run.Bank();
+         }
+ 
++        void StartDescendTimer()
++        {
++            StopDescendTimer();
++            if (descendTimerRoot == null) return;
++            descendTimerRoot.gameObject.SetActive(true);
++            if (descendTimerFill != null)
++                descendTimerFill.rectTransform.localScale = Vector3.one;
++            if (descendTimerLabel != null)
++                descendTimerLabel.text = $"AUTO DESCEND IN... {Mathf.CeilToInt(DescendDecisionTime)}";
++            descendTimerCo = StartCoroutine(DescendTimerRoutine());
++        }
++
++        void StopDescendTimer()
++        {
++            if (descendTimerCo != null)
++            {
++                StopCoroutine(descendTimerCo);
++                descendTimerCo = null;
++            }
++            if (descendTimerRoot != null) descendTimerRoot.gameObject.SetActive(false);
++        }
++
++        IEnumerator DescendTimerRoutine()
++        {
++            float remaining = DescendDecisionTime;
++            int lastShown = -1;
++            while (remaining > 0f)
++            {
++                remaining -= Time.deltaTime;
++                if (descendTimerFill != null)
++                {
++                    float t = Mathf.Clamp01(remaining / DescendDecisionTime);
++                    descendTimerFill.rectTransform.localScale = new Vector3(t, 1f, 1f);
++                }
++                int secs = Mathf.Max(0, Mathf.CeilToInt(remaining));
++                if (secs != lastShown)
++                {
++                    lastShown = secs;
++                    if (descendTimerLabel != null)
++                        descendTimerLabel.text = $"AUTO DESCEND IN... {secs}";
++                }
++                yield return null;
++            }
++            descendTimerCo = null;
++            if (descendTimerRoot != null) descendTimerRoot.gameObject.SetActive(false);
++            if (descendButton != null && descendButton.interactable)
++                OnDescendClicked();
++        }
++
+         void ClearDamageLayer()
+         {
+             for (int i = damageLayer.childCount - 1; i >= 0; i--)
+@@ -621,6 +1179,7 @@ namespace DiverDungeon.Prototype
+                 btn.onClick.AddListener(() => {
+                     if (!isPlayingFloor) return;
+                     if (captured >= enemyVisuals.Count) return;
++                    if (run.ActiveRule.focusRule == FocusRule.NoFocus) return;
+                     // Don't allow focusing a dead enemy.
+                     var color = enemyVisuals[captured].sprite != null ? enemyVisuals[captured].sprite.color : Color.white;
+                     if (color.a < 0.5f) return;
+@@ -628,9 +1187,18 @@ namespace DiverDungeon.Prototype
+                     UpdateFocusVisuals();
+                 });
+ 
++                Color thisEnemyBase = enemyBase;
++                if (run.ActiveRule.focusRule == FocusRule.ForcedFocus && i == run.CurrentTideIndex)
++                {
++                    thisEnemyBase = new Color(0.18f, 0.55f, 0.85f);  // tide blue
++                    img.color = thisEnemyBase;
++                    ring.color = new Color(0.4f, 0.85f, 1f, 1f);     // tide-marker glow
++                    ring.gameObject.SetActive(true);
++                }
++
+                 enemyVisuals.Add(new EnemyVisual {
+                     root = rt, sprite = img, hpLabel = hpText, focusRing = ring, hpStart = enemies[i].hp,
+-                    homeAnchoredPos = home, baseColor = enemyBase
++                    homeAnchoredPos = home, baseColor = thisEnemyBase
+                 });
+             }
+         }
+@@ -638,11 +1206,16 @@ namespace DiverDungeon.Prototype
+         void UpdateFocusVisuals()
+         {
+             int focus = run.FocusEnemyIndex;
++            int tide = run.ActiveRule.focusRule == FocusRule.ForcedFocus ? run.CurrentTideIndex : -1;
+             for (int i = 0; i < enemyVisuals.Count; i++)
+             {
+                 var ev = enemyVisuals[i];
+                 if (ev.focusRing == null) continue;
+-                ev.focusRing.gameObject.SetActive(i == focus);
++                bool isFocus = i == focus;
++                bool isTide = i == tide;
++                ev.focusRing.gameObject.SetActive(isFocus || isTide);
++                if (isFocus) ev.focusRing.color = new Color(1f, 0.85f, 0.2f, 1f);
++                else if (isTide) ev.focusRing.color = new Color(0.4f, 0.85f, 1f, 1f);
+             }
+         }
+ 
+@@ -664,10 +1237,11 @@ namespace DiverDungeon.Prototype
+                 if (i < enemyVisuals.Count && enemyVisuals[i].hpLabel != null)
+                     enemyVisuals[i].hpLabel.text = enemies[i].hp.ToString();
+ 
+-            const float perTick = 0.65f; // 0.5s × 1.3 — combat 30% slower
++            const float basePerTick = 0.845f; // 0.65s × 1.3 — additional 30% slower
+ 
+             while (AnyAliveHero(heroes) && AnyAliveEnemy(enemies))
+             {
++                float perTick = basePerTick / SpeedMultiplier;
+                 // Hero side — each hero independently picks: focus (if alive) else random alive enemy
+                 for (int hi = 0; hi < heroes.Count; hi++)
+                 {
+@@ -683,8 +1257,22 @@ namespace DiverDungeon.Prototype
+ 
+                     var hv = heroVisuals[hi];
+                     var ev = enemyVisuals[targetIdx];
++                    bool heroRanged = heroes[hi].attackType == AttackType.Ranged;
++                    if (hv.animator != null)
++                    {
++                        float animWindow = perTick + AttackAnimLead;
++                        hv.animator.speed = animWindow > 0f ? AttackClipLength / animWindow : 1f;
++                        hv.animator.Play("attack", 0, 0f);
++                        yield return new WaitForSeconds(AttackAnimLead);
++                    }
+                     yield return PlayAttack(hv.root, hv.homeAnchoredPos, ev.root, ev.homeAnchoredPos,
+-                        ev.sprite, ev.baseColor, dmg, false, perTick);
++                        ev.sprite, ev.baseColor, dmg, false, perTick,
++                        heroRanged, hv.sprite, hv.baseColor);
++                    if (hv.animator != null)
++                    {
++                        hv.animator.speed = 1f;
++                        if (heroes[hi].hp > 0) hv.animator.Play("Idle", 0, 0f);
++                    }
+ 
+                     if (enemies[targetIdx].hp <= 0)
+                     {
+@@ -700,6 +1288,22 @@ namespace DiverDungeon.Prototype
+                 }
+                 if (!AnyAliveEnemy(enemies)) break;
+ 
++                // Mis-focus penalty for the upcoming enemy salvo: if Tide is alive and player isn't focusing it,
++                // every enemy hit on this round scales by misFocusDamageMultiplier.
++                var rule = run.ActiveRule;
++                bool tideAlive = rule.focusRule == FocusRule.ForcedFocus
++                                 && rule.tideEnemyIndex >= 0
++                                 && rule.tideEnemyIndex < enemies.Count
++                                 && enemies[rule.tideEnemyIndex].hp > 0;
++                bool misFocus = tideAlive && run.FocusEnemyIndex != rule.tideEnemyIndex;
++                float dmgMult = misFocus ? rule.misFocusDamageMultiplier : 1f;
++                if (combatFocusHint != null)
++                {
++                    if (misFocus) combatFocusHint.text = "Mis-focus penalty active";
++                    else if (rule.focusRule == FocusRule.ForcedFocus) combatFocusHint.text = "Focusing the Tide enemy";
++                    else combatFocusHint.text = "";
++                }
++
+                 // Enemy side — each enemy independently picks a random alive hero.
+                 for (int ei = 0; ei < enemies.Count; ei++)
+                 {
+@@ -717,17 +1321,23 @@ namespace DiverDungeon.Prototype
+                     }
+                     if (targetIdx < 0) break;
+ 
+-                    int dmg = System.Math.Max(1, enemies[ei].atk - heroes[targetIdx].def);
++                    int rawDmg = System.Math.Max(1, enemies[ei].atk - heroes[targetIdx].def);
++                    int dmg = System.Math.Max(1, Mathf.RoundToInt(rawDmg * dmgMult));
+                     var h = heroes[targetIdx]; h.hp = System.Math.Max(0, h.hp - dmg); heroes[targetIdx] = h;
+                     UpdateHeroHpBar(targetIdx, heroes[targetIdx].hp, heroes[targetIdx].maxHp);
+ 
+                     var ev = enemyVisuals[ei];
+                     var hv = heroVisuals[targetIdx];
++                    bool enemyRanged = enemies[ei].attackType == AttackType.Ranged;
+                     yield return PlayAttack(ev.root, ev.homeAnchoredPos, hv.root, hv.homeAnchoredPos,
+-                        hv.sprite, hv.baseColor, dmg, true, perTick);
++                        hv.sprite, hv.baseColor, dmg, true, perTick,
++                        enemyRanged, ev.sprite, ev.baseColor);
+ 
+-                    if (heroes[targetIdx].hp <= 0 && hv.sprite != null)
+-                        hv.sprite.color = new Color(0.25f, 0.25f, 0.30f, 0.45f);
++                    if (heroes[targetIdx].hp <= 0)
++                    {
++                        if (hv.sprite != null) hv.sprite.color = new Color(0.25f, 0.25f, 0.30f, 0.45f);
++                        if (hv.animator != null) hv.animator.Play("Defeat", 0, 0f);
++                    }
+                 }
+             }
+ 
+@@ -741,6 +1351,7 @@ namespace DiverDungeon.Prototype
+             for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
+                 UpdateHeroHpBar(i, run.Party[i].hp, run.Party[i].maxHp);
+ 
++            StopDescendTimer();
+             if (outcome == FloorOutcome.Wiped)
+             {
+                 yield return Flash(new Color(1, 0, 0, 0.6f));
+@@ -748,7 +1359,7 @@ namespace DiverDungeon.Prototype
+                 previewLabel.text = "";
+                 descendButtonLabel.text = "RETURN";
+                 descendButton.onClick.RemoveAllListeners();
+-                descendButton.onClick.AddListener(ReturnToMainMenu);
++                descendButton.onClick.AddListener(ReturnToDungeonSelect);
+                 descendButton.interactable = true;
+                 bankButton.interactable = false;
+             }
+@@ -761,6 +1372,7 @@ namespace DiverDungeon.Prototype
+                 descendButton.onClick.AddListener(OnDescendClicked);
+                 descendButton.interactable = true;
+                 bankButton.interactable = true;
++                StartDescendTimer();
+             }
+ 
+             isPlayingFloor = false;
+@@ -778,16 +1390,53 @@ namespace DiverDungeon.Prototype
+         }
+ 
+         IEnumerator PlayAttack(RectTransform actor, Vector2 actorHome,
+-            RectTransform target, Vector2 targetHome, Image targetImg, Color targetBase,
+-            int dmg, bool targetIsHero, float slice)
++            RectTransform target, Vector2 targetHome, Graphic targetImg, Color targetBase,
++            int dmg, bool targetIsHero, float slice,
++            bool ranged = false, Graphic actorImg = null, Color actorBase = default)
+         {
+             if (slice <= 0f) slice = 0.5f;
+-            float lungeOut = Mathf.Min(0.195f, slice * 0.27f); // tackle 20% slower (1.2× v1)
+-            float actorBack = Mathf.Min(0.18f, slice * 0.22f);
++            float lungeOut = Mathf.Min(0.2535f, slice * 0.351f); // tackle additional 30% slower
++            float actorBack = Mathf.Min(0.234f, slice * 0.286f);
+             float pause = Mathf.Min(0.04f, slice * 0.05f);
+             float remaining = Mathf.Max(0f, slice - lungeOut - actorBack - pause);
+             float targetRecover = remaining;
+ 
++            if (ranged)
++            {
++                // Ranged: actor stands still and blinks white, target reacts as if hit.
++                float blink = Mathf.Min(0.18f, slice * 0.25f);
++                float windup = Mathf.Max(0f, lungeOut - blink * 0.5f);
++                if (windup > 0f) yield return new WaitForSeconds(windup);
++
++                if (actorImg != null) actorImg.color = Color.white;
++                if (targetImg != null) targetImg.color = new Color(1f, 0.15f, 0.15f, 1f);
++                if (target != null)
++                {
++                    SpawnDamageNumber(target.position, dmg, targetIsHero ? new Color(1f, 0.4f, 0.4f) : Color.white);
++                    target.anchoredPosition = targetHome + Vector2.zero;  // no push for ranged
++                    target.localScale = new Vector3(0.86f, 0.86f, 1f);
++                }
++                if (blink > 0f) yield return new WaitForSeconds(blink);
++                if (actorImg != null) actorImg.color = actorBase;
++
++                if (pause > 0f) yield return new WaitForSeconds(pause);
++
++                float t2 = 0f;
++                while (t2 < targetRecover && target != null)
++                {
++                    t2 += Time.deltaTime;
++                    float p = Mathf.Clamp01(t2 / targetRecover);
++                    float u = 1f - p; float pp = 1f - u * u * u;
++                    target.localScale = Vector3.LerpUnclamped(new Vector3(0.86f, 0.86f, 1f), Vector3.one, pp);
++                    if (targetImg != null)
++                        targetImg.color = Color.Lerp(new Color(1f, 0.5f, 0.5f, 1f), targetBase, pp);
++                    yield return null;
++                }
++                if (target != null) { target.anchoredPosition = targetHome; target.localScale = Vector3.one; }
++                if (targetImg != null) targetImg.color = targetBase;
++                yield break;
++            }
++
+             Vector2 lungeOffset = Vector2.zero;
+             Vector2 pushOffset = Vector2.zero;
+             if (actor != null && target != null)
+@@ -864,13 +1513,13 @@ namespace DiverDungeon.Prototype
+ 
+         void OnRunBanked(int floor, int gold)
+         {
+-            meta.RecordRunEnd(floor, gold);
++            meta.RecordRunEnd(run.ActiveDungeon != null ? run.ActiveDungeon.id : null, floor, gold);
+             StartCoroutine(BankFlash(floor, gold));
+         }
+ 
+         void OnRunWiped(int floor, int gold)
+         {
+-            meta.RecordRunEnd(floor, 0);
++            meta.RecordRunEnd(run.ActiveDungeon != null ? run.ActiveDungeon.id : null, floor, 0);
+         }
+ 
+         IEnumerator BankFlash(int f, int g)
+@@ -879,7 +1528,7 @@ namespace DiverDungeon.Prototype
+             resultLabel.text = $"BANKED at floor {f} for {g} gold.";
+             descendButtonLabel.text = "RETURN";
+             descendButton.onClick.RemoveAllListeners();
+-            descendButton.onClick.AddListener(ReturnToMainMenu);
++            descendButton.onClick.AddListener(ReturnToDungeonSelect);
+             descendButton.interactable = true;
+             bankButton.interactable = false;
+         }
+@@ -900,13 +1549,25 @@ namespace DiverDungeon.Prototype
+ 
+         void ReturnToMainMenu()
+         {
+-            // Restore default DESCEND listener for next run.
++            StopDescendTimer();
+             descendButton.onClick.RemoveAllListeners();
+             descendButton.onClick.AddListener(OnDescendClicked);
+             ShowScreen(Screen.MainMenu);
+             RefreshMainMenu();
+         }
+ 
++        void ReturnToDungeonSelect()
++        {
++            StopDescendTimer();
++            descendButton.onClick.RemoveAllListeners();
++            descendButton.onClick.AddListener(OnDescendClicked);
++            // Mark "New" badge cleared if this run was on a just-unlocked dungeon.
++            if (run != null && run.ActiveDungeon != null && meta != null)
++                meta.MarkSeenJustUnlocked(run.ActiveDungeon.id);
++            ShowScreen(Screen.DungeonSelect);
++            RefreshDungeonSelect();
++        }
++
+         void SpawnDamageNumber(Vector3 worldPos, int dmg, Color color)
+         {
+             var go = new GameObject("DamageNumber", typeof(RectTransform), typeof(Text));
+@@ -962,8 +1623,12 @@ namespace DiverDungeon.Prototype
+         void UpdateHeroHpBar(int slot, int hp, int max)
+         {
+             if (slot >= heroVisuals.Count) return;
+-            heroVisuals[slot].hpFill.fillAmount = max > 0 ? (float)hp / max : 0f;
+-            heroVisuals[slot].hpLabel.text = $"{hp}/{max}";
++            float t = max > 0 ? Mathf.Clamp01((float)hp / max) : 0f;
++            var hv = heroVisuals[slot];
++            if (hv.hpFill != null)
++                hv.hpFill.rectTransform.localScale = new Vector3(t, 1f, 1f);
++            if (hv.hpLabel != null)
++                hv.hpLabel.text = $"{hp}/{max}";
+         }
+ 
+         // --------------------------------------------------------------------
+```

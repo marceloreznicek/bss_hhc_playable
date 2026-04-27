@@ -1,0 +1,276 @@
+# PRÉ-CODE — HeroMerge v0.3 (4 fixes na mecânica de grid-merge)
+
+## TAREFA
+
+A v0.2 do HeroMerge tem um grid 4×2 onde o player tapeia SUMMON pra
+adicionar Tier-1 e arrasta uma célula em cima de outra de mesmo tier
+pra mesclar (2-of-a-kind → tier+1). O player pediu **4 mudanças** pra
+v0.3:
+
+1. **3-of-a-kind**: merge agora exige 3 unidades do mesmo tier, não 2.
+2. **Adjacência obrigatória**: a unidade arrastada precisa ser solta em
+   cima de outra que esteja **lado a lado** com uma terceira de mesmo
+   tier — em outras palavras, o cluster final precisa ter pelo menos 2
+   das 3 células geometricamente adjacentes (compartilhando borda
+   horizontal ou vertical no grid 4×2).
+3. **Pulsing magnetic pull**: enquanto arrasta, mostrar visualmente
+   QUAIS 3 células serão consumidas. Não apenas highlight — animação de
+   "pull" pulsante (escala/glow/shake) nas células do cluster que vai
+   ser mergeado, atualizada em tempo real conforme o dedo se move.
+4. **Não overconsume**: se houver MAIS de 3 do mesmo tier disponíveis
+   (ex: 4 Tier-1s no grid), o merge deve consumir EXATAMENTE 3 (a
+   arrastada + as 2 melhores candidatas). Sobra 1 intacta no grid. Em 5,
+   sobra 2. Etc.
+5. **Drag offset bug**: hoje o ghost que segue o dedo aparece **deslocado
+   pra esquerda** porque o `#drag-ghost` usa `position: absolute` dentro
+   de `#bottom-panel` mas o CSS `transform: translate(-50%, -50%) scale(1.15)`
+   roda DEPOIS do `left/top`, e o `top: 1000px` de `#bottom-panel` mais o
+   reflow dá um offset visual. Resultado: o sprite arrastado aparece à
+   esquerda do dedo, não centralizado. Precisa ficar exatamente embaixo do dedo.
+
+Vocês são 8 IAs. Apontem:
+- Edge cases na lógica de "escolher 2 vizinhas + a arrastada"
+- Race conditions entre o pulse animation e o pointermove
+- Bugs prováveis na seleção de "melhores candidatas" (qual critério? distância? índice? dist Manhattan adjacente?)
+- Riscos no offset do ghost (transform-origin? CSS specificity? scale × translate ordering?)
+- Qualquer pegadinha de UX (jogador vê 4 pulsando, escolhe arrastar, e só 3 mesclam — confunde?)
+- Soluções alternativas
+
+Restrição: ES5-ish JS, sem novas dependências, mudança mínima.
+
+---
+
+## CONTEXTO ATUAL — HEROMERGE v0.2
+
+Grid 4×2 = 8 cells, indexadas 0..7:
+```
+[0] [1] [2] [3]
+[4] [5] [6] [7]
+```
+Adjacência (compartilha borda):
+- 0 ↔ 1, 4   |   1 ↔ 0, 2, 5   |   2 ↔ 1, 3, 6   |   3 ↔ 2, 7
+- 4 ↔ 0, 5   |   5 ↔ 1, 4, 6   |   6 ↔ 2, 5, 7   |   7 ↔ 3, 6
+
+`STATE.grid: Array(8)` — cada cell é `{tier: 1..5}` ou `null`.
+
+## CÓDIGO ATUAL (que vai ser modificado)
+
+### `tryMergeCells` — versão atual (2-of-a-kind)
+```js
+function tryMergeCells(srcIdx, dstIdx) {
+  if (srcIdx === dstIdx) return false;
+  var s = STATE.grid[srcIdx], d = STATE.grid[dstIdx];
+  if (!s || !d) return false;
+  if (s.tier !== d.tier) return false;
+  if (s.tier >= 5) return false;
+  STATE.grid[dstIdx] = { tier: s.tier + 1 };
+  STATE.grid[srcIdx] = null;
+  STATE.mergesCompleted++;
+  playSFX('unlock');
+  spawnGridFlash(dstIdx);
+  return true;
+}
+```
+
+### `highlightMatches` — versão atual (todas as células de mesmo tier)
+```js
+function highlightMatches(srcIdx, on) {
+  var src = STATE.grid[srcIdx];
+  var cells = document.querySelectorAll('.grid-cell');
+  for (var i = 0; i < cells.length; i++) {
+    var idx = parseInt(cells[i].getAttribute('data-idx'), 10);
+    if (idx === srcIdx) continue;
+    var u = STATE.grid[idx];
+    if (on && src && u && u.tier === src.tier) cells[i].classList.add('match');
+    else cells[i].classList.remove('match');
+  }
+}
+```
+
+### `showDragGhost` / `moveDragGhost` — versão com bug de offset
+```js
+function showDragGhost(srcIdx, clientX, clientY) {
+  var ghost = document.getElementById('drag-ghost');
+  // ... popula <img>
+  ghost.classList.add('show');
+  moveDragGhost(clientX, clientY);
+}
+function moveDragGhost(clientX, clientY) {
+  var ghost = document.getElementById('drag-ghost');
+  var panel = document.getElementById('bottom-panel');
+  var pr = panel.getBoundingClientRect();
+  ghost.style.left = (clientX - pr.left) + 'px';
+  ghost.style.top  = (clientY - pr.top)  + 'px';
+}
+```
+
+### CSS atual do ghost
+```css
+#drag-ghost {
+  position: absolute;
+  display: none;
+  width: 200px; height: 200px;
+  pointer-events: none;
+  z-index: 9999;
+  left: 0; top: 0;
+  transform: translate(-50%, -50%) scale(1.15);  /* ← queixa do user */
+  filter: drop-shadow(0 0 18px rgba(255,210,80,0.85));
+}
+```
+`#bottom-panel` é `position: absolute; top: 1000px; left: 0; width:1080px; height:920px; padding: 24px 60px 30px;`. Está dentro do `#game` que é escalado proporcionalmente pra viewport via `transform: scale(...)` no harness.
+
+### CSS atual do `.match` (highlight)
+```css
+.grid-cell.match {
+  border-color: #ffd97a;
+  box-shadow: 0 0 22px rgba(255,210,80,0.7), inset 0 0 12px rgba(255,210,80,0.3);
+  animation: matchPulse 0.8s ease-in-out infinite alternate;
+}
+@keyframes matchPulse {
+  from { box-shadow: 0 0 14px rgba(255,210,80,0.5), inset 0 0 8px rgba(255,210,80,0.2); }
+  to   { box-shadow: 0 0 28px rgba(255,210,80,0.9), inset 0 0 18px rgba(255,210,80,0.5); }
+}
+```
+
+### Pointer handlers (relevantes)
+`pointerdown` → DRAG.srcIdx = idx + setPointerCapture
+`pointermove` (no document) → moveDragGhost(ev.clientX, ev.clientY)
+`pointerup` → resolve dstIdx via cellIdxFromPoint, chama tryMergeCells
+
+---
+
+## PLANO DE IMPLEMENTAÇÃO PROPOSTO
+
+### A. Resolver cluster de 3 (`computeMergeCluster(srcIdx, dropIdx)`) — ~50 LoC
+
+```js
+// Adjacency map for the 4×2 grid (precomputed)
+var GRID_ADJ = [
+  [1,4], [0,2,5], [1,3,6], [2,7],
+  [0,5], [1,4,6], [2,5,7], [3,6]
+];
+
+// Returns up to 2 grid indices to PAIR with the dragged cell + dropTarget.
+// Selection priority:
+//   1. dropTarget itself (must exist + same tier + adjacent to ≥1 other same-tier)
+//   2. one same-tier cell adjacent to dropTarget (closest by Manhattan)
+// Returns array of 3 indices [srcIdx, dropIdx, partnerIdx] or null if no valid trio.
+function computeMergeCluster(srcIdx, dropIdx) {
+  var s = STATE.grid[srcIdx];
+  if (!s) return null;
+  if (s.tier >= 5) return null;
+  var d = STATE.grid[dropIdx];
+  if (!d || d.tier !== s.tier || dropIdx === srcIdx) return null;
+  // Candidates = same-tier cells adjacent to dropIdx (excluding srcIdx)
+  var adj = GRID_ADJ[dropIdx];
+  var partner = -1;
+  for (var i = 0; i < adj.length; i++) {
+    var a = adj[i];
+    if (a === srcIdx) continue;
+    var u = STATE.grid[a];
+    if (u && u.tier === s.tier) { partner = a; break; }
+  }
+  if (partner < 0) return null;
+  return [srcIdx, dropIdx, partner];
+}
+```
+
+### B. Modificar `tryMergeCells` — exatamente 3, próximo tier no dst — ~15 LoC
+
+```js
+function tryMergeCells(srcIdx, dstIdx) {
+  var cluster = computeMergeCluster(srcIdx, dstIdx);
+  if (!cluster) return false;
+  var nextTier = STATE.grid[srcIdx].tier + 1;
+  for (var i = 0; i < cluster.length; i++) STATE.grid[cluster[i]] = null;
+  STATE.grid[dstIdx] = { tier: nextTier };
+  STATE.mergesCompleted++;
+  playSFX('unlock');
+  spawnGridFlash(dstIdx);
+  return true;
+}
+```
+
+### C. Pulsing magnetic-pull preview em tempo real — ~30 LoC
+
+Durante o drag, conforme o dedo se move, recomputar qual seria o cluster
+SE o player soltasse aqui (target = célula sob o ponteiro). Se cluster
+válido, marcar essas 3 células com classe `.pulling` (animação mais forte
+que `.match`). Se inválido, nenhuma `.pulling`.
+
+```js
+// On pointermove, after moveDragGhost:
+var hoverIdx = cellIdxFromPoint(ev.clientX, ev.clientY);
+updatePullPreview(DRAG.srcIdx, hoverIdx);
+```
+
+```js
+function updatePullPreview(srcIdx, hoverIdx) {
+  var cells = document.querySelectorAll('.grid-cell');
+  for (var i = 0; i < cells.length; i++) cells[i].classList.remove('pulling');
+  if (hoverIdx < 0 || hoverIdx === srcIdx) return;
+  var cluster = computeMergeCluster(srcIdx, hoverIdx);
+  if (!cluster) return;
+  for (var k = 0; k < cluster.length; k++) {
+    var c = document.querySelector('.grid-cell[data-idx="' + cluster[k] + '"]');
+    if (c) c.classList.add('pulling');
+  }
+}
+```
+
+CSS novo:
+```css
+.grid-cell.pulling {
+  border-color: #ffd97a;
+  animation: pullPulse 0.45s ease-in-out infinite alternate;
+}
+@keyframes pullPulse {
+  from { transform: scale(1);     box-shadow: 0 0 18px rgba(255,210,80,0.6), inset 0 0 14px rgba(255,210,80,0.4); }
+  to   { transform: scale(1.08);  box-shadow: 0 0 36px rgba(255,210,80,1),   inset 0 0 28px rgba(255,210,80,0.7); }
+}
+```
+
+### D. Fix do drag-ghost offset — ~5 LoC CSS
+
+Trocar `transform: translate(-50%, -50%) scale(1.15)` por usar `margin-left/top: -100px` (metade do width=200) que NÃO pega no compositor antes do `left/top` se aplicar. Ou mover `#drag-ghost` pra fora do `#bottom-panel` (anexar em `#game`) e usar coords no espaço do `#game` direto.
+
+Solução escolhida: anexar ghost a `#game` (não a `#bottom-panel`) e calcular offset usando `getBoundingClientRect()` de `#game`. O scale do harness é uniforme, então `clientX - gameRect.left` dividido por `(gameRect.width / 1080)` dá game-space x. Setar `left/top` nesses coords. Mantém `translate(-50%, -50%)` mas agora dentro de um container que não tem padding/transforms que confundam.
+
+OU mais simples: parar de usar `translate(-50%, -50%)` e em vez disso setar `ghost.style.left = clientX - 100 + 'px'` direto (no client space) usando `position: fixed` em vez de `absolute`. `position: fixed` ignora o pai e ancora no viewport — exatamente o que queremos pra ghost que segue o dedo no client space.
+
+```css
+#drag-ghost {
+  position: fixed;
+  display: none;
+  width: 200px; height: 200px;
+  pointer-events: none;
+  z-index: 9999;
+  filter: drop-shadow(0 0 18px rgba(255,210,80,0.85));
+  /* removed: transform translate; left/top now centered manually */
+}
+```
+
+```js
+function moveDragGhost(clientX, clientY) {
+  var ghost = document.getElementById('drag-ghost');
+  ghost.style.left = (clientX - 100) + 'px';  // 100 = width/2
+  ghost.style.top  = (clientY - 100) + 'px';
+}
+```
+
+Agora ghost segue o dedo exatamente. `position: fixed` ancora no viewport, ignora qualquer transform de pais. Mais simples, mais robusto.
+
+---
+
+## REVISÕES SOLICITADAS POR IA
+
+- **Claude Opus 4.7**: edge cases — pode `partner === srcIdx` slip through? E se `dropIdx` for o `srcIdx` (drop em si mesma)? E se houver 4 da mesma tier mas só 1 adjacente ao drop? Cluster com `partner === dropIdx`?
+- **Claude Sonnet 4.6**: audite UX/exploits — drop fora do grid + cluster persiste, drag em cell vazia, multi-touch derruba pulse, drag de tier 5 (cap), animação de pulse drena bateria mobile.
+- **GPT-5.3 Codex**: race entre pointermove de 60fps e a query DOM (`querySelector('.grid-cell[data-idx]')`) — caching desejável? `requestAnimationFrame` em vez de chamar updatePullPreview em todo move?
+- **GPT-5.5 (co-coder)**: proponha o snippet ES5-ish final pra `computeMergeCluster`, `updatePullPreview`, e o CSS do `.pulling`.
+- **KAT Coder Pro V2**: TL;DR DOM-specific — `position: fixed` em mobile com scaled parent funciona? Issues conhecidos com Safari iOS sobre `setPointerCapture` + `position: fixed`?
+- **Gemini 3 Flash**: explique POR QUE 3-of-a-kind é mais comum em jogos de merge (Top War, Merge Master) que 2-of-a-kind, e dê alternativas (4-of-a-kind?, 3 mas cluster pode ser linha de 3?).
+- **Qwen 3.6 Plus**: o que estamos ignorando? `.match` (highlight de tier) coexiste com `.pulling` (cluster ativo) — conflito de animação? Cleanup de `.pulling` em pointerup falha?
+- **Grok 4.20**: como atacante explora isso? Multi-touch que adiciona 4ª célula ao cluster? Drop em célula que muda durante a animação? Race entre tutorial step `tutorialOnFirstMerge` e a renderização do flash?
+
+Foco em **prevenir bugs antes de codar**.

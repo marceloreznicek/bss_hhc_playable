@@ -1,0 +1,783 @@
+# REVISÃO FINAL — HeroMerge v0.1 ship gate
+
+## TAREFA
+HeroMerge v0.1 (playable HTML5 single-file de merge × auto-battler) passou pelas 4 etapas anteriores:
+
+- ETAPA 1 (precode) — 8 IAs identificaram 5 prioridades + ~20 edge cases
+- ETAPA 1.5 (síntese) — Kimi K2.6 consolidou em 5 ações concretas
+- ETAPA 2 (execução) — implementado em ~440 linhas no diff (HeroSwarm v2 → HeroMerge v0.1), validado com `snap_l1` + `snap_merge` + `snap_intro` + `snap_endcard` + `syntax_check` (0 erros JS)
+- ETAPA 3 (postcode) — 6 IAs revisaram. Verdict: 5 sem objeções críticas, 1 (Grok) rejeitou citando (a) cleanup gap entre merge e combat-death, (b) race magnetic/stacking
+  - Resposta: (a) é falso — `killActor`→`setTimeout(removeActor)` legacy continua funcionando para morte por combate; o novo `cleanupDeadActors` é aditivo só pro estado `merged`. (b) confirmado teoricamente mas teste end-to-end com 4 unidades e magnetic + stacking fired-na-mesma-frame produziu cluster=4→merge tier-2=1 sem jitter. Aceitável v0.1.
+  - Fixes aplicados: `releasePointerCapture` em `releaseHeld` (MiMo #7); remoção de `injectAvatar` órfãos em slots inexistentes (GPT-5.5 triagem)
+
+Vocês são as 2 IAs do gate final. **AMBOS devem aprovar para shippar.**
+
+- **MiMo V2 Pro**: aprovação estrutural — foque em cenários: restart, offline, multi-device (touch/mouse), level transitions, fail screen, endcard. Procure DEALBREAKERS, não nitpicks.
+- **Claude Sonnet 4.6**: última linha de defesa — pegue bugs que outros 14 não pegaram. Foque em casos de execução real do playable em produção (rede de anúncios, autoplay BGM bloqueado, mraid/ExitApi, dimensionamento responsivo).
+
+## FORMATO DE RESPOSTA (OBRIGATÓRIO)
+
+Comece com **APROVADO** ou **REJEITADO** em letras maiúsculas, sozinho na primeira linha.
+Em seguida 3-5 bullets de justificativa.
+Se REJEITADO, inclua um quinto bullet: "BLOQUEIO:" descrevendo o bug específico que precisa de fix antes de shippar.
+
+---
+
+## RESUMO DA IMPLEMENTAÇÃO
+
+Layout: 1 botão SUMMON gigante (verde, pulsante, com cooldown sweep) substitui as 3 cards do HeroSwarm v2. Ao redor: hint "DRAG to MERGE".
+
+Mecânica:
+1. Tap SUMMON → spawn Tier-1 Recruit em posição aleatória dentro do bottom half da battlefield (700ms cooldown, hard cap 25 units)
+2. Pointerdown numa unit player → manual hit-test (visualScale 1.89× compensado), state='held', class .held adiciona scale+glow+z9999
+3. Pointermove → unit segue dedo, posição clampada ao field; reset auto-merge timer só se delta > 6px
+4. tickMagnetic (no game loop, depois de moveActors) → outras units do mesmo tier dentro de 350px lerpam pra dedo a 600 px/s
+5. tickAutoMerge (depois de tickTackles) → se 600ms parado E há ≥1 unit dentro de 110px → resolveMergeAtPointer
+6. Pointerup → resolveMergeAtPointer
+7. resolveMergeAtPointer → lock transacional, valida h.dead/parentNode/gameActive/tier, monta cluster dentro de 110px, marca todos como state='merged' dead=true, spawna Tier+1 no ponto do dedo, flash visual, SFX
+8. cleanupDeadActors (no início do próximo gameTick) → filtra units com state='merged' e detacha DOM
+
+Engine bypass para held/merged: `if (u.state === 'held' || u.state === 'merged') continue;` em moveActors, resolveStacking, applyAoeDamage (invulnerável durante drag), inner loop de targeting de mobile enemies, resolveCollisions (loop interno).
+
+Tutorial 3 passos: TAP SUMMON → DRAG TO MERGE (após 2 recruits) → off (após 1ª merge).
+
+Intro rebrandado: "HERO MERGE / Summon recruits. Drag to merge. Crush the horde." Endcard: "PLAY NOW TO BUILD YOUR ARMY".
+
+Reuso 100% do motor HeroSwarm: actor system, gameLoop, applyActorTransform, killActor/removeActor, WAVES[1], WAVES[2], LEVEL3_MOBS, dragon FIRE BREATH @ 10 kills, fail screen, endcard CTA, store URLs (HHC iOS+Android), bottomHalfY remap, destroyed-city/night/cave backdrops.
+
+## VALIDAÇÃO MANUAL
+- `node qa/syntax_check.cjs` → 0 erros JS, summon spawna recruit, cooldown ativa
+- `node qa/snap_merge.cjs` → 4 recruits → drag → 1 Lumberjack tier-2, 1 merge completo, 0 erros
+- `node qa/snap_l1.cjs` → SUMMON + tutorial bubble + 6 recruits no campo lutando contra wave 1 (goblins + brute), 2 kills
+- `node qa/snap_intro.cjs` / `snap_endcard.cjs` → branding novo OK
+
+## DIFF FINAL (HeroSwarm v2 → HeroMerge v0.1, base64 elidido)
+
+```diff
+--- HeroSwarm/HeroSwarm_playable_v0.1.html	2026-04-26 20:31:10.232427602 -0300
++++ HeroMerge/HeroMerge_playable_v0.1.html	2026-04-26 21:47:29.671045547 -0300
+@@ -97,6 +97,7 @@
+   top: 0; left: 0;
+   width: 100%;
+   height: 100%;
++  touch-action: none; /* HeroMerge: drag-to-merge — block native touch panning */
+ }
+ 
+ /* ─────────────────────────────────────────────────────────
+@@ -106,7 +107,7 @@
+ .actor {
+   position: absolute;
+   top: 0; left: 0;
+-  pointer-events: none;
++  pointer-events: none; /* hit-test is manual via STATE.units (visualScale 1.89× desyncs DOM) */
+   will-change: transform;
+ }
+ .actor .sprite {
+@@ -114,6 +115,7 @@
+   display: block;
+   transform-origin: center center;
+   animation: bob 0.5s ease-in-out infinite alternate;
++  pointer-events: none;
+ }
+ @keyframes bob {
+   from { transform: translateY(-3px) scale(1);    }
+@@ -613,6 +615,92 @@
+ .card-auto-label .auto-cd { font-size: 36px; color: #fff; margin-top: 6px; }
+ 
+ /* ─────────────────────────────────────────────────────────
++   SUMMON BAR (HeroMerge — replaces the 3-card stack)
++   ───────────────────────────────────────────────────────── */
++#summon-area {
++  position: absolute;
++  top: 1080px;
++  left: 0;
++  width: 1080px;
++  height: 840px;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: flex-start;
++  padding-top: 60px;
++  gap: 28px;
++}
++#btn-summon {
++  position: relative;
++  width: 720px;
++  height: 240px;
++  background: linear-gradient(180deg, #46c93a 0%, #1f8a18 100%);
++  border: 8px solid #ffd97a;
++  border-radius: 36px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  color: #fff;
++  font-size: 88px;
++  font-weight: 900;
++  text-shadow: 3px 3px 0 #0c4a08;
++  cursor: pointer;
++  overflow: hidden;
++  box-shadow: 0 12px 0 #0c4a08, 0 0 50px rgba(70,200,50,0.5);
++  letter-spacing: 4px;
++  font-family: 'Riffic', 'Arial Black', sans-serif;
++  animation: summonPulse 1.6s ease-in-out infinite alternate;
++}
++#btn-summon:active { transform: translateY(5px); box-shadow: 0 7px 0 #0c4a08, 0 0 50px rgba(70,200,50,0.5); animation: none; }
++#btn-summon.cooldown { pointer-events: none; filter: grayscale(60%) brightness(0.65); animation: none; }
++#btn-summon .cd-sweep {
++  position: absolute; inset: 0; border-radius: inherit;
++  background: conic-gradient(from -90deg, rgba(0,0,0,0.55) var(--cdp,0%), transparent 0%);
++  pointer-events: none;
++}
++#btn-summon .cd-text {
++  position: absolute; inset: 0;
++  display: flex; align-items: center; justify-content: center;
++  font-size: 56px; color: #fff;
++  text-shadow: 2px 2px 0 #0c4a08;
++  pointer-events: none;
++}
++@keyframes summonPulse {
++  from { box-shadow: 0 12px 0 #0c4a08, 0 0 40px rgba(70,200,50,0.4); }
++  to   { box-shadow: 0 12px 0 #0c4a08, 0 0 80px rgba(70,200,50,0.85); }
++}
++#merge-hint {
++  color: #ffd97a;
++  font-size: 44px;
++  font-weight: 900;
++  letter-spacing: 3px;
++  font-family: 'Riffic', 'Arial Black', sans-serif;
++  text-shadow: 2px 3px 0 #1a0800;
++  opacity: 0.88;
++}
++
++/* Held actor — visually lifted, ignores hp-bar interaction during drag. */
++.actor.held .sprite { transform: scale(1.18); filter: drop-shadow(0 0 18px rgba(255,220,120,0.95)); animation: none; }
++.actor.held { z-index: 9999 !important; }
++
++/* Magnetic flash burst at the merge spawn point. */
++.merge-flash {
++  position: absolute;
++  width: 200px; height: 200px;
++  border-radius: 50%;
++  background: radial-gradient(circle, rgba(255,240,180,0.95) 0%, rgba(255,200,100,0.6) 30%, transparent 75%);
++  pointer-events: none;
++  transform: translate(-50%, -50%) scale(0.3);
++  animation: mergeFlashAnim 0.5s ease-out forwards;
++  z-index: 5000;
++}
++@keyframes mergeFlashAnim {
++  0%   { transform: translate(-50%, -50%) scale(0.3); opacity: 1; }
++  60%  { transform: translate(-50%, -50%) scale(1.2); opacity: 0.9; }
++  100% { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
++}
++
++/* ─────────────────────────────────────────────────────────
+    INTRO OVERLAY
+    ───────────────────────────────────────────────────────── */
+ #intro {
+@@ -856,53 +944,20 @@
+   <!-- WAVE INFO -->
+   <div id="wave-info"><span id="wave-info-text">Level 1 — Kills: 0 / 15</span></div>
+ 
+-  <!-- CARD STACK -->
+-  <div id="card-stack">
+-    <!-- HERO CARD (tap, 1.5s cooldown) -->
+-    <div class="card" id="card-hero">
+-      <div class="card-avatar" id="avatar-hero" style="background: linear-gradient(180deg, #d83020, #8a1010);"></div>
+-      <div class="card-info">
+-        <div class="card-name">HERO</div>
+-        <div class="card-stats">
+-          <span class="stat hp"><span class="stat-icon">♥</span> 5</span>
+-          <span class="stat atk"><span class="stat-icon">⚔</span> 1</span>
+-        </div>
+-      </div>
+-      <div class="card-action" id="btn-spawn-hero">SUMMON<div class="cd-sweep"></div><div class="cd-text"></div></div>
+-    </div>
+-
+-    <!-- OGRE CARD (tap, 4s cooldown — locked initially) -->
+-    <div class="card locked" id="card-ogre" data-unlock-text="UNLOCK AT 3 KILLS">
+-      <div class="card-avatar" id="avatar-ogre" style="background: linear-gradient(180deg, #4a8a3a, #2a5a20);"></div>
+-      <div class="card-info">
+-        <div class="card-name">MANLY LUMBERJACK</div>
+-        <div class="card-stats">
+-          <span class="stat hp"><span class="stat-icon">♥</span> 10</span>
+-          <span class="stat atk"><span class="stat-icon">⚔</span> 3</span>
+-        </div>
+-      </div>
+-      <div class="card-action" id="btn-spawn-ogre">SUMMON<div class="cd-sweep"></div><div class="cd-text"></div></div>
+-    </div>
+-
+-    <!-- KNIGHT CARD (tap, 3s cooldown — locked initially. Stats = 2× Ogre.) -->
+-    <div class="card locked" id="card-knight" data-unlock-text="UNLOCK AT 20 KILLS">
+-      <div class="card-avatar" id="avatar-knight" style="background: linear-gradient(180deg, #b0b8c0, #606870);"></div>
+-      <div class="card-info">
+-        <div class="card-name">KNIGHT</div>
+-        <div class="card-stats">
+-          <span class="stat hp"><span class="stat-icon">♥</span> 20</span>
+-          <span class="stat atk"><span class="stat-icon">⚔</span> 6</span>
+-        </div>
+-      </div>
+-      <div class="card-action" id="btn-spawn-knight">SUMMON<div class="cd-sweep"></div><div class="cd-text"></div></div>
++  <!-- SUMMON BAR (replaces HeroSwarm's 3-card stack) -->
++  <div id="summon-area">
++    <div id="btn-summon">SUMMON
++      <div class="cd-sweep"></div>
++      <div class="cd-text"></div>
+     </div>
++    <div id="merge-hint">DRAG to MERGE</div>
+   </div>
+ 
+   <!-- INTRO -->
+   <div id="intro">
+-    <div id="intro-title">HERO<br>SWARM</div>
++    <div id="intro-title">HERO<br>MERGE</div>
+     <div id="intro-hero-placeholder"></div>
+-    <div id="intro-text">Lead the swarm.<br>Crush the horde.</div>
++    <div id="intro-text">Summon recruits.<br>Drag to merge.<br>Crush the horde.</div>
+     <div id="intro-btn">START</div>
+   </div>
+ 
+@@ -919,7 +974,7 @@
+   <!-- ENDCARD -->
+   <div id="endcard">
+     <div id="endcard-icon"><img id="endcard-icon-img" alt=""></div>
+-    <div id="endcard-text">PLAY NOW TO SAVE<br>THE KINGDOM<br>IN YOUR UNDIES</div>
++    <div id="endcard-text">PLAY NOW TO BUILD<br>YOUR ARMY</div>
+     <div id="endcard-btn">PLAY NOW</div>
+   </div>
+ 
+@@ -938,13 +993,24 @@
+   units: [],
+   enemies: [],
+   unitsUnlocked: { ogre: false, knight: false },
+-  cooldownUntil: { hero: 0, ogre: 0, knight: 0 },   // ms timestamp; tap blocked until then
++  cooldownUntil: { hero: 0, ogre: 0, knight: 0, summon: 0 },   // ms timestamp; tap blocked until then
+   dragonKillCount: 0,
+   failed: false,
+   guideStep: 0,
+   introClosed: false,
+   gameActive: false,
+-  gameEnded: false
++  gameEnded: false,
++  // ── HeroMerge drag-merge state ─────────────────────────
++  heldActor: null,         // unit currently being dragged (single-pointer lock)
++  activePointerId: null,   // captured pointerId; rejects multitouch
++  pointerX: 0,             // game-space pointer coords (clamped to field)
++  pointerY: 0,
++  lastMoveAt: 0,           // ms; for hold-still auto-merge
++  lastMoveX: 0,
++  lastMoveY: 0,
++  mergeResolving: false,   // transactional lock — anti double-merge
++  mergesCompleted: 0,      // triggers tutorial step 3
++  recruitsSpawned: 0       // triggers tutorial step 2 (after 2nd summon)
+ };
+ 
+ // ─────────────────────────────────────────────────────────
+@@ -1077,6 +1143,7 @@
+   if (STATE.gameEnded) return;
+   STATE.gameEnded  = true;
+   STATE.gameActive = false;
++  if (typeof releaseHeld === 'function') releaseHeld(true);
+   document.getElementById('endcard').classList.add('show');
+ }
+ 
+@@ -1084,6 +1151,7 @@
+   if (STATE.failed) return;
+   STATE.failed = true;
+   STATE.gameActive = false;
++  if (typeof releaseHeld === 'function') releaseHeld(true);
+   // Fire breath flash + screen shake first, then FAIL overlay
+   var fire = document.getElementById('fire-flash');
+   fire.classList.remove('flash'); void fire.offsetWidth; fire.classList.add('flash');
+@@ -1240,6 +1308,36 @@
+   }
+ };
+ 
++// ─────────────────────────────────────────────────────────
++// HEROMERGE — TIER REGISTRY
++// ─────────────────────────────────────────────────────────
++// 5-tier merge ladder. Tiers 1–3 reuse UNIT_TYPES (player). Tiers 4–5 reuse the
++// brute/dragon ENEMY_TYPES sprites + stats but as PLAYER side. Single registry
++// avoids the "createActor(brute, UNIT_TYPES)" lookup-undefined crash flagged by
++// the precode review.
++var TIER_TYPE = ['hero', 'ogre', 'knight', 'brute', 'dragon']; // index = tier-1
++var TIER_BY_TYPE = { hero: 1, ogre: 2, knight: 3, brute: 4, dragon: 5 };
++var MERGE_UNIT_TYPES = {
++  hero:   UNIT_TYPES.hero,
++  ogre:   UNIT_TYPES.ogre,
++  knight: UNIT_TYPES.knight,
++  // Cloned from ENEMY_TYPES with side flipped to player + speed restored so
++  // these still chase enemies after a merge promotes a unit into them.
++  brute:  { side: 'player', label: 'BRUTE',      color: '#5a3818',
++            w: 168, h: 200, hp: 35,  dmg: 4, speed: 60,  aoe: true },
++  dragon: { side: 'player', label: 'CHAMPION',   color: '#7030b0',
++            w: 342, h: 252, hp: 120, dmg: 6, speed: 80,  aoe: true }
++};
++// Hard cap to prevent SUMMON spam crashing the loop (safety guard from Sonnet).
++var MAX_PLAYER_UNITS = 25;
++var SUMMON_COOLDOWN_MS = 700;
++// Merge mechanic tunables (validated by precode synthesis).
++var MAGNETIC_RADIUS    = 350;   // px — units of same tier within this lerp toward finger
++var MAGNETIC_SPEED     = 600;   // px/s — pull rate
++var MERGE_RADIUS       = 110;   // px — cluster pinch zone at release
++var AUTO_MERGE_DELAY   = 600;   // ms — time held still before auto-fire
++var AUTO_MERGE_DELTA   = 6;     // px — pointer-jitter tolerance for "still"
++
+ // AOE radius for boss attacks (extra reach beyond their own footprint)
+ var BOSS_AOE_RADIUS = 90;
+ // Static spacing kept between an attacker and its target while tackling.
+@@ -1368,7 +1466,9 @@
+     state: def.side === 'enemy' ? 'idle' : 'walking', // enemies are immobile until contacted
+     target: null,
+     tackleTimer: 0,
+-    dead: false
++    dead: false,
++    // HeroMerge: tier 1–5 for player units (drives merge); -1 for enemies (never merge).
++    tier: (def.side === 'player' && TIER_BY_TYPE[typeKey]) ? TIER_BY_TYPE[typeKey] : -1
+   };
+   applyActorTransform(actor);
+   return actor;
+@@ -1457,11 +1557,29 @@
+ }
+ 
+ function gameTick(dt) {
++  // HeroMerge: deferred-cleanup pass — units flagged dead by merge resolution
++  // get DOM-detached and dropped from STATE.units BEFORE the iterating systems
++  // run, avoiding mid-frame array mutation (precode synthesis: KAT/GPT-5.3/Grok).
++  cleanupDeadActors();
+   acquireTargets();
+   moveActors(dt);
++  tickMagnetic(dt);          // HeroMerge: pull same-tier units toward held actor
+   resolveStacking();
+   resolveCollisions();
+   tickTackles(dt);
++  tickAutoMerge();           // HeroMerge: fire merge if held still long enough
++}
++
++function cleanupDeadActors() {
++  // Player units flagged .dead by mergeResolution — detach DOM + filter.
++  var i;
++  for (i = STATE.units.length - 1; i >= 0; i--) {
++    var u = STATE.units[i];
++    if (u.dead && u.state === 'merged') {
++      if (u.el && u.el.parentNode) u.el.parentNode.removeChild(u.el);
++      STATE.units.splice(i, 1);
++    }
++  }
+ }
+ 
+ // ─────────────────────────────────────────────────────────
+@@ -1504,6 +1622,7 @@
+   for (var i = 0; i < STATE.units.length; i++) {
+     var u = STATE.units[i];
+     if (u.dead || u.state === 'dying' || u.state === 'tackling') continue;
++    if (u.state === 'held' || u.state === 'merged') continue; // HeroMerge: drag bypass
+     var t = u.target;
+     if (!t) {
+       // No enemies left — drift toward the field center (gentle assembly)
+@@ -1569,6 +1688,7 @@
+   for (var i = 0; i < units.length; i++) {
+     var a = units[i];
+     if (a.dead || a.state === 'dying') continue;
++    if (a.state === 'held' || a.state === 'merged') continue; // HeroMerge: drag bypass
+     // vs other player units (50/50 split)
+     for (var j = i + 1; j < units.length; j++) {
+       var b = units[j];
+@@ -1659,6 +1779,7 @@
+     for (var n = 0; n < STATE.units.length; n++) {
+       var pu = STATE.units[n];
+       if (pu.dead || pu.state === 'dying') continue;
++      if (pu.state === 'held' || pu.state === 'merged') continue; // HeroMerge: untargettable while dragged
+       var ddx = pu.x - em.x, ddy = pu.y - em.y;
+       var dd  = Math.sqrt(ddx * ddx + ddy * ddy);
+       var rng = em.r + pu.r + COMBAT_GAP + 4;
+@@ -1704,6 +1825,7 @@
+   for (var i = STATE.units.length - 1; i >= 0; i--) {
+     var u = STATE.units[i];
+     if (u.dead || u.state === 'dying') continue;
++    if (u.state === 'held' || u.state === 'merged') continue; // HeroMerge: invulnerable while dragged/being-merged
+     var dx = u.x - boss.x, dy = u.y - boss.y;
+     if (dx * dx + dy * dy <= radiusSq) {
+       applyDamage(boss, u);
+@@ -2018,6 +2140,9 @@
+ }
+ 
+ function clearAllActors() {
++  // HeroMerge: drop the drag handle BEFORE wiping the array — otherwise heldActor
++  // points at a removed DOM node and pointermove crashes (Grok exploit #1).
++  if (typeof releaseHeld === 'function') releaseHeld(true);
+   STATE.units.forEach(function(u)   { removeActor(u); });
+   STATE.enemies.forEach(function(e) { removeActor(e); });
+   STATE.units.length   = 0;
+@@ -2229,13 +2354,10 @@
+ // Hero TAP button: card stack at y=1000, hero card top ~1020, button ~ centered vertically
+ // Card width ~1020, button right side ~ x=860, y center ~1110.
+ var TUT_POS = {
+-  heroBtn:   { x: 870, y: 1090 },
+-  coinBar:   { x: 870, y: 60   },
+-  ogreCard:  { x: 540, y: 1310 },
+-  ogreBtn:   { x: 870, y: 1310 }, // SUMMON button on the Lumberjack card
+-  knightCard:{ x: 540, y: 1620 },
+-  knightBtn: { x: 870, y: 1620 }, // SUMMON button on the Knight card
+-  dragon:    { x: 870, y: 580  } // dragon now spawns on right side; game coords (battlefield top:120 + lane y)
++  summonBtn: { x: 540, y: 1280 },          // center of #btn-summon (top:1140 + h:240/2)
++  dragFrom:  { x: 380, y: 600 },            // demo drag origin (rough recruit spawn)
++  dragTo:    { x: 700, y: 600 },            // demo drag target
++  dragon:    { x: 870, y: 580  }
+ };
+ 
+ function tutAt(name) { return TUT_POS[name]; }
+@@ -2245,17 +2367,13 @@
+   hideTutBubble();
+   if (!stepName) return;
+   switch (stepName) {
+-    case 'tap-hero':
+-      showGuideHand(tutAt('heroBtn').x, tutAt('heroBtn').y);
+-      showTutBubble('TAP to spawn your HERO!', tutAt('heroBtn').x, tutAt('heroBtn').y - 110);
++    case 'tap-summon':
++      showGuideHand(tutAt('summonBtn').x, tutAt('summonBtn').y);
++      showTutBubble('TAP to SUMMON!', tutAt('summonBtn').x, tutAt('summonBtn').y - 180);
+       break;
+-    case 'ogre-unlocked':
+-      showGuideHand(tutAt('ogreBtn').x, tutAt('ogreBtn').y);
+-      showTutBubble('MANLY LUMBERJACK joins the fight!', tutAt('ogreCard').x, tutAt('ogreCard').y - 130);
+-      break;
+-    case 'knight-unlocked':
+-      showGuideHand(tutAt('knightBtn').x, tutAt('knightBtn').y);
+-      showTutBubble('KNIGHT unlocked!', tutAt('knightCard').x, tutAt('knightCard').y - 130);
++    case 'drag-merge':
++      showGuideHand(tutAt('dragTo').x, tutAt('dragTo').y);
++      showTutBubble('DRAG units together to MERGE!', tutAt('dragTo').x, tutAt('dragTo').y - 180);
+       break;
+     case 'kill-dragon':
+       showGuideHand(tutAt('dragon').x, tutAt('dragon').y);
+@@ -2267,53 +2385,280 @@
+ // Drive the tutorial state machine from gameplay events
+ function tutorialOnIntroClose() {
+   STATE.guideStep = 1;
+-  tutGoTo('tap-hero');
++  tutGoTo('tap-summon');
+ }
+-function tutorialOnFirstTap() {
++function tutorialOnSummonTap() {
+   if (STATE.guideStep !== 1) return;
++  // Wait for at least 2 recruits before nudging the merge gesture.
++  if (STATE.recruitsSpawned < 2) return;
+   STATE.guideStep = 2;
+-  hideGuideHand();
+-  hideTutBubble();
++  tutGoTo('drag-merge');
+ }
+-function tutorialOnOgreUnlock() {
++function tutorialOnFirstMerge() {
++  if (STATE.guideStep > 2) return;
+   STATE.guideStep = 3;
+-  tutGoTo('ogre-unlocked');
+-  setTimeout(function() {
+-    if (STATE.guideStep === 3) { hideGuideHand(); hideTutBubble(); }
+-  }, 2400);
+-}
+-function tutorialOnKnightUnlock() {
+-  STATE.guideStep = 4;
+-  tutGoTo('knight-unlocked');
+-  setTimeout(function() {
+-    if (STATE.guideStep === 4) { hideGuideHand(); hideTutBubble(); }
+-  }, 2400);
++  hideGuideHand();
++  hideTutBubble();
+ }
+ function tutorialOnDragonSpawn() {
+   STATE.guideStep = 5;
+   tutGoTo('kill-dragon');
+-  // Auto-dismiss after 3s — players are busy fighting
+   setTimeout(function() {
+     if (STATE.guideStep === 5) { hideGuideHand(); hideTutBubble(); }
+   }, 3000);
+ }
+ 
+ // ─────────────────────────────────────────────────────────
+-// CARD WIRING
++// HEROMERGE — SUMMON BUTTON
+ // ─────────────────────────────────────────────────────────
+-document.getElementById('btn-spawn-hero').addEventListener('click', function() {
+-  if (!STATE.gameActive) return;
+-  tryTapSpawn('hero');
+-  tutorialOnFirstTap();
+-});
+-document.getElementById('btn-spawn-ogre').addEventListener('click', function() {
+-  if (!STATE.gameActive) return;
+-  tryTapSpawn('ogre');
+-});
+-document.getElementById('btn-spawn-knight').addEventListener('click', function() {
+-  if (!STATE.gameActive) return;
+-  tryTapSpawn('knight');
+-});
++function setSummonCooldownVisual() {
++  var btn = document.getElementById('btn-summon');
++  var sweep = btn.querySelector('.cd-sweep');
++  var label = btn.querySelector('.cd-text');
++  var now = performance.now();
++  var until = STATE.cooldownUntil.summon;
++  if (now >= until) {
++    btn.classList.remove('cooldown');
++    sweep.style.setProperty('--cdp', '0%');
++    label.textContent = '';
++    return;
++  }
++  btn.classList.add('cooldown');
++  var remain = until - now;
++  var pct = Math.min(100, (remain / SUMMON_COOLDOWN_MS) * 100);
++  sweep.style.setProperty('--cdp', pct + '%');
++  label.textContent = (remain / 1000).toFixed(1) + 's';
++}
++setInterval(setSummonCooldownVisual, 60);
++
++function summonRecruit() {
++  if (!STATE.gameActive || STATE.gameEnded) return;
++  var now = performance.now();
++  if (now < STATE.cooldownUntil.summon) { playSFX('locked'); return; }
++  // Hard cap: prevents SUMMON spam from crashing the loop (Sonnet/Gemini guard).
++  var live = 0;
++  for (var i = 0; i < STATE.units.length; i++) if (!STATE.units[i].dead) live++;
++  if (live >= MAX_PLAYER_UNITS) { playSFX('locked'); return; }
++  // Random spawn inside the bottom half (avoids edges so the unit doesn't immediately clip).
++  var x = 220 + Math.random() * (LANE_W - 440);
++  var y = FIELD_PAD_TOP + 30 + Math.random() * (FIELD_PAD_BOTTOM - FIELD_PAD_TOP - 60);
++  var recruit = createActor('hero', MERGE_UNIT_TYPES, x, y);
++  STATE.units.push(recruit);
++  playSFX('spawn');
++  STATE.cooldownUntil.summon = now + SUMMON_COOLDOWN_MS;
++  STATE.recruitsSpawned++;
++  setSummonCooldownVisual();
++  tutorialOnSummonTap();
++}
++document.getElementById('btn-summon').addEventListener('click', summonRecruit);
++
++// ─────────────────────────────────────────────────────────
++// HEROMERGE — POINTER + MAGNETIC + MERGE
++// ─────────────────────────────────────────────────────────
++function clientToGameCoords(ev) {
++  // The harness scales #game proportionally to fit the viewport. Walk back via the bounding rect.
++  var game = document.getElementById('game');
++  var rect = game.getBoundingClientRect();
++  var sx = 1080 / rect.width;
++  var sy = 1920 / rect.height;
++  var gameX = (ev.clientX - rect.left) * sx;
++  var gameY = (ev.clientY - rect.top)  * sy;
++  // Battlefield starts at game-y 120 + height 780; lane coords are local.
++  return { x: gameX, y: gameY - 120 };
++}
++
++function clampToField(p) {
++  if (p.x < 40) p.x = 40;
++  if (p.x > LANE_W - 40) p.x = LANE_W - 40;
++  if (p.y < FIELD_PAD_TOP) p.y = FIELD_PAD_TOP;
++  if (p.y > FIELD_PAD_BOTTOM) p.y = FIELD_PAD_BOTTOM;
++  return p;
++}
++
++// Manual hit-test: visualScale 1.89× desyncs DOM hitbox from sprite. Iterate
++// units back-to-front (top-most z first) and pick the bounding box that contains the point.
++function findActorAt(p) {
++  for (var i = STATE.units.length - 1; i >= 0; i--) {
++    var u = STATE.units[i];
++    if (u.dead || u.state === 'dying' || u.state === 'merged') continue;
++    if (u.tier == null || u.tier < 1 || u.tier > 5) continue;
++    var halfW = (u.def.w * 1.89) / 2;
++    var halfH = (u.def.h * 1.89) / 2;
++    if (Math.abs(p.x - u.x) <= halfW && Math.abs(p.y - u.y) <= halfH) return u;
++  }
++  return null;
++}
++
++function onPointerDown(ev) {
++  if (!STATE.gameActive || STATE.gameEnded) return;
++  if (STATE.heldActor) return;                    // single-pointer lock (multitouch reject)
++  var p = clientToGameCoords(ev);
++  var hit = findActorAt(p);
++  if (!hit) return;
++  if (hit.tier >= 5) return;                      // top tier — can't merge further
++  STATE.heldActor = hit;
++  STATE.activePointerId = ev.pointerId;
++  hit.state = 'held';
++  hit.el.classList.add('held');
++  clampToField(p);
++  STATE.pointerX = p.x; STATE.pointerY = p.y;
++  STATE.lastMoveAt = performance.now();
++  STATE.lastMoveX = p.x; STATE.lastMoveY = p.y;
++  hit.x = p.x; hit.y = p.y;
++  applyActorTransform(hit);
++  // Capture pointer so we still get move/up events even if finger leaves the lane.
++  try { ev.target.setPointerCapture && ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
++  ev.preventDefault();
++}
++
++function onPointerMove(ev) {
++  if (!STATE.heldActor) return;
++  if (ev.pointerId !== STATE.activePointerId) return;     // ignore second finger
++  var h = STATE.heldActor;
++  if (h.dead || !h.el || !h.el.parentNode) { releaseHeld(true); return; }
++  var p = clampToField(clientToGameCoords(ev));
++  STATE.pointerX = p.x; STATE.pointerY = p.y;
++  h.x = p.x; h.y = p.y;
++  applyActorTransform(h);
++  // Reset auto-merge timer only if pointer actually moved more than the noise tolerance.
++  var dx = p.x - STATE.lastMoveX, dy = p.y - STATE.lastMoveY;
++  if (dx*dx + dy*dy > AUTO_MERGE_DELTA * AUTO_MERGE_DELTA) {
++    STATE.lastMoveAt = performance.now();
++    STATE.lastMoveX = p.x;
++    STATE.lastMoveY = p.y;
++  }
++  ev.preventDefault();
++}
++
++function onPointerUp(ev) {
++  if (!STATE.heldActor) return;
++  if (ev.pointerId !== STATE.activePointerId) return;
++  resolveMergeAtPointer();
++}
++
++function releaseHeld(silent) {
++  var h = STATE.heldActor;
++  var pid = STATE.activePointerId;
++  STATE.heldActor = null;
++  STATE.activePointerId = null;
++  if (h && h.el && h.el.parentNode) {
++    h.el.classList.remove('held');
++    if (h.state === 'held') h.state = 'walking';
++  }
++  // Release pointer capture explicitly (MiMo postcode #7) — leaving it dangling
++  // can starve subsequent pointer events on some Android browsers.
++  if (pid != null) {
++    var root = document.getElementById('game');
++    try { root && root.releasePointerCapture && root.releasePointerCapture(pid); } catch (e) {}
++  }
++}
++
++function tickMagnetic(dt) {
++  var h = STATE.heldActor;
++  if (!h || h.dead) return;
++  var R2 = MAGNETIC_RADIUS * MAGNETIC_RADIUS;
++  for (var i = 0; i < STATE.units.length; i++) {
++    var u = STATE.units[i];
++    if (u === h || u.dead) continue;
++    if (u.tier !== h.tier) continue;
++    if (u.state === 'merged' || u.state === 'dying') continue;
++    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
++    var d2 = dx*dx + dy*dy;
++    if (d2 > R2) continue;
++    var d = Math.sqrt(d2);
++    if (d < 1) continue;
++    var pull = Math.min(MAGNETIC_SPEED * dt, d);
++    u.x += (dx / d) * pull;
++    u.y += (dy / d) * pull;
++    applyActorTransform(u);
++  }
++}
++
++function tickAutoMerge() {
++  if (!STATE.heldActor) return;
++  if (STATE.mergeResolving) return;
++  if (performance.now() - STATE.lastMoveAt < AUTO_MERGE_DELAY) return;
++  // Only auto-fire if at least one same-tier neighbour is in the merge radius.
++  var found = false, R2 = MERGE_RADIUS * MERGE_RADIUS, h = STATE.heldActor;
++  for (var i = 0; i < STATE.units.length && !found; i++) {
++    var u = STATE.units[i];
++    if (u === h || u.dead || u.tier !== h.tier) continue;
++    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
++    if (dx*dx + dy*dy <= R2) found = true;
++  }
++  if (found) resolveMergeAtPointer();
++}
++
++function spawnMergeFlash(x, y) {
++  var lane = document.getElementById('lane');
++  var f = document.createElement('div');
++  f.className = 'merge-flash';
++  f.style.left = x + 'px';
++  f.style.top  = y + 'px';
++  lane.appendChild(f);
++  setTimeout(function() { if (f.parentNode) f.parentNode.removeChild(f); }, 600);
++}
++
++function resolveMergeAtPointer() {
++  if (STATE.mergeResolving) return;          // transactional lock
++  STATE.mergeResolving = true;
++  try {
++    var h = STATE.heldActor;
++    if (!h || h.dead || !h.el || !h.el.parentNode) { releaseHeld(true); return; }
++    if (!STATE.gameActive || STATE.gameEnded)       { releaseHeld(true); return; }
++    if (h.tier < 1 || h.tier >= 5)                  { releaseHeld(true); return; }
++    var R2 = MERGE_RADIUS * MERGE_RADIUS;
++    var cluster = [h];
++    for (var i = 0; i < STATE.units.length; i++) {
++      var u = STATE.units[i];
++      if (u === h || u.dead) continue;
++      if (u.tier !== h.tier) continue;
++      if (u.state === 'merged' || u.state === 'dying') continue;
++      var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
++      if (dx*dx + dy*dy <= R2) cluster.push(u);
++    }
++    if (cluster.length < 2) { releaseHeld(true); return; }
++    // Mark every cluster member as merged. The deferred cleanup pass at the next
++    // frame's gameTick handles DOM detach + array removal — keeps this routine
++    // safe from mid-frame array mutation.
++    for (var k = 0; k < cluster.length; k++) {
++      var c = cluster[k];
++      c.state = 'merged';
++      c.dead = true;
++      c.el.classList.remove('held');
++    }
++    // Spawn next tier at the pointer.
++    var nextKey = TIER_TYPE[h.tier]; // h.tier is 1-based; index = tier yields next type
++    if (nextKey) {
++      var newU = createActor(nextKey, MERGE_UNIT_TYPES, STATE.pointerX, STATE.pointerY);
++      STATE.units.push(newU);
++      playSFX('unlock');
++      spawnMergeFlash(STATE.pointerX, STATE.pointerY);
++      STATE.mergesCompleted++;
++      tutorialOnFirstMerge();
++    }
++  } finally {
++    STATE.heldActor = null;
++    STATE.activePointerId = null;
++    STATE.mergeResolving = false;
++  }
++}
++
++// Bind pointer events to the lane (and document for capture safety).
++(function bindPointers(){
++  var lane = document.getElementById('lane');
++  if (!lane) return;
++  // Use #game so the listener still fires if the finger drifts above the battlefield.
++  var root = document.getElementById('game');
++  root.addEventListener('pointerdown', onPointerDown);
++  root.addEventListener('pointermove', onPointerMove);
++  root.addEventListener('pointerup',   onPointerUp);
++  root.addEventListener('pointercancel', onPointerUp);
++  // Safety: clear held on visibility change / pagehide.
++  document.addEventListener('visibilitychange', function() {
++    if (document.hidden && STATE.heldActor) releaseHeld(true);
++  });
++})();
+ 
+ // Inject card-avatar portraits from each unit's SPRITES image (upper half via CSS crop).
+ function injectAvatar(slotId, typeKey) {
+@@ -2326,11 +2671,11 @@
+   img.draggable = false;
+   slot.appendChild(img);
+ }
+-// Hero CARD portrait keeps the player.png (kept in SPRITES.heroAvatar). The
+-// in-battle Hero sprite + intro panel use SPRITES.hero (= intro-hero.png).
+-injectAvatar('avatar-hero',   'heroAvatar');
+-injectAvatar('avatar-ogre',   'ogre');
+-injectAvatar('avatar-knight', 'knight');
++// HeroMerge: card-avatar slots no longer exist (3-card stack removed). Calls
++// kept commented for archaeology — injectAvatar early-returns on null slot anyway.
++// injectAvatar('avatar-hero', 'heroAvatar');
++// injectAvatar('avatar-ogre', 'ogre');
++// injectAvatar('avatar-knight', 'knight');
+ 
+ // Intro panel — show the hero sprite in place of the [HERO] placeholder.
+ (function(){
+
+```

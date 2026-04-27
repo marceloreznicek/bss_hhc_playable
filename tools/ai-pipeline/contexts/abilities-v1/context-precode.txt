@@ -1,0 +1,301 @@
+TASK: pre-code review of the v1 implementation plan for the **Character Special Abilities** feature in DiverDungeon (Unity 6, C#, turn-based deterministic party combat). Your job is to surface edge cases, determinism risks, race conditions in the resolver loop, missing invariants, security/correctness gotchas, and any design holes BEFORE Claude writes the code.
+
+The PM agent has already produced a Phase-2 feature proposal (locked v1 scope) at `product/features/2026-04-26-character-special-abilities.md`. This file consolidates the load-bearing parts of that spec plus all the existing code that will be touched. Treat the v1 Scope Statement as the contract; flag anything Claude (the implementer) is at risk of getting wrong, missing, or implementing in a non-deterministic way.
+
+══════════════════════════════════════════════════════════════════
+PROJECT CONTEXT
+══════════════════════════════════════════════════════════════════
+
+- **Engine:** Unity 6, C# (no async/await in resolver — pure synchronous per-tick loop).
+- **Architecture pillar to preserve at all costs:** **Pillar 2 — battles are deterministic.** Same `(party, dungeon, focus, floor)` MUST yield byte-identical resolver output every time. The current `CombatResolver` uses a single seeded `System.Random(seed)` to pick targets when no focus is set. Anything new (mana gain, status effects, ability resolution) must remain a pure function of state — NO `Time.deltaTime`, NO `UnityEngine.Random`, NO non-deterministic dictionary iteration, NO floating-point order-of-operations divergence.
+- **Combat model:** Strict turn-cycling. Per round: Hero0 attacks → Hero1 attacks → ... → HeroN-1 attacks → Enemy0 attacks → Enemy1 attacks → ... → EnemyM-1 attacks → repeat. Each "atomic action" = one hero attack OR one enemy attack.
+- **Preview system:** `RunController.PreviewNextFloor()` clones state and runs the resolver ahead of time to project HP-after / outcome / ticks for the next floor. The preview MUST run the same code path as the real fight — abilities and mana gain included. Cloning cost matters (preview is called on UI updates, possibly every frame).
+- **CSV-driven tuning:** All balance values live in CSVs at `Balance/*.csv`. Hardcoded constants are NOT acceptable for tunable values.
+- **Prototype phase:** the project is small (~5 prototype scripts). No backwards-compat constraints. We can change struct shapes freely.
+
+══════════════════════════════════════════════════════════════════
+v1 SCOPE STATEMENT (LOCKED — this is the contract)
+══════════════════════════════════════════════════════════════════
+
+1. **Per-hero data.** Each `HeroData` row gains: `maxMana`, `startingMana`, `manaPerAttack`, `manaPerHit`, `manaPerHitCap`, `manaLockTicks` (default 0), `abilityId`. CSV-driven.
+
+2. **Per-hero runtime state.** `HeroStats` gains an integer `mana` field and a list of `ActiveStatus`. `EnemyStats` also gains an `ActiveStatus` list (for Bleed/Burn/Debuff applied to enemies).
+
+3. **Mana gain rules.**
+   - On hero's own attack: `mana += manaPerAttack` AFTER damage dealt.
+   - On hero taking damage: `mana += min(rawDamage, manaPerHitCap)` where `rawDamage` is **PRE-mitigation** (i.e., `enemyAtk` not `enemyAtk - heroDef`). Apply AFTER damage and HP update.
+   - If hero hp ≤ 0 after the hit, mana gain is still recorded but the cast does NOT fire (locked: no death-casts).
+   - Mana clamped to `[0, maxMana]`. **No overflow.**
+
+4. **Cast trigger boundary (LOCKED: between every atomic action).** After every single atomic action — one hero attack, or one enemy attack on a hero — call `ResolvePendingCasts()`. Walks heroes in slot order (0, 1, 2, ...); any alive hero with `mana >= maxMana` casts, applies effect, sets `mana = 0`, walk continues. Multiple casts can fire from a single trigger if multiple heroes are at max in slot order. After each cast, an `AnyAliveEnemy` / `AnyAliveHero` early-exit check.
+
+5. **Mana lock.** v1 default: `manaLockTicks = 0` (no lock). The CSV column exists and the resolver respects `manaLockTicksRemaining > 0` (skip cast), but no v1 hero ships with non-zero. Decrement at end-of-round alongside status tick.
+
+6. **Mana-on-KO.** A hero whose `hp <= 0` does NOT cast. Phoenix archetype is out.
+
+7. **Status effects.** Per-target list `List<ActiveStatus>` on `HeroStats` and `EnemyStats`. Each entry: `{ statusType, magnitude, ticksRemaining, sourceHeroIndex }`. Tick-down once at **end of enemy-side step** (one decrement per full hero+enemy round). v1 status types: `Shield`, `DamageOverTime`, `StatBuff`, `StatDebuff`. Re-cast of same type on same target REPLACES (not stacks). No cleanse, no stack-and-explode.
+
+8. **Mana persistence between floors (LOCKED).** Floor start: every alive hero's `mana = startingMana`. KO'd heroes stay KO'd. All status effects clear (heroes AND enemies). Then call `ResolvePendingCasts()` once (handles `startingMana >= maxMana` cast-at-floor-start case).
+
+9. **Ability target types:** `SelfOnly`, `FocusedEnemy`, `FirstAliveEnemy`, `FirstAliveAlly`, `LowestHpAliveAlly`, `AllEnemies`, `AllAllies`. Fallbacks:
+   - `FocusedEnemy` → `FirstAliveEnemy` if no focus set or rule is `NoFocus`.
+   - `FirstAliveAlly` / `LowestHpAliveAlly` → `SelfOnly` if caster is the only alive ally.
+   - `LowestHpAliveAlly` tiebreaker: lowest party-slot index.
+
+10. **Ability effect types:** `FlatDamage`, `FlatHeal`, `DamageOverTime`, `Shield`, `StatBuffNTicks`, `None`. Magnitude scales off caster's `atk` (or `maxHp` for Shield) via a coefficient stored in the ability data. NO ability-specific RNG.
+
+11. **Determinism invariant.** Full input set `(Party + floor + focus + dungeon rule)` produces a single byte-identical resolver output. `PreviewNextFloor` MUST run the same code path.
+
+12. **Wired-but-off interrupt hook.** `if (IsInterrupted(heroIndex)) skip cast;` — always returns false in v1.
+
+13. **CSV failure-mode.** Unknown `abilityId` resolves to a no-op `None` ability that still consumes mana on cast (resets to 0) but applies no effect. Logs warning. Game does NOT crash.
+
+14. **Out of v1 scope:** items, manaless heroes, player-chosen targets, mid-cast interrupts, multi-cast/chain, mana overflow, per-dungeon ability rules, enemy abilities, random-target abilities, mana persistence between floors, hero passives, ability cosmetics.
+
+══════════════════════════════════════════════════════════════════
+MANA → CAST FLOW (pseudocode — this is the behavior to implement)
+══════════════════════════════════════════════════════════════════
+
+```
+on_floor_start:
+  for each alive hero h:
+    h.mana = h.startingMana
+    h.activeStatuses.Clear()
+  for each enemy e:
+    e.activeStatuses.Clear()
+  ResolvePendingCasts()             // honors startingMana >= maxMana
+
+loop while AnyAliveHero AND AnyAliveEnemy:
+  // Hero side
+  for hi in 0..heroCount-1:
+    if hero[hi].hp <= 0: continue
+    PerformHeroAttack(hi)            // existing path, deals damage to picked enemy
+    hero[hi].mana = clamp(hero[hi].mana + manaPerAttack[hi], 0, maxMana[hi])
+    ResolvePendingCasts()            // NEW (Q1: between every atomic action)
+    if !AnyAliveEnemy: break
+
+  if !AnyAliveEnemy: break
+
+  // Enemy side
+  for ei in 0..enemyCount-1:
+    if enemy[ei].hp <= 0: continue
+    target = PickEnemyTarget(...)
+    rawDamage = ComputePreMitigationDamage(ei, target)   // = enemy.atk * dmgMult (mis-focus)
+    ApplyEnemyAttack(ei, target)     // existing path; updates target.hp via mitigated damage
+    if hero[target].hp > 0:
+      hero[target].mana = clamp(
+        hero[target].mana + min(rawDamage, manaPerHitCap[target]),
+        0,
+        maxMana[target]
+      )
+    ResolvePendingCasts()            // NEW
+    if !AnyAliveHero: break
+
+  // End-of-round: tick down every status and manaLock by 1; prune expired
+  TickAndPruneStatuses()
+
+ResolvePendingCasts():
+  for hi in 0..heroCount-1:
+    if hero[hi].hp <= 0: continue
+    if IsInterrupted(hi): continue          // always false in v1
+    if hero[hi].manaLockTicksRemaining > 0: continue
+    if hero[hi].mana >= maxMana[hi]:
+      CastAbility(hi)                       // applies effect via target-type resolution
+      hero[hi].mana = 0
+      // no mana lock in v1 data
+      if !AnyAliveEnemy: return
+      if !AnyAliveHero: return
+```
+
+══════════════════════════════════════════════════════════════════
+CURRENT CODE (what Claude will be modifying)
+══════════════════════════════════════════════════════════════════
+
+**Assets/Prototype/Scripts/CombatResolver.cs (full file, 204 lines):**
+
+```csharp
+using System.Collections.Generic;
+using System.Text;
+
+namespace DiverDungeon.Prototype
+{
+    public enum AttackType { Melee = 0, Ranged = 1 }
+
+    public struct HeroStats {
+        public int hp;
+        public int maxHp;
+        public int atk;
+        public int def;
+        public AttackType attackType;
+    }
+
+    public struct EnemyStats {
+        public int hp;
+        public int atk;
+        public int def;
+        public AttackType attackType;
+    }
+
+    public enum FloorOutcome { Cleared, Wiped }
+
+    public struct TickEvent {
+        public int tick;
+        public string actor;
+        public string target;
+        public int damage;
+        public int actorHpAfter;
+        public int targetHpAfter;
+    }
+
+    public struct CombatResult {
+        public FloorOutcome outcome;
+        public int[] heroHpAfter;
+        public int totalTicks;
+        public List<TickEvent> log;
+    }
+
+    public static class CombatResolver
+    {
+        public static CombatResult Resolve(IList<HeroStats> heroes, IList<EnemyStats> enemies,
+            int focusEnemyIndex, int seed, DungeonRule rule)
+        {
+            var heroList = new List<HeroStats>(heroes);
+            var enemyList = new List<EnemyStats>(enemies);
+            var log = new List<TickEvent>();
+            var rng = new System.Random(seed);
+            int tick = 0;
+
+            if (rule.focusRule == FocusRule.NoFocus) focusEnemyIndex = -1;
+
+            while (AnyAliveHero(heroList) && AnyAliveEnemy(enemyList))
+            {
+                // Hero side
+                for (int hi = 0; hi < heroList.Count; hi++)
+                {
+                    if (heroList[hi].hp <= 0) continue;
+                    int tIdx = PickHeroTarget(focusEnemyIndex, enemyList, rng);
+                    if (tIdx < 0) break;
+                    tick++;
+                    int dmg = System.Math.Max(1, heroList[hi].atk - enemyList[tIdx].def);
+                    var e = enemyList[tIdx];
+                    e.hp -= dmg;
+                    enemyList[tIdx] = e;
+                    log.Add(new TickEvent { tick=tick, actor=$"Hero{hi}", target=$"Enemy{tIdx}",
+                        damage=dmg, actorHpAfter=heroList[hi].hp, targetHpAfter=enemyList[tIdx].hp });
+                }
+
+                if (!AnyAliveEnemy(enemyList)) break;
+
+                // Enemy side
+                bool tideAlive = rule.focusRule == FocusRule.ForcedFocus
+                                 && rule.tideEnemyIndex >= 0
+                                 && rule.tideEnemyIndex < enemyList.Count
+                                 && enemyList[rule.tideEnemyIndex].hp > 0;
+                bool misFocusActive = tideAlive && focusEnemyIndex != rule.tideEnemyIndex;
+                float dmgMult = misFocusActive ? rule.misFocusDamageMultiplier : 1f;
+
+                for (int ei = 0; ei < enemyList.Count; ei++)
+                {
+                    if (enemyList[ei].hp <= 0) continue;
+                    int tIdx = PickEnemyTarget(heroList, rng);
+                    if (tIdx < 0) break;
+                    tick++;
+                    int rawDmg = System.Math.Max(1, enemyList[ei].atk - heroList[tIdx].def);
+                    int dmg = System.Math.Max(1, (int)System.Math.Round(rawDmg * dmgMult));
+                    var h = heroList[tIdx];
+                    h.hp -= dmg;
+                    heroList[tIdx] = h;
+                    log.Add(new TickEvent { tick=tick, actor=$"Enemy{ei}", target=$"Hero{tIdx}",
+                        damage=dmg, actorHpAfter=enemyList[ei].hp,
+                        targetHpAfter=System.Math.Max(0, heroList[tIdx].hp) });
+                }
+            }
+
+            var hpAfter = new int[heroList.Count];
+            for (int i = 0; i < heroList.Count; i++) hpAfter[i] = System.Math.Max(0, heroList[i].hp);
+            return new CombatResult {
+                outcome = AnyAliveHero(heroList) ? FloorOutcome.Cleared : FloorOutcome.Wiped,
+                heroHpAfter = hpAfter, totalTicks = tick, log = log
+            };
+        }
+
+        // ... PickHeroTarget, PickEnemyTarget, AnyAliveHero, AnyAliveEnemy unchanged
+    }
+}
+```
+
+NOTE: `HeroStats` is a `struct` — copy-by-value semantics. The current code uses `heroList[hi]` then `var h = heroList[tIdx]; h.hp -= dmg; heroList[tIdx] = h;` to mutate. Adding a `List<ActiveStatus>` field to a struct means the **list reference is shared on copy** unless explicitly cloned. This is a determinism trap — flag in your review.
+
+**Assets/Prototype/Scripts/HeroData.cs (full):**
+
+```csharp
+[Serializable]
+public class HeroData {
+    public int id;
+    public string heroName = "Hero";
+    public Color color = Color.white;
+    public int level = 1;
+    public int baseHp = 100;
+    public int hpPerLevel = 20;
+    public int baseAtk = 12;
+    public int atkPerLevel = 3;
+    public int baseDef = 2;
+    public int defPerLevel = 0;
+    public AttackType attackType = AttackType.Melee;
+
+    public int MaxHp => baseHp + (level - 1) * hpPerLevel;
+    public int Atk   => baseAtk + (level - 1) * atkPerLevel;
+    public int Def   => baseDef + (level - 1) * defPerLevel;
+
+    public HeroStats ToStats() => new HeroStats {
+        hp = MaxHp, maxHp = MaxHp, atk = Atk, def = Def, attackType = attackType
+    };
+}
+```
+
+**Assets/Prototype/Scripts/RunController.cs key bits:**
+
+- `Party` is `List<HeroStats>` (struct values, not refs).
+- `BeginFloor()` builds enemies and applies tide. Currently DOES NOT touch hero state. New behavior: at floor start, set each alive hero's `mana = startingMana`, clear all status effects on heroes and enemies, then run `ResolvePendingCasts()` once.
+- `ApplyFloorOutcome(int[] partyHpAfter, FloorOutcome outcome)` is how the resolver result currently flows back. Probably needs to also write back **mana** trajectories so the UI can read them.
+- `PreviewNextFloor()` computes `seed = floor * 1000 + Party.Count`, builds enemies, applies tide, and calls `CombatResolver.Resolve(Party, enemies, previewFocus, seed, previewRule)`. **The Party passed is the live `List<HeroStats>` — Resolve copies it into a new list internally. Currently safe because HeroStats is a pure-value struct. Adding a mutable List<ActiveStatus> field breaks this.**
+
+**Balance/balance_general.csv (current schema):** key,value,type,group,notes — flat key-value table. Hero per-row data is NOT yet in CSV (HeroData is currently a serialized class on a ScriptableObject or built in code; CSV path not wired for heroes yet). This means the v1 implementation will need a NEW CSV (e.g., `balance_heroes.csv`) AND a NEW CSV (e.g., `balance_abilities.csv`), plus loaders.
+
+**CsvLoader.cs** has `LoadFile(name)`, `Parse(text)`, `GetInt`, `GetFloat`, `GetString`, `ParseHexColor`. RFC-4180-ish parser exists.
+
+**FocusRule / DungeonRule** (in DungeonDefinition.cs, not pasted):
+- `FocusRule { NoFocus, FreeFocus, ForcedFocus }`.
+- `DungeonRule.Standard` = `FreeFocus, tideEnemyIndex=-1, misFocusDamageMultiplier=1`.
+
+══════════════════════════════════════════════════════════════════
+WHAT WE WANT FROM YOUR REVIEW
+══════════════════════════════════════════════════════════════════
+
+Your role-specific system prompt (loaded separately) tells you what nicheto focus on. In addition, every reviewer should answer:
+
+1. **Determinism risks.** Anywhere the proposed v1 plan, pseudocode, or implied data model could break Pillar 2. Flag dictionary iteration order, list identity sharing across struct copies, floating-point order, RNG sourcing, etc.
+
+2. **Edge cases the spec misses.**
+   - Status tick-down: should it happen ONLY at end-of-enemy-step, or also if the round ends mid-action because everyone died? What's the consistent rule?
+   - DamageOverTime ticks: at what point in the round? Same time as the global tick-down, or separate?
+   - Shield + DoT interaction: does Shield absorb DoT damage? (Spec is silent.)
+   - StatBuff applied mid-round: does the buffed value affect the SAME round's later actions or only next round?
+   - `LowestHpAliveAlly` when caster IS the lowest-HP ally: target self or skip?
+   - Cast that kills the focused enemy: focus auto-clears (spec says `RunController.FocusEnemyIndex` resets on `ApplyFloorOutcome`, but mid-floor focus when target dies is currently unhandled by the spec).
+   - `ResolvePendingCasts` re-entrancy: if a cast applies a `StatBuff` that grants mana to allies (not in v1, but is the framework safe against this?), do we recurse?
+   - Floor-start `ResolvePendingCasts`: if a hero has `startingMana >= maxMana` AND ability is `AllEnemies` AoE, we cast on ENEMIES THAT ARE FRESHLY SPAWNED — is that the intended player-experience?
+
+3. **C# / Unity gotchas.** Struct mutation of List<> fields, IList<> vs List<> copying, GC churn from per-cast allocations, `System.Random` re-seeding semantics, Unity serialization of lists-on-structs, ScriptableObject vs CSV trade-off for ability data.
+
+4. **CSV failure modes.** What if a row has `maxMana=0`? `manaPerAttack < 0`? `abilityId` empty string? Malformed CSV header? Suggest defensive defaults aligned with item 13 of the locked scope.
+
+5. **Preview cost.** `PreviewNextFloor()` is called on every UI state change. Currently it allocates two `List<>`, a `System.Random`, and a `List<TickEvent>`. Adding per-tick mana clamping + `ResolvePendingCasts` per atomic action + status tick + status list copies makes this materially more expensive. Suggest mitigations.
+
+6. **Test invariants the implementer should write.** What unit/property tests would prove the determinism invariant (#11)? What tests catch the struct-list-aliasing bug if it's introduced?
+
+7. **Public API shape (caller-facing).** `CombatResolver.Resolve` currently returns `CombatResult { outcome, heroHpAfter, totalTicks, log }`. To wire mana bars in the UI, the caller needs to see mana trajectories too. Suggest the smallest API extension that doesn't break existing callers (`RunController.PreviewNextFloor`, the current FloorPreview struct).
+
+8. **Anything else you'd flag for the implementer.**
+
+Output should be tight, numbered, and concrete. No hedging. If you would refuse to ship something specific, say so with the line number / spec item it conflicts with.

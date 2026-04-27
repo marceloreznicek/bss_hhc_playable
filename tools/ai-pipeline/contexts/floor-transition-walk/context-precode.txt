@@ -1,0 +1,396 @@
+TASK: pre-code review of the v1 implementation plan for **Floor Transition Walk Sequence** in DiverDungeon (Unity 6, C#, prototype-stage party combat). Your job is to surface edge cases, race conditions, animation/coroutine pitfalls, state-bug risks, and any design holes BEFORE Claude writes the code.
+
+══════════════════════════════════════════════════════════════════
+PROJECT CONTEXT
+══════════════════════════════════════════════════════════════════
+
+- **Engine:** Unity 6, C#. UI is uGUI (Canvas + RectTransform), procedurally built in `UIController.cs`.
+- **Architecture pillar:** combat is **deterministic** and stat-driven. Combat resolution lives in `CombatResolver`/`RunController` and is decoupled from the UI. The UI only schedules animations on top of the resolver output. **This feature must NOT alter combat resolution or determinism.** It is purely a presentation/flow change between floors.
+- **Floor flow today (no walk):**
+  1. Player clicks DESCEND → `OnDescendClicked()` → `run.BeginFloor()` returns enemies → `BuildEnemyVisuals(enemies)` → `StartCoroutine(RunLiveCombat(enemies))`.
+  2. `RunLiveCombat` ticks heroes/enemies in a strict turn-cycle until cleared/wiped → calls `run.ApplyFloorOutcome(...)`.
+  3. On clear: UI shows DESCEND / BANK; an `AUTO DESCEND IN N` timer (`StartDescendTimer`) auto-clicks DESCEND if the player does nothing. On wipe: button becomes `RETURN`. On bank: `RunBanked` event fires.
+- **No spatial scene yet.** Heroes and enemies are uGUI elements (`Image`/`RectTransform`) in `combatPanel`, anchored to rows (`heroRow` and `enemyRow`). Each visual has a `homeAnchoredPos` we can tween to/from. There is **no actual "room geometry"** — we re-use the same panel between floors.
+- **Existing assets we can reuse:** `flashOverlay` Image already exists (used for damage flashes); we can repurpose for fade. Hero `Animator` has clips like `Idle`, `attack`, `Defeat`. **No `walk` animation clip is guaranteed in v1** — the proposal falls back to idle-slide (translate the idle sprite) until a walk clip is wired.
+- **Prototype phase:** ~5 prototype scripts. No backwards-compat constraints. We can change struct shapes / add events freely.
+
+══════════════════════════════════════════════════════════════════
+v1 SCOPE STATEMENT (LOCKED — this is the contract)
+══════════════════════════════════════════════════════════════════
+
+1. **Trigger.** Sequence plays on every successful floor clear when the player chooses **Continue (Descend)** to the next floor. Wipe → no sequence (jump to RunOver UI). Bank → no sequence (jump to RunBanked UI). The Bank/Continue choice happens **before** the walk-out (so the moment of decision is preserved).
+
+2. **Sequence (blocking — UI inputs disabled until sequence ends).**
+   - **Walk-out (~0.5s):** all hero visuals translate upward off the top of `combatPanel` from their `homeAnchoredPos`. Speed = constant. Use a coroutine that lerps `anchoredPosition.y` outward.
+   - **Fade-out (~0.25s):** `flashOverlay` fades from alpha 0 → 1 (black). Concurrent with the **last** part of walk-out OR sequenced after — implementation detail, but total walk-out + fade should land at ~0.75s.
+   - **Room swap (instant, while screen is black):** existing enemy visuals are destroyed (`BuildEnemyVisuals` already does this on entry to next floor); next floor's enemies are built and placed at their `homeAnchoredPos`; hero visuals are repositioned to a "below-screen" entry point (their `homeAnchoredPos.y - offset`) so they can walk back in.
+   - **Fade-in (~0.25s):** `flashOverlay` fades 1 → 0.
+   - **Walk-in (~0.5s):** hero visuals translate from below-screen entry point up to their `homeAnchoredPos`. Constant speed.
+   - **FIGHT banner (~0.6s hold, with brief punch-in scale at start):** large "FIGHT" Text overlay in the center of `combatPanel`. Pulse-in scale (e.g., 1.4 → 1.0 over 0.1s), hold ~0.4s, fade out ~0.1s.
+   - **Combat begins:** after banner finishes, call existing `RunLiveCombat(enemies)` path. **No change** to combat ticking behavior.
+
+3. **Total budget: ~2.1s** (walk-out 0.5 + fade 0.5 + walk-in 0.5 + banner 0.6). Numbers are tunable but should live as `const float` at top of UIController (NOT hardcoded inline).
+
+4. **State guards (CRITICAL).**
+   - `isPlayingFloor` must be `true` for the entire transition + combat (so DESCEND/BANK can't be clicked, and the auto-descend timer is stopped before sequence starts).
+   - The auto-descend timer (`StopDescendTimer`) must be stopped at the moment the player commits to Descend — same as today.
+   - `descendButton.interactable = false` and `bankButton.interactable = false` for the duration of the sequence — same as today during combat.
+   - **No double-trigger:** if `isPlayingFloor == true`, `OnDescendClicked` early-returns (existing guard preserved).
+
+5. **Dead party members.** Heroes with `hp <= 0` do NOT walk. They:
+   - Stay slumped (current `Defeat` animation) and do NOT translate during walk-out — they fade out with the screen instead.
+   - During room swap, they're repositioned at their `homeAnchoredPos` (off-screen-below entry is for alive heroes only).
+   - They do NOT walk in. They appear at `homeAnchoredPos` already slumped when fade-in completes.
+   - Their `hp = 0` state is preserved across floors (current behavior — `RunController.ApplyFloorOutcome` does not revive).
+
+6. **Camera.** No camera movement. The "room change" is sold by the fade-to-black + the walk-out/walk-in deltas. We do NOT pan or stitch room geometry. (Out of scope; flagged for later.)
+
+7. **Enemy entry.** Enemies for the next floor are **already in place** when fade-in completes. They do NOT walk in. The party walks toward static enemies, then "FIGHT" lands.
+
+8. **Wipe path (UNCHANGED).** On wipe, no walk-out plays; existing `Flash(red)` + `WIPED on floor N` UI shows. Heroes do not walk anywhere on death.
+
+9. **Bank path (UNCHANGED).** On Bank click, `run.Bank()` fires immediately, `OnRunBanked` event runs the existing flash + return-to-meta flow. No walk-out.
+
+10. **Final-floor / dungeon-clear.** Out of scope for v1. The walk-out plays on every successful floor clear that leads to another floor. There is no "final floor" concept in current prototype; if a dungeon has finite floors in the future, the sequence will need a special-case skip — flag this as a known limitation, not a v1 task.
+
+11. **Walk animation.** v1 falls back to **idle-slide** (translate the existing idle sprite). If the hero `Animator` has a `walk` state, switch to it during walk-out/walk-in and revert to `Idle` after; otherwise leave on `Idle` and just translate. No hard requirement on a walk clip in v1.
+
+12. **Determinism.** This feature MUST NOT call into `RunController` for anything other than the existing `BeginFloor()` call (which it already does). The walk sequence is pure UI; it does not touch `Party`, `enemies`, RNG, or floor state. **Combat tick output is unchanged byte-for-byte.**
+
+13. **Out of v1 scope:**
+   - Camera pan / parallax / room geometry
+   - Per-dungeon room art variety
+   - Boss-floor unique entry
+   - Walk animation clip authoring (idle-slide for v1)
+   - Enemy walk-in / spawn animations
+   - SFX (wire one event hook `OnFightBannerShown` for future audio; do not add audio code in v1)
+
+══════════════════════════════════════════════════════════════════
+PROPOSED IMPLEMENTATION SHAPE (the plan to validate)
+══════════════════════════════════════════════════════════════════
+
+All changes in `Assets/Prototype/Scripts/UIController.cs`. No changes to `RunController.cs` or any other script.
+
+```csharp
+// Top of UIController class — new constants (tunable; live next to other timing consts)
+const float WalkOutDuration   = 0.5f;
+const float FadeOutDuration   = 0.25f;
+const float FadeInDuration    = 0.25f;
+const float WalkInDuration    = 0.5f;
+const float FightBannerHold   = 0.4f;
+const float FightBannerIn     = 0.1f;
+const float FightBannerOut    = 0.1f;
+const float WalkOffsetY       = 600f;   // pixels off-screen for walk start/end
+
+// New event for future audio hookup (v1 has no subscribers)
+public event System.Action OnFightBannerShown;
+
+// New: FIGHT banner Text built once in BuildCombat() alongside flashOverlay.
+Text fightBanner; // built once, disabled by default
+
+// MODIFIED: OnDescendClicked replaces the existing body
+void OnDescendClicked()
+{
+    if (isPlayingFloor) return;
+    StopDescendTimer();
+    ClearDamageLayer();
+
+    // Disable buttons immediately so the player can't double-click during transition
+    descendButton.interactable = false;
+    bankButton.interactable = false;
+
+    // CurrentFloor > 0 means we just cleared a floor — play the walk transition.
+    // CurrentFloor == 0 means this is the FIRST descend of the run — skip walk-out
+    // (heroes haven't been "in" any room yet). Floor 1 still gets fade-in + FIGHT banner.
+    bool playWalkOut = run.CurrentFloor > 0;
+    StartCoroutine(FloorTransitionThenCombat(playWalkOut));
+}
+
+IEnumerator FloorTransitionThenCombat(bool playWalkOut)
+{
+    isPlayingFloor = true;          // lock for the entire transition + combat
+    try
+    {
+        // 1. Walk-out (only if we cleared a floor)
+        if (playWalkOut)
+            yield return WalkOutAlive();
+
+        // 2. Fade to black
+        yield return FadeOverlay(0f, 1f, FadeOutDuration);
+
+        // 3. Room swap (while black)
+        var enemies = run.BeginFloor();
+        BuildEnemyVisuals(enemies);
+        UpdateFocusVisuals();
+        UpdateCounters();
+        // Reposition alive heroes below-screen for walk-in
+        for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
+        {
+            var hv = heroVisuals[i];
+            if (hv.root == null) continue;
+            if (run.Party[i].hp <= 0)
+            {
+                // Dead hero — stay at home, slumped sprite already set last floor
+                hv.root.anchoredPosition = hv.homeAnchoredPos;
+            }
+            else
+            {
+                hv.root.anchoredPosition = hv.homeAnchoredPos + new Vector2(0, -WalkOffsetY);
+                if (hv.animator != null) hv.animator.Play("Idle", 0, 0f);
+            }
+        }
+
+        // 4. Fade in
+        yield return FadeOverlay(1f, 0f, FadeInDuration);
+
+        // 5. Walk in (alive heroes only)
+        yield return WalkInAlive();
+
+        // 6. FIGHT banner
+        yield return ShowFightBanner();
+
+        // 7. Hand off to combat (UNCHANGED resolver path)
+        // (isPlayingFloor stays true — RunLiveCombat asserts it on entry)
+        yield return RunLiveCombat(enemies);
+    }
+    finally
+    {
+        // RunLiveCombat already toggles isPlayingFloor = false on exit;
+        // belt-and-suspenders in case of exception during the transition itself.
+        isPlayingFloor = false;
+    }
+}
+
+IEnumerator WalkOutAlive()
+{
+    float t = 0f;
+    // Snapshot start positions for alive heroes
+    var starts = new Vector2[heroVisuals.Count];
+    for (int i = 0; i < heroVisuals.Count; i++)
+        starts[i] = heroVisuals[i].root != null ? heroVisuals[i].root.anchoredPosition : Vector2.zero;
+
+    while (t < WalkOutDuration)
+    {
+        t += Time.deltaTime;
+        float u = Mathf.Clamp01(t / WalkOutDuration);
+        for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
+        {
+            if (run.Party[i].hp <= 0) continue; // dead heroes don't walk
+            var hv = heroVisuals[i];
+            if (hv.root == null) continue;
+            hv.root.anchoredPosition = starts[i] + new Vector2(0, WalkOffsetY * u);
+        }
+        yield return null;
+    }
+}
+
+IEnumerator WalkInAlive()
+{
+    float t = 0f;
+    var starts = new Vector2[heroVisuals.Count];
+    for (int i = 0; i < heroVisuals.Count; i++)
+        starts[i] = heroVisuals[i].root != null ? heroVisuals[i].root.anchoredPosition : Vector2.zero;
+
+    while (t < WalkInDuration)
+    {
+        t += Time.deltaTime;
+        float u = Mathf.Clamp01(t / WalkInDuration);
+        for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
+        {
+            if (run.Party[i].hp <= 0) continue;
+            var hv = heroVisuals[i];
+            if (hv.root == null) continue;
+            hv.root.anchoredPosition = Vector2.Lerp(starts[i], hv.homeAnchoredPos, u);
+        }
+        yield return null;
+    }
+    // Snap to exact home (avoid float drift)
+    for (int i = 0; i < heroVisuals.Count && i < run.Party.Count; i++)
+    {
+        if (run.Party[i].hp <= 0) continue;
+        if (heroVisuals[i].root != null)
+            heroVisuals[i].root.anchoredPosition = heroVisuals[i].homeAnchoredPos;
+    }
+}
+
+IEnumerator FadeOverlay(float fromAlpha, float toAlpha, float duration)
+{
+    if (flashOverlay == null) { yield break; }
+    // Force black for the room-swap fade (overlay is reused for damage flashes; restore color afterward is fine
+    // because every damage flash sets its own color)
+    var c = flashOverlay.color; c.r = 0f; c.g = 0f; c.b = 0f; c.a = fromAlpha;
+    flashOverlay.color = c;
+    float t = 0f;
+    while (t < duration)
+    {
+        t += Time.deltaTime;
+        float u = Mathf.Clamp01(t / duration);
+        c.a = Mathf.Lerp(fromAlpha, toAlpha, u);
+        flashOverlay.color = c;
+        yield return null;
+    }
+    c.a = toAlpha; flashOverlay.color = c;
+}
+
+IEnumerator ShowFightBanner()
+{
+    if (fightBanner == null) yield break;
+    fightBanner.gameObject.SetActive(true);
+    var rt = fightBanner.rectTransform;
+
+    // Punch-in
+    float t = 0f;
+    while (t < FightBannerIn)
+    {
+        t += Time.deltaTime;
+        float u = Mathf.Clamp01(t / FightBannerIn);
+        rt.localScale = Vector3.Lerp(new Vector3(1.4f, 1.4f, 1f), Vector3.one, u);
+        var col = fightBanner.color; col.a = u; fightBanner.color = col;
+        yield return null;
+    }
+    rt.localScale = Vector3.one;
+    var c = fightBanner.color; c.a = 1f; fightBanner.color = c;
+
+    OnFightBannerShown?.Invoke();
+
+    // Hold
+    yield return new WaitForSeconds(FightBannerHold);
+
+    // Fade out
+    t = 0f;
+    while (t < FightBannerOut)
+    {
+        t += Time.deltaTime;
+        float u = Mathf.Clamp01(t / FightBannerOut);
+        var col = fightBanner.color; col.a = 1f - u; fightBanner.color = col;
+        yield return null;
+    }
+    fightBanner.gameObject.SetActive(false);
+}
+```
+
+ALSO: in `BuildCombat()`, after `flashOverlay` is created, build the `fightBanner` Text:
+- Parent: `combatPanel`
+- Anchor: center
+- Font size: ~140
+- Text: "FIGHT"
+- Bold, white with subtle outline
+- `gameObject.SetActive(false)` by default
+- Sibling order: above `flashOverlay` (so the banner shows even if overlay is mid-fade — but in our flow they don't overlap, so this is defensive)
+
+══════════════════════════════════════════════════════════════════
+EXISTING CODE THAT WILL BE TOUCHED OR THAT MATTERS
+══════════════════════════════════════════════════════════════════
+
+```csharp
+// UIController.cs:1066 — current OnDescendClicked (TO BE REPLACED)
+void OnDescendClicked()
+{
+    if (isPlayingFloor) return;
+    StopDescendTimer();
+    ClearDamageLayer();
+    var enemies = run.BeginFloor();
+    BuildEnemyVisuals(enemies);
+    UpdateFocusVisuals();
+    descendButton.interactable = false;
+    bankButton.interactable = false;
+    StartCoroutine(RunLiveCombat(enemies));
+}
+
+// UIController.cs:1079 — Bank (UNCHANGED)
+void OnBankClicked()
+{
+    if (isPlayingFloor) return;
+    StopDescendTimer();
+    run.Bank();
+}
+
+// UIController.cs:1108 — auto-descend timer auto-clicks Descend at the end
+IEnumerator DescendTimerRoutine()
+{
+    // ... countdown ...
+    if (descendButton != null && descendButton.interactable)
+        OnDescendClicked();
+}
+
+// UIController.cs:1231 — RunLiveCombat (UNCHANGED, called at end of transition)
+IEnumerator RunLiveCombat(List<EnemyStats> enemyTemplate)
+{
+    isPlayingFloor = true;
+    // ... ticks until ApplyFloorOutcome, then sets isPlayingFloor = false at the end ...
+}
+
+// UIController.cs:79 — HeroVisual (relevant fields)
+class HeroVisual {
+    public RectTransform root;
+    public Vector2 homeAnchoredPos;
+    public Animator animator;
+    // ...
+}
+
+// RunController.cs:81 — StartRun resets CurrentFloor = 0
+// RunController.cs:102 — BeginFloor increments CurrentFloor and returns enemies for that floor
+// RunController.cs:113 — ApplyFloorOutcome handles wipe (RunOver) vs clear (AwaitingDecision)
+```
+
+══════════════════════════════════════════════════════════════════
+QUESTIONS FOR EACH AI (focused validation)
+══════════════════════════════════════════════════════════════════
+
+### For Claude Opus 4.7 (edge cases invisible):
+1. The very FIRST descend of a run (`CurrentFloor == 0` before `BeginFloor`) — the plan skips walk-out but still does fade + walk-in + FIGHT. Is that the right call, or should the first descend also skip the fade and just play FIGHT? Any UX awkwardness?
+2. Auto-descend timer fires `OnDescendClicked()` automatically. If the player clicks DESCEND at the *exact* same frame the auto-timer fires, can both fire and start two coroutines? Re-check the `isPlayingFloor` guard ordering.
+3. If the player clicks BANK on the same frame they click DESCEND (or auto-descend fires in same frame), is there any race where BANK wins after the transition coroutine starts? The plan disables `bankButton.interactable` AFTER `StopDescendTimer` but before starting the coroutine — is that ordering safe?
+4. `flashOverlay` is reused for damage flashes during combat. After the transition's fade-in completes, alpha is 0 — but its `.color` was forced to black. The next damage flash sets its own color, so this should be fine. Confirm there's no race where a damage flash starts mid-transition.
+5. During walk-out, `Time.deltaTime` is used. If the game is paused (Time.timeScale = 0) or the user backgrounded the app, will the coroutine hang forever? Should we use `Time.unscaledDeltaTime`?
+6. Are there any layout-rebuild gotchas — does `BuildEnemyVisuals` triggering during the black-screen moment cause a visible 1-frame flash before fade-in starts? Worth a `Canvas.ForceUpdateCanvases()` call?
+7. The `try/finally` around the IEnumerator — does Unity's coroutine system propagate exceptions through `yield return` correctly enough that `finally` will run on `StopAllCoroutines` or on scene unload?
+
+### For Claude Sonnet 4.6 (security auditor — repurposed for correctness/state safety):
+1. Is there any way `isPlayingFloor` can leak (stay true forever) if a yield throws or if `RunLiveCombat` exits abnormally? Walk through every exit path.
+2. The `OnFightBannerShown` event has no v1 subscribers. If a future subscriber throws, does it brick the transition? Should the invoke be wrapped in try/catch?
+3. The plan uses `run.Party[i].hp <= 0` to decide who walks. But `BeginFloor()` is called between walk-out and walk-in — does `Party` HP get mutated by `BeginFloor()`? (Confirm: `BeginFloor` only increments floor and builds enemies; it does not touch `Party`. Verify in source.)
+4. `flashOverlay` color is mutated in-place (RGB forced to black). If the alpha is 0 after fade-in but RGB is black, the next damage flash that wants red will overwrite RGB anyway. Confirm no surprise.
+
+### For GPT-5.3 Codex (logical reasoning):
+1. Sequence ordering: walk-out → fade-out → swap → fade-in → walk-in → banner → combat. Is the swap (BeginFloor + BuildEnemyVisuals + reposition heroes) correctly placed at the *peak* of the fade (full black)? Or should it happen AFTER fade-out completes but BEFORE fade-in starts? The plan does it in the dead zone — confirm.
+2. The reposition step puts alive heroes at `homeAnchoredPos + (0, -WalkOffsetY)`. But walk-out moved them to `homeAnchoredPos + (0, +WalkOffsetY)` (off-screen TOP). The next room they enter from BOTTOM. That means visually they "exit top, enter bottom" — is the polarity of `WalkOffsetY` correct in both `WalkOutAlive` (positive Y) and reposition (negative Y)?
+3. `WalkInAlive` lerps from current anchored position (which is `home + (0, -offset)`) to `home`. That's correct. But `WalkOutAlive` snapshots `starts` and adds `(0, offset * u)` — it does NOT clamp to home + offset at the end. After walk-out, an alive hero is at `home + (0, offset)`. Then reposition forces `home + (0, -offset)`. That's a discontinuity but it's during black screen — fine. Confirm.
+4. If a hero dies on the *previous* floor's last tick, the plan says "stay slumped at homeAnchoredPos" during walk-out. But at the moment walk-out starts, the dead hero is *already* at home (combat ends with everyone at home). So skipping the translation for `hp <= 0` is sufficient — they just stay put. Confirm.
+
+### For GPT-5.5 (co-coder):
+1. Review each of the new methods (`FloorTransitionThenCombat`, `WalkOutAlive`, `WalkInAlive`, `FadeOverlay`, `ShowFightBanner`). Any bugs, off-by-ones, or missing null-checks?
+2. Should `FloorTransitionThenCombat` cache `Party.Count` once, or read `run.Party.Count` each iteration? (Party doesn't change during a floor transition, but defensive question.)
+3. The `fightBanner` Text needs to be built in `BuildCombat()`. Provide the exact construction snippet matching existing `MakeText` patterns in this file.
+4. Naming: `WalkOffsetY` — is this the right unit (pixels)? Should it be derived from `combatPanel` height instead so it scales with screen size?
+
+### For KAT Coder Pro V2 (Unity-specific TL;DR):
+1. Is `IEnumerator` + `StartCoroutine` the right Unity idiom here, or should this use `async Task` / `UniTask`? Project doesn't use UniTask today — stick with coroutines. Confirm.
+2. `Time.deltaTime` vs `Time.unscaledDeltaTime` — which is right for a UI transition that should always play at real-time?
+3. `RectTransform.anchoredPosition` vs `localPosition` for the translation — anchored is right because the visuals are anchored in `combatPanel`. Confirm.
+4. The `flashOverlay` is an `Image`. Mutating its `.color.a` directly works in uGUI. Confirm there's no `CanvasGroup` interaction needed.
+
+### For Qwen 3.6 Plus (devil's advocate):
+1. Is the entire feature over-engineered for v1? Could we ship "fade-to-black + FIGHT banner" only (no walk) and get 80% of the impact?
+2. Is the 2.1s total budget too long? Players will sit through this between EVERY floor — at floor 30, that's 60 seconds of waiting. Should the sequence get shorter as the run progresses, or is fixed-time fine?
+3. Is there any value in letting the player TAP-TO-SKIP the transition? Or does that defeat the purpose of the pacing beat?
+
+### For Gemini 3 Flash (brainstorm):
+1. Weird scenarios that could break this: app backgrounded mid-fade, scene reload mid-walk, `OnDestroy` called during the coroutine. What invariants should we assert?
+2. Is there a simpler "single-coroutine" framing vs. the proposed split into many helper coroutines? Tradeoffs?
+
+### For Grok 4.20 (red team):
+1. Try to break this. What input sequence (button mashing, rapid focus changes, scene reloads) could leave the UI in an inconsistent state?
+2. If `RunLiveCombat` throws an exception, what's the resulting state of the UI? Is there a recovery path, or is the run dead?
+3. Memory: `BuildEnemyVisuals` destroys old visuals and creates new ones every floor. Combined with the fade, are there any leaks (e.g., dead enemies' `Image` objects still parented somewhere)?
+
+══════════════════════════════════════════════════════════════════
+DELIVERABLE
+══════════════════════════════════════════════════════════════════
+
+For each AI: respond with CONCRETE bugs/risks/edge cases (not style opinions). Mark each as:
+- **BLOCKER** — must fix before code is written
+- **NIT** — worth fixing but not blocking
+- **OUT-OF-SCOPE** — flag for v2 / next feature
+
+If the plan is ready as-is, say so explicitly. If it needs changes, list them in priority order.

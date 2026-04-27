@@ -1,0 +1,130 @@
+TASK: pre-code review of the v1 implementation plan for the **Enemy Visual Juice** feature in DiverDungeon (Unity 6, C#, turn-based deterministic party combat). The 17 enemy sprites are static PNGs with no idle animation. Goal is to give them perceived life via procedural transform-driven motion + a healthbar treatment that replaces the current numeric HP label. Surface determinism risks, mobile perf concerns, sync bugs with the live-combat coroutine, and edge cases BEFORE Claude writes the code.
+
+══════════════════════════════════════════════════════════════════
+PROJECT CONTEXT
+══════════════════════════════════════════════════════════════════
+
+- **Engine:** Unity 6, C# (LinuxEditor 2022.3.62f3 in dev). Mobile target.
+- **Pillar 1 — battles must FEEL alive.** Sprites are static PNGs. No animation, no rigged characters. We have ~16ms/frame on phones; the visual juice layer must be cheap.
+- **Pillar 2 — battles are deterministic.** Same `(party, dungeon, focus, floor)` MUST yield byte-identical resolver output every time. The deterministic resolver in `CombatResolver.Resolve(...)` and `RunController.PreviewNextFloor()` MUST NOT be perturbed by visual juice. Anything new must be presentation-only. NO `Time.deltaTime` in resolver. NO `UnityEngine.Random` reads from anywhere on the combat path.
+- **Where the juice goes:** `Assets/Prototype/Scripts/UIController.cs` — function `BuildEnemyVisuals(List<EnemyStats>)` (lines 1811–1900) builds the on-screen enemy widgets dynamically as UI Image inside `enemyRow` (a RectTransform inside the Canvas). The prefabs at `Assets/Enemies/Prefabs/<World>/Enemy_<slug>.prefab` use SpriteRenderer (3D world-space) but `BuildEnemyVisuals` does NOT instantiate them today; it builds an inline `Image`. The `EnemyView` MonoBehaviour exists but is dead code in v1.
+- **Existing per-enemy widget structure** (`EnemyVisual` class, line 141):
+  - `RectTransform root` (anchored at `homeAnchoredPos`)
+  - `Image sprite` (the enemy art; falls back to flat-red color block if sprite null)
+  - `Text hpLabel` ← TO BE REPLACED with healthbar
+  - `Image focusRing` (yellow ring or tide-blue ring)
+  - `int hpStart`, `Color baseColor`
+- **Today's HP label updates** (must be replaced with bar fill):
+  - line 1958–1959 (post-attack snapshot)
+  - line 2016–2017 (per-enemy-update during the attack tween)
+  - line 2255–2256 (end-of-round snapshot)
+- **Combat coroutine:** `RunLiveCombat` (line 1918+) animates the deterministic CombatResolver log. It moves enemies (`enemyVisuals[i].root.anchoredPosition`) for floor-transition walks (line 1484, 1560, 1571). Bob/weave must NOT fight those tween writes during transitions. Visuals also do attack flashes, focus-ring updates, and end-of-floor death tinting.
+- **Per-enemy state available at build time:** `EnemyStats` carries `enemyDataId`, `hp`, `maxHp`, `attackType`, `mana`, `maxMana`, `abilityManaCost`, etc. From `enemyDataId` we can look up `EnemyData.archetype` (Grunt/Swarm/Bruiser/Ranged/Caster/Anchor) for per-archetype tuning.
+- **Tide-marker enemy** is highlighted today via `focusRing` color swap (line 1888). On Drowned Crypt floors the Tide enemy is the "boss" — perfect target for an anchor pulse effect.
+
+══════════════════════════════════════════════════════════════════
+LOCKED REQUIREMENTS (user-mandated, do NOT challenge)
+══════════════════════════════════════════════════════════════════
+
+1. **All enemies render at 1.5× current size.**
+   - Today the enemy widget side is `each = Mathf.Min(180f, ...)`. Bump that base to 270f.
+   - Layout (`gap`, anchoring) must still keep all enemies on-screen for the max enemy count (Hollow gets up to ~8 enemies on deep floors; verify the row width still accommodates 8 × 270 + 7 × 30 gaps ≈ 2370 — current `enemyRow.sizeDelta.x` likely needs to clamp via `Mathf.Min(270f, (maxW - gap*(n-1))/n)`).
+
+2. **Bob and weave** — every enemy procedurally moves vertically (bob) and laterally (weave) with sin-wave motion to give them char.
+   - Amplitude small (~5–10 px in UI units, will tune).
+   - Frequency low (~0.8–1.2 Hz per axis, will tune).
+   - Per-enemy phase offset so the screen does NOT lockstep (CRITICAL — without this it looks like a chorus line).
+
+3. **Slight expand and contract** — uniform scale pulse (breathe), separately phased.
+   - Range ~0.97×–1.03× of base (which is 1.5× the original).
+   - Frequency ~0.6 Hz.
+
+4. **Healthbars only — NO numeric HP shown anywhere on enemies.** Replace `hpLabel` Text entirely with a fill bar above the sprite.
+   - Bar color graded by HP%: green ≥60%, yellow 30–60%, red <30%.
+   - Must update at the same beats the old numeric label updated (post-attack, mid-attack tween, end-of-round).
+   - The numeric `hpLabel` Text component should be removed from the EnemyVisual class.
+
+══════════════════════════════════════════════════════════════════
+DESIGNER PROPOSALS TO ADD LIFE (these need your review — accept/reject/refine)
+══════════════════════════════════════════════════════════════════
+
+**P1. Per-enemy phase offsets — deterministic from slot index, NOT runtime random.**
+Use `slotIndex * golden_ratio_seed` (or hash of `enemyDataId + slot`) so identical previews replay identical motion. Pure visual, but consistent with our "preview is reproducible" pillar. Also avoids `UnityEngine.Random` calls on the hot path.
+
+**P2. Per-archetype tuning of bob/weave/breathe params:**
+- **Swarm (Goblin/Kobold/Giant Rat)** — twitchy, ~1.5 Hz bob, smaller amp
+- **Grunt (Bandit/Zombie)** — baseline
+- **Bruiser (Bandit Brute/Bone Warrior/Ratman)** — slower, ~0.7 Hz, heavier weave amp
+- **Ranged (Bandit Archer/Bone Archer/Vampire)** — medium, slight aim sway toward focus enemy(player side)
+- **Caster (Goblin Shaman)** — medium baseline + brief 0.2s "sway pause" every 3s (suggests channeling)
+- **Anchor (Ogre/Mummy Brute/Mutant Spider)** — slow, ~0.5 Hz, big weave amp, low bob
+
+**P3. Z-tilt sway (rotation around Z) ±3°, out of phase with bob — pendulum body feel.**
+
+**P4. Hit reaction punch:** on damage taken, scale punch to 1.15× → 1.0× over 0.12s + brief desaturation flash. Replace/augment the existing red-flash treatment.
+
+**P5. Death wilt:** on hp→0, rotate 90° + alpha fade over 0.4s instead of just tinting `Color(0.4, 0.1, 0.1, 0.35)` (line 2265). After settle, sprite stays in wilted pose for the rest of the floor.
+
+**P6. Anchor/Tide pulse:** for the Tide enemy on Drowned Crypt (`run.CurrentTideIndex`), brightness pulse on the sprite (multiply color by 0.92→1.08) at ~0.5 Hz. Reads as "boss." Coexists with the existing focusRing.
+
+**P7. Caster wind-up:** when `enemy.mana >= enemy.abilityManaCost - 1` (about to cast), upscale to 1.1× and saturate color slightly for the tick before cast. Synchronizes with the cast beat in `RunLiveCombat`.
+
+**P8. Healthbar visual treatment:**
+- Bar above sprite, full width of sprite, ~12 px tall
+- Background = dark gray (0.15, 0.15, 0.15, 0.8)
+- Fill = HP%-graded gradient (green/yellow/red)
+- Tiny shake on the bar (NOT the sprite root) when damage lands, ~3 px amplitude, 0.1s
+- Bar hides when enemy is dead
+
+══════════════════════════════════════════════════════════════════
+KEY DESIGN DECISIONS UNDER REVIEW (flag tradeoffs / risks)
+══════════════════════════════════════════════════════════════════
+
+**D1. Where does the per-frame motion live?**
+- (A) Per-enemy `EnemyJuice` MonoBehaviour added inline by `BuildEnemyVisuals`, runs its own `Update()`. Pro: locality. Con: 8× MonoBehaviours each frame.
+- (B) Single `EnemyVisualScheduler` MonoBehaviour on a host GO that iterates `enemyVisuals` once per frame and writes transforms. Pro: better cache locality, one Update call. Con: more central.
+- (C) Drive everything from inside the existing `RunLiveCombat` coroutine via `WaitForEndOfFrame`. Pro: zero new MonoBehaviours. Con: only animates during live combat — between floors, on screens like dungeon select, the enemies (if visible) freeze.
+- **Recommendation we want validated:** **(B)** — central scheduler. Mobile perf wins by avoiding 8 Update() callbacks. Pause via `enabled=false` is trivial.
+
+**D2. Determinism & visual-only invariant.**
+The scheduler reads `Time.unscaledTime` (or `Time.time`) and per-enemy phase. Phase derives from `slotIndex` (deterministic) — NOT from `UnityEngine.Random`. The scheduler MUST NOT mutate `EnemyStats`, focus, mana, or anything `RunController`/`CombatResolver` reads. **Risk to flag:** does anything in `RunLiveCombat` read `root.anchoredPosition` (already mutated by walk transitions) and depend on it being on-grid? See lines 1484, 1560, 1571. Bob during a walk-in transition would skew the lerp target.
+
+**D3. Pause windows for procedural motion.**
+- Floor transition walk-in (line 1480–1497): bob is OFF (otherwise heroes/enemies wobble across the screen).
+- Death (P5): bob is OFF for the dead enemy after wilt completes.
+- Mid-attack tween (when an enemy lunges to hit): bob is OFF for that enemy during the tween, ON for the others.
+- Cast wind-up (P7): bob is reduced/shifted; not killed.
+- Idle (between attacks): bob is ON.
+
+How do we cleanly express these state transitions? Suggest: enum `JuiceMotion { Off, Idle, WindUp, Tween, Dead }` per-enemy, set by callsites.
+
+**D4. UI Canvas perf — is procedurally moving 8× UI Images cheap enough on phones?**
+Each enemy has: `RectTransform.anchoredPosition` write + `localScale` write + `Image.color` write per frame = 3 dirty notifications × 8 enemies = 24 layout-rebuild triggers/frame. Concern: Canvas rebuilds. Mitigation: Each enemy widget already has its own RectTransform parented under `enemyRow`. Rebuilds should be local but verify Canvas batches them. Hero side already animates the RawImage (RenderTexture from 3D); adding 8 enemies should be fine if we measure.
+
+**D5. Healthbar architecture.**
+- (A) New struct field `Image hpFill` + `Image hpBg` on `EnemyVisual`. Build them in `BuildEnemyVisuals` immediately above sprite. Update in `SetEnemyHp(i, current, max)` helper.
+- (B) Reuse the hero healthbar pattern from `BuildHeroVisuals` (which has its own hpFill).
+- (C) Instantiate the prefab's `EnemyView.hpFill` (currently null on prefabs). This requires refactoring `BuildEnemyVisuals` to instantiate the prefab — out of scope; flag as v2.
+
+**Recommendation we want validated:** **(A)**, mirroring hero pattern but kept inline.
+
+**D6. Scaling impact on layout.**
+With 1.5×: 8 enemies × 270 + 7 gaps × 30 = 2370 px. The current row width is unknown but heroes are clamped at 288 max each. Verify `enemyRow.sizeDelta.x` accommodates worst case OR keep the `Mathf.Min(270f, (maxW - gap*(n-1))/n)` clamp so they shrink under crowding.
+
+**D7. Shake direction for healthbar damage tells.**
+Apply shake to the healthbar root only, not the sprite root (sprite is busy bobbing). Cross-check with hit-reaction punch (P4) — these run simultaneously when an enemy is hit. Visual chorus or visual chaos?
+
+══════════════════════════════════════════════════════════════════
+WHAT WE WANT FROM EACH REVIEWER
+══════════════════════════════════════════════════════════════════
+
+For each section below, give a numbered list of concerns with severity (BLOCKER / MAJOR / MINOR / NIT) and a one-line proposed fix:
+
+1. **Determinism risks** — anything in the proposal that could leak into the resolver / preview / replay path.
+2. **Mobile perf risks** — Update() costs, Canvas rebuilds, GC allocs per frame, transform setter chains.
+3. **Sync bugs with `RunLiveCombat`** — overlap between procedural bob/weave and the existing tween writes (walk-in, attack lunge, wilt).
+4. **Edge cases** — 8 enemies on Hollow deep floor, mid-tween focus change, dead enemy is the Tide, cast wind-up while healthbar is shaking, focus ring + anchor pulse double-tinting, etc.
+5. **Recommendation on D1–D7** — accept the recommended option or argue for an alternative.
+6. **Anything missing from P1–P8** — what idle-life trick are we leaving on the table?
+
+Output format: keep your sections short. No need for code blocks unless a single concrete C# snippet meaningfully clarifies a fix.

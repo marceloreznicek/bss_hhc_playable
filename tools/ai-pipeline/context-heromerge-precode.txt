@@ -1,0 +1,376 @@
+# PRÉ-CODE — HeroMerge playable (merge × auto-battler)
+
+## TAREFA
+
+Estamos prestes a implementar **HeroMerge**, um playable de anúncio (HTML5
+single-file, formato 1080×1920 portrait) construído sobre o motor existente
+do **HeroSwarm v2**. O HeroSwarm v2 já foi shippado e funciona — vamos clonar
+sua master HTML e modificar.
+
+Vocês são 8 IAs especialistas. **Antes de qualquer linha de código**, revisem
+o plano abaixo e apontem:
+- Edge cases que vão quebrar o jogo
+- Race conditions na interação drag-merge
+- Problemas de UX na mecânica magnética
+- Riscos de regressão no motor reusado
+- Bugs prováveis no animation timing
+- Soluções alternativas que considerem melhores
+
+Não inventem features fora do escopo do GDD v0.1. **Mudança mínima, máxima
+clareza.** O playable inteiro precisa caber em ~310 LoC novos.
+
+---
+
+## CONTEXTO DO MOTOR (HeroSwarm v2 — JÁ EXISTENTE, será reusado)
+
+Stack: HTML/CSS/JS vanilla, 1 arquivo (~4 MB com sprites embed em base64),
+sem build pipeline além de um pequeno bundler Node. ES5-ish (var,
+function expressions). Sem módulos. Sem frameworks.
+
+### Sistema de actors (top-down)
+
+```js
+// Cada actor é um <div class="actor"> com sprite, hp-bar, posicionado por translate3d.
+// applyActorTransform: position via translate3d(x, y, 0); z-index = floor(y) para profundidade top-down.
+// .actor.dying anima fade-out (0.42s).
+
+function createActor(typeKey, registry, x, y) {
+  // Cria o DOM, adiciona ao #lane, retorna o objeto JS com {id, x, y, hp, dmg, ...}
+}
+
+function moveActors(dt) {
+  // Para cada player unit: anda em direção ao target (closest enemy)
+  // Para cada enemy com speed > 0: anda em direção ao closest player
+  // Clamp y em [FIELD_PAD_TOP=410, FIELD_PAD_BOTTOM=700] (bottom half)
+}
+
+function resolveStacking() {
+  // Rigid-body: player↔player split 50/50, player↔enemy one-way push
+}
+
+function tickTackles(dt) {
+  // Lunge animation + dano via TACKLE_INTERVAL (0.6s)
+}
+```
+
+### Stats das unidades (já balanceados em HeroSwarm)
+
+```js
+var UNIT_TYPES = {
+  hero:   { side:'player', w:78,  h:108, hp:5,  dmg:1, speed:110 },
+  ogre:   { side:'player', w:96,  h:120, hp:10, dmg:3, speed:70  },
+  knight: { side:'player', w:110, h:138, hp:20, dmg:6, speed:100 }
+};
+var ENEMY_TYPES = {
+  goblin:   { hp:4,   dmg:2, speed:0, aoe:false, w:84  },
+  brute:    { hp:35,  dmg:4, speed:0, aoe:true,  w:168 },
+  skeleton: { hp:6,   dmg:2, speed:0, aoe:false, w:92  },
+  captain:  { hp:9,   dmg:3, speed:0, aoe:false, w:112 },
+  troll:    { hp:45,  dmg:5, speed:0, aoe:true,  w:188 },
+  dragon:   { hp:120, dmg:6, speed:0, aoe:true,  w:342 }  // Demon Lord
+};
+```
+
+### Spawn / waves (sistema atual no HeroSwarm)
+
+```js
+// Player spawn (atual): tap card → spawnUnit(typeKey) → cria actor em (x:-60, y:CENTER_Y±SPAWN_DELTA_Y)
+// SPAWN_COOLDOWN = { hero: 750, ogre: 2000, knight: 3000 } ms
+// WAVES[1] = 20 enemies pre-placed; WAVES[2] = 20 enemies; LEVEL3_MOBS = 30 + Demon Lord
+
+function spawnUnit(typeKey) {
+  if (!STATE.gameActive) return;
+  var y = CENTER_Y + (Math.random() * 2 - 1) * SPAWN_DELTA_Y;
+  var a = createActor(typeKey, UNIT_TYPES, SPAWN_X_PLAYER, y);
+  STATE.units.push(a);
+  playSFX('spawn');
+  return a;
+}
+
+function spawnEnemy(typeKey, x, y) {
+  if (!STATE.gameActive) return;
+  var a = createActor(typeKey, ENEMY_TYPES, x, bottomHalfY(y));
+  STATE.enemies.push(a);
+  return a;
+}
+
+// FIELD_PAD_TOP=410, FIELD_PAD_BOTTOM=700, CENTER_Y=555 — combat band = bottom half
+```
+
+### Tutorial (atual)
+
+```js
+function showGuideHand(gameX, gameY) { /* posiciona <div id="guide-hand"> com sprite SPRITES.hand */ }
+function showTutBubble(text, gameX, gameY, opts) { /* fala-balão */ }
+// TUT_POS tem heroBtn, ogreBtn, knightBtn (apontam pro botão SUMMON de cada card)
+```
+
+### Layout DOM atual (vai mudar)
+
+```html
+<div id="game">
+  <div id="banner-strip">KILL THE HORDE</div>
+  <div id="battlefield" class="level-1">
+    <div id="lane"></div>            <!-- actors vivem aqui -->
+  </div>
+  <div id="wave-info">Level 1 — Kills 0/20</div>
+
+  <!-- 3 cards (HeroSwarm v2) — vão SAIR -->
+  <div id="card-hero">    <div id="btn-spawn-hero">SUMMON</div>   ... </div>
+  <div id="card-ogre">    <div id="btn-spawn-ogre">SUMMON</div>   ... </div>
+  <div id="card-knight">  <div id="btn-spawn-knight">SUMMON</div> ... </div>
+
+  <div id="endcard"> ... </div>
+</div>
+```
+
+---
+
+## GDD CONSOLIDADO (HeroMerge v0.1)
+
+### Conceito (1 parágrafo)
+
+Tap **SUMMON** dropa Recruits Tier-1 no campo. **Drag** uma unit em cima de
+outra do mesmo tier → mescla em tier maior. Ao tocar uma unit, todas do
+mesmo tier num raio de ~350px são puxadas magneticamente em direção ao dedo.
+Ao soltar (ou após 0.6s parado), o cluster funde em UMA unit do próximo
+tier no ponto da soltada. Combate auto. Sobreviver as 3 waves do HeroSwarm
+e matar o Demon Lord = vitória.
+
+### Ladder de tiers (5 níveis, reusa sprites do HeroSwarm)
+
+| Tier | Nome | Sprite | HP | DMG | Speed |
+|---|---|---|---|---|---|
+| 1 | Recruit    | hero    (intro-hero.png)  | 5   | 1  | 110 |
+| 2 | Lumberjack | ogre    (lenhador.png)    | 10  | 3  | 70  |
+| 3 | Knight     | knight  (igris.png)       | 20  | 6  | 100 |
+| 4 | Brute      | brute   (juggermon2.png)  | 35  | 4  | 60  |
+| 5 | Champion   | dragon  (overlord.png)    | 120 | 6  | 80  |
+
+(Stats vêm direto das tabelas existentes — apenas reuso.)
+
+### Mecânica magnética — comportamento exato
+
+- Player toca uma unit → guarda `STATE.heldActor`
+- Cada frame: outras units do MESMO tier dentro do raio R=350px lerpam em
+  direção ao `heldActor` na velocidade ~600 px/s (ease-out)
+- `heldActor` segue o dedo (pointer x/y → game coords)
+- Ao soltar (pointerup) OU após 600ms de hold-still:
+  - Identifica o cluster: heldActor + todas units do mesmo tier dentro de
+    R_MERGE=80px da posição do dedo
+  - Se cluster.length >= 2: despawn todas + spawn 1 unit do próximo tier no
+    ponto do dedo + flash + SFX
+  - Se cluster.length < 2: heldActor volta pro lugar (cancelar)
+
+### SUMMON button (substitui as 3 cards)
+
+- 1 botão grande na parte de baixo da tela
+- Cooldown ~700ms (estado visual: cd-sweep + cd-text)
+- Spawna 1 Recruit (Tier 1) em posição aleatória dentro do bottom half
+  do battlefield (mesmo `bottomHalfY` usado pra enemies)
+- Pode ser tapado a qualquer momento, mesmo durante drag-merge
+
+### Tutorial (3 passos)
+
+1. **0–3s**: bubble "TAP SUMMON!" + guide hand pulsa no botão
+2. **Após 2 Recruits estarem vivos**: bubble "DRAG TO MERGE!" + guide hand
+   demonstra um drag de Recruit pra Recruit (a animação magnética faz o
+   ensino acontecer visualmente)
+3. **Após 1ª merge feita**: tutorial off
+
+### Win / fail / endcard
+
+Inalterados do HeroSwarm v2 (Demon Lord killed = win, Fire Breath = fail,
+endcard = mesmo intro-hero portrait + "PLAY NOW TO BUILD YOUR ARMY").
+
+---
+
+## PLANO DE IMPLEMENTAÇÃO PROPOSTO (~310 LoC novos)
+
+### 1. UI — substituir 3 cards por 1 botão SUMMON (~30 LoC)
+
+**Remover** do DOM: `#card-hero`, `#card-ogre`, `#card-knight` e seus
+listeners. **Adicionar**:
+
+```html
+<div id="summon-area">
+  <div id="btn-summon">SUMMON
+    <div class="cd-sweep"></div>
+    <div class="cd-text"></div>
+  </div>
+</div>
+```
+
+CSS: tamanho ~520×170px, mesmo gradient verde do endcard-btn, centralizado
+horizontalmente abaixo do `#wave-info`. Reusa `.cd-sweep` e `.cd-text` da
+HeroSwarm.
+
+JS: `document.getElementById('btn-summon').addEventListener('click', onSummonTap);`
+com cooldown de 700ms via `STATE.cooldownUntil.summon`.
+
+### 2. Spawn no bottom half com posição aleatória (~15 LoC)
+
+```js
+function onSummonTap() {
+  if (!STATE.gameActive) return;
+  var now = performance.now();
+  if (now < STATE.cooldownUntil.summon) { playSFX('locked'); return; }
+  var x = 200 + Math.random() * (LANE_W - 400);  // evita beiradas
+  var y = FIELD_PAD_TOP + Math.random() * (FIELD_PAD_BOTTOM - FIELD_PAD_TOP);
+  var recruit = createActor('hero', UNIT_TYPES, x, y);
+  recruit.tier = 1;       // ← NOVO campo no actor
+  STATE.units.push(recruit);
+  playSFX('spawn');
+  STATE.cooldownUntil.summon = now + 700;
+}
+```
+
+### 3. Sistema de tiers (~20 LoC)
+
+```js
+var TIER_TYPE = ['hero', 'ogre', 'knight', 'brute', 'dragon']; // index 0 = tier 1
+
+// No createActor: setar a.tier (default por sprite key)
+// No spawnEnemy: enemies têm tier = -1 (não merge)
+```
+
+### 4. Drag-to-merge — pointer events (~80 LoC)
+
+```js
+var STATE = { ...
+  heldActor: null,
+  pointerX: 0, pointerY: 0,
+  holdStartedAt: 0,
+};
+
+document.getElementById('lane').addEventListener('pointerdown', function(e) {
+  var hit = findActorAt(toGameCoords(e));
+  if (!hit || hit.tier == null || hit.tier >= 5) return;
+  STATE.heldActor = hit;
+  STATE.pointerX = toGameCoords(e).x;
+  STATE.pointerY = toGameCoords(e).y;
+  STATE.holdStartedAt = performance.now();
+  hit.state = 'held';
+});
+
+document.addEventListener('pointermove', function(e) {
+  if (!STATE.heldActor) return;
+  var p = toGameCoords(e);
+  STATE.pointerX = p.x; STATE.pointerY = p.y;
+  STATE.heldActor.x = p.x; STATE.heldActor.y = p.y;
+  STATE.holdStartedAt = performance.now();  // reset auto-fire
+});
+
+document.addEventListener('pointerup', function() {
+  if (!STATE.heldActor) return;
+  resolveMergeAtPointer();
+  STATE.heldActor = null;
+});
+```
+
+### 5. Atração magnética (~50 LoC, no game loop)
+
+```js
+function tickMagnetic(dt) {
+  var h = STATE.heldActor;
+  if (!h) return;
+  var R = 350, R2 = R * R;
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.tier !== h.tier || u.dead) continue;
+    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
+    var d2 = dx*dx + dy*dy;
+    if (d2 > R2) continue;
+    var d = Math.sqrt(d2);
+    if (d < 1) continue;
+    var pull = Math.min(600 * dt, d);  // px/s, never overshoot
+    u.x += (dx / d) * pull;
+    u.y += (dy / d) * pull;
+    applyActorTransform(u);
+  }
+  // Auto-fire merge if held still for >600ms
+  if (performance.now() - STATE.holdStartedAt > 600) {
+    resolveMergeAtPointer();
+    STATE.heldActor = null;
+  }
+}
+```
+
+### 6. Merge resolution (~40 LoC)
+
+```js
+function resolveMergeAtPointer() {
+  var h = STATE.heldActor;
+  if (!h) return;
+  var R_MERGE = 80, R2 = R_MERGE * R_MERGE;
+  var cluster = [h];
+  for (var i = 0; i < STATE.units.length; i++) {
+    var u = STATE.units[i];
+    if (u === h || u.tier !== h.tier || u.dead) continue;
+    var dx = STATE.pointerX - u.x, dy = STATE.pointerY - u.y;
+    if (dx*dx + dy*dy < R2) cluster.push(u);
+  }
+  if (cluster.length < 2) {
+    h.state = 'idle';
+    return;  // cancelado, fica onde está
+  }
+  // Despawn cluster
+  cluster.forEach(function(u) { u.dead = true; u.dom.remove(); });
+  STATE.units = STATE.units.filter(function(u) { return !u.dead; });
+  // Spawn next tier no ponto do dedo
+  var nextKey = TIER_TYPE[h.tier];  // tier 1 → index 1 → ogre
+  if (!nextKey) return;             // já tava no tier 5
+  var newU = createActor(nextKey, UNIT_TYPES, STATE.pointerX, STATE.pointerY);
+  newU.tier = h.tier + 1;
+  STATE.units.push(newU);
+  playSFX('unlock');  // power up sound
+  // TODO: flash visual no spawn point (CSS .merge-flash)
+}
+```
+
+### 7. Tutorial swap (~40 LoC) + remover lógica antiga
+
+Substituir `tutorialOnIntroClose` / `tutGoTo` para usar 3 passos novos:
+- Step 1: TAP SUMMON
+- Step 2 (após 2 Recruits): DRAG TO MERGE
+- Step 3 (após 1ª merge): off
+
+### 8. Layout edits (~20 LoC HTML/CSS)
+
+Remover blocks `#card-hero`, `#card-ogre`, `#card-knight`. Adicionar
+`#summon-area`. Ajustar `#wave-info` margin-bottom.
+
+---
+
+## ESCOPO EXPLICITAMENTE FORA
+
+- Múltiplas famílias de unidades (só um ladder).
+- Economia/coins.
+- Skill ativa do Champion (só usa o AoE existente).
+- Som de "magnetic woosh" novo (reusa `power up_01.mp3`).
+
+---
+
+## REVISÕES SOLICITADAS (cada IA no seu nicho)
+
+- **Claude Opus 4.7**: edge cases invisíveis (ex: clicar em unit já em
+  combate, drag sai do battlefield, race entre auto-fire e pointerup, etc).
+- **Claude Sonnet 4.6**: audite exploits / quebras visuais (ex: spam SUMMON
+  estoura 100 units, magnetic puxa unit que tá morrendo, drag durante level
+  transition, etc).
+- **GPT-5.3 Codex**: race conditions (game loop @ 60fps vs pointer events,
+  pointerup durante merge animation, dt variável).
+- **GPT-5.5**: proponha o snippet final correto pra cada bloco que parece
+  problemático, em JS ES5-ish (var, function).
+- **KAT Coder Pro V2**: TL;DR JS/DOM-specific (touch events em mobile,
+  pointer-events: none nos sprites, will-change pra performance).
+- **Gemini 3 Flash**: explique POR QUE a mecânica magnética pode falhar e
+  dê alternativas (ex: pinch animation, single-tap merge, queue de cliques).
+- **Qwen 3.6 Plus**: o que as outras IAs estão ignorando? (ex: game loop
+  ainda chama moveActors no held actor, hp-bar segue o drag, z-index do
+  drag, sprites visualScale 1.89× = hit area).
+- **Grok 4.20**: como um atacante criativo quebra isso? (ex: drag pra fora
+  da viewport, unit morre durante cluster, multiplos pointers/multitouch,
+  level transition durante hold).
+
+Foco em **prevenir bugs antes de codar**, não em refatorar o motor.

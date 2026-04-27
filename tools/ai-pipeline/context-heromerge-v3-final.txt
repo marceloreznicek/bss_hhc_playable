@@ -1,0 +1,38 @@
+# REVISÃO FINAL — HeroMerge v0.3 ship gate
+
+## TAREFA
+HeroMerge v0.3 (4 fixes na mecânica de grid-merge) passou pelas 4 etapas:
+
+- ETAPA 1 (precode) — 8 IAs: edge cases do cluster, racing pulse animation, ghost CSS pegadinhas
+- ETAPA 1.5 (síntese) — Kimi consolidou: cache CELL_ELS, position:fixed ghost, rAF coalescing, .pulling override .match, revalidate at commit, cleanup .pulling em todos eventos
+- ETAPA 2 (execução) — implementado, validado com puppeteer (snap_grid.cjs):
+  * 4 Tier-1s em [0,1,2,3] → drag 3→1 → cluster=[3,1,0] visível pulsando, cell 2 INTACTA
+  * Ghost coords client-space (211.5, 576.75), position:fixed funciona
+  * Post-merge: 1 Tier-2 em cell 1, cells 0+3 vazias, cell 2 ainda Tier-1 (no overconsume ✓)
+  * BATTLE deploy → STATE.units = {tier1:1, tier2:1}
+- ETAPA 3 (postcode) — 6 IAs: 1 aprovou explicitamente (GPT-5.5 triagem), 5 deram refactor recommendations sem rejeitar. MiMo V2.5 flagou TOCTOU teórico — já mitigado pelo revalidation loop em `tryMergeCells` antes de mutar STATE.grid.
+
+Vocês são as 2 IAs do gate. **Ambos APROVADO = ship.**
+
+- **MiMo V2 Pro**: aprovação estrutural — restart, level transitions, fail screen, multi-touch, mobile Safari quirks. Procure DEALBREAKERS.
+- **Claude Sonnet 4.6**: última linha — bugs que outros 14 não pegaram. Foque em casos de produção (rede de anúncios, autoplay BGM, mraid/ExitApi, dimensionamento responsivo, touch events em iOS).
+
+FORMATO: APROVADO ou REJEITADO em maiúsculas, sozinho na primeira linha, depois 3-5 bullets. Se REJEITADO, inclua "BLOQUEIO:" no último bullet.
+
+## RESUMO DAS 4 MUDANÇAS
+1. **3-of-a-kind merge**: `tryMergeCells` chama `computeMergeCluster(src, drop)` → cluster de 3, todos consumidos, próximo tier no drop.
+2. **Adjacency required**: `computeMergeCluster` exige que `dropIdx` tenha pelo menos 1 vizinho geometricamente adjacente (via `GRID_ADJ` precomputado pro grid 4×2) que seja mesmo tier e ≠ srcIdx. Spec do user: "2 das 3 lado a lado" → drop+partner adjacentes satisfaz isso.
+3. **Pulsing magnetic-pull preview**: `updatePullPreview` (rAF-coalesced em pointermove) marca `.pulling` em exatamente as 3 células do cluster. CSS adiciona scale(1.09) + golden ring expansivo + glow. Cleanup em endDrag.
+4. **No overconsume**: cluster sempre = 3 elementos. 4ª célula de mesmo tier fica intacta no grid (validado: snap_grid mostra cell 2 = T1 após merge de [3,1,0]).
+5. **Ghost offset fix**: `#drag-ghost` movido pra `document.body` (fora do `#game` que tem `transform:scale`), `position:fixed`, `transform:translate(-50%,-50%) scale(1.15)`. `moveDragGhost(clientX, clientY)` seta left/top diretamente em viewport pixels. Resultado: ghost embaixo do dedo, sem offset.
+
+Defesas adicionais (precode synthesis):
+- `CELL_ELS` cache (8 nós, 1× no init)
+- Single-pointer lock via `DRAG.active`
+- TOCTOU revalidation em `tryMergeCells` antes de mutar
+- Cleanup `.pulling`/`.match`/`.dragging` em pointerup, pointercancel, lostpointercapture, visibilitychange, e início de novo drag
+- `clusterEquals()` evita repintura DOM redundante quando finger se move dentro da mesma célula
+- `setPointerCapture` (try/catch) pra dedo que sai do grid
+
+## CÓDIGO COMPLETO IMPLEMENTADO
+(ver context-heromerge-v3-postcode.txt — mesmo código que foi revisado pelo postcode com 0 rejeitados)

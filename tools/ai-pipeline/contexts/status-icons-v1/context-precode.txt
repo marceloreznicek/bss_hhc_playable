@@ -1,0 +1,199 @@
+TASK: pré-code review do plano para adicionar **status icons (DOT + Shield) sobre a barra de HP de cada herói** no DiverDungeon (Unity 6, C#, turn-based deterministic combat). Este é um feature pequeno de UI, complementar ao **Cast Banner v1** que acabou de aprovar via pipeline. Surgir bugs, riscos de regressão, edge cases, e tradeoffs ANTES da implementação.
+
+══════════════════════════════════════════════════════════════════
+USER SPEC
+══════════════════════════════════════════════════════════════════
+
+> "Implement these on the bottom right side of the char (over HP bar). Add white font with the number on it:
+> - DOT --> Damage to be taken each turn
+> - Shield --> Shield ammount.
+> The icon goes away if the effect goes away."
+
+Sprites entregues:
+- `/home/marcelo/Reznicek Studios/temp_sprites/status_effects/dot.png` (1024×1024 RGBA)
+- `/home/marcelo/Reznicek Studios/temp_sprites/status_effects/shield.png` (1024×1024 RGBA)
+
+══════════════════════════════════════════════════════════════════
+PLANO PROPOSTO
+══════════════════════════════════════════════════════════════════
+
+1. **Asset import**: copiar sprites para `Assets/Resources/StatusIcons/dot.png` e `shield.png`. Escrever .meta files com `textureType: 8` (Sprite) para que `Resources.Load<Sprite>("StatusIcons/dot")` funcione. GUID novos por arquivo (UUIDv4 hex sem hifens).
+
+2. **HeroVisual class** ganha:
+   ```csharp
+   public Image dotIcon;
+   public Text dotLabel;
+   public Image shieldIcon;
+   public Text shieldLabel;
+   ```
+
+3. **BuildCombat** (na construção de cada herói): após criar HP bar (linha ~1147), criar dois RectTransform filhos da `rt` do herói, ancorados no canto inferior-direito sobre a HP bar. Tamanho ~36×36 cada. Layout: shield à esquerda, dot à direita (ambos no canto inferior-direito da hero rect). Cada um tem:
+   - Image (sprite carregado de Resources)
+   - Text overlay (white, bold, fontSize 20, anchored center)
+   - Inicialmente `gameObject.SetActive(false)`
+
+4. **UpdateHeroStatusIcons(int slot, List<ActiveStatus> bag)** novo helper:
+   - Encontra primeira entrada `Shield` no bag → mostra shield icon + magnitude. Senão hide.
+   - Encontra primeira entrada `DamageOverTime` → mostra dot icon + magnitude (dano por tick). Senão hide.
+   - v1 "replace not stack" garante no máximo 1 de cada tipo por herói (CombatResolver.UpsertStatus).
+
+5. **Integration points**:
+   - Chamar `UpdateHeroStatusIcons` para todos heróis dentro de `RefreshAllCombatBars(heroes, enemies)` em `UIController.cs`.
+   - `RefreshAllCombatBars` é invocado pelo cast banner (após cada cast) e end-of-round (após status tick).
+   - Floor start: ícones automaticamente limpos via clear de status bags + `RefreshAllCombatBars` (que verá listas vazias).
+
+6. **Resources caching**: load os 2 sprites uma vez em `Awake` ou `BuildCombat`, cache em campos estáticos ou de instância. Não loadar por cada herói.
+
+══════════════════════════════════════════════════════════════════
+EXISTING CODE (relevant excerpts)
+══════════════════════════════════════════════════════════════════
+
+### HeroVisual class (UIController.cs:110)
+```csharp
+class HeroVisual {
+    public RectTransform root;
+    public Graphic sprite;
+    public Image hpFill;
+    public Text hpLabel;
+    public Image manaBg;
+    public Image manaFill;
+    public Text nameLabel;
+    public Vector2 homeAnchoredPos;
+    public Color baseColor;
+    public int slot;
+    public GameObject heroInstance;
+    public Camera heroCam;
+    public RenderTexture heroRT;
+    public Animator animator;
+    public ParticleSystem dustParticles;
+}
+```
+
+### HP bar build (UIController.cs:1141-1159)
+```csharp
+var hpBg = MakeImage("HpBg", rt, new Color(0.05f, 0.05f, 0.05f));
+var hpBgRt = hpBg.rectTransform;
+hpBgRt.anchorMin = new Vector2(0f, 0f); hpBgRt.anchorMax = new Vector2(1f, 0f);
+hpBgRt.pivot = new Vector2(0.5f, 1f);
+hpBgRt.anchoredPosition = new Vector2(0, -8);
+hpBgRt.sizeDelta = new Vector2(0, 26);
+
+var hpFill = MakeImage("HpFill", hpBg.rectTransform, new Color(0.2f, 0.85f, 0.3f));
+// ...
+var hpLbl = MakeText("HpLbl", hpBg.rectTransform, ...);
+```
+
+The HP bar is at the bottom of the hero RectTransform (anchorMin/Max y=0, pivot y=1, anchoredPosition Y=-8). User wants icons in the **bottom-right corner OVER the HP bar**. That suggests anchoring icons to (1, 0) of hero rt with a small offset.
+
+### ActiveStatus + StatusType (Assets/Prototype/Scripts/ActiveStatus.cs)
+```csharp
+public enum StatusType {
+    Shield = 0,
+    DamageOverTime = 1,
+    StatBuff = 2,
+    StatDebuff = 3
+}
+public struct ActiveStatus {
+    public StatusType type;
+    public int magnitude;
+    public int ticksRemaining;
+    public int sourceHeroIndex;
+}
+```
+
+### CombatResolver.UpsertStatus (replace-not-stack rule)
+```csharp
+static void UpsertStatus(List<ActiveStatus> bag, ActiveStatus s) {
+    for (int i = 0; i < bag.Count; i++) {
+        if (bag[i].type == s.type) { bag[i] = s; return; }
+    }
+    bag.Add(s);
+}
+```
+Garante no máximo 1 entry por StatusType por target.
+
+### RefreshAllCombatBars (UIController.cs, post cast-banner feature)
+```csharp
+void RefreshAllCombatBars(List<HeroStats> heroes, List<EnemyStats> enemies)
+{
+    for (int i = 0; i < heroes.Count && i < heroVisuals.Count; i++)
+    {
+        UpdateHeroHpBar(i, heroes[i].hp, heroes[i].maxHp);
+        UpdateHeroManaBar(i, heroes[i].mana, heroes[i].maxMana);
+    }
+    for (int i = 0; i < enemies.Count && i < enemyVisuals.Count; i++) { ... }
+}
+```
+
+### RunLiveCombat status flow (UIController.cs:1789-1796)
+```csharp
+var heroStatuses = new List<List<ActiveStatus>>(heroes.Count);
+for (int i = 0; i < heroes.Count; i++) heroStatuses.Add(new List<ActiveStatus>(2));
+var enemyStatuses = new List<List<ActiveStatus>>(enemies.Count);
+for (int i = 0; i < enemies.Count; i++) enemyStatuses.Add(new List<ActiveStatus>(2));
+```
+`heroStatuses` is local to `RunLiveCombat` coroutine. To pass it to `RefreshAllCombatBars`, either add it as parameter, or store as a field.
+
+### Sample sprite .meta (template for new sprites)
+```yaml
+fileFormatVersion: 2
+guid: <NEW_GUID>
+TextureImporter:
+  serializedVersion: 13
+  ...
+  textureType: 8     # 8 = Sprite
+  spriteMode: 1      # 1 = Single
+  alphaIsTransparency: 1
+  ...
+```
+
+══════════════════════════════════════════════════════════════════
+PONTOS A REVISAR
+══════════════════════════════════════════════════════════════════
+
+**§1. State propagation**
+- `heroStatuses` é local em `RunLiveCombat`. Para `RefreshAllCombatBars` atualizar ícones, ele precisa receber a lista. Opções:
+  - (A) Adicionar parâmetro: `RefreshAllCombatBars(heroes, enemies, heroStatuses)`. Mudança em todos call sites.
+  - (B) Promover `heroStatuses` para field do `UIController`, populado em RunLiveCombat. Risco: estado vaza entre floors se não limpar.
+  - (C) Ter um `UpdateHeroStatusIconsAll(heroStatuses)` separado, chamado pelos mesmos pontos que `RefreshAllCombatBars` (cast banner + end-of-round).
+- Recomendar opção. Por que?
+
+**§2. Sprite import + .meta files**
+- O .meta precisa de GUID novo por arquivo. Posso gerar via `python3 -c "import uuid; print(uuid.uuid4().hex)"` ou similar.
+- Risk: Unity pode regenerar .meta se detectar conflito. Aceitável?
+- Cache estático vs cache no UIController.Awake — qual prefere?
+- Deve fazer load ASAP (Awake) para que BuildCombat possa atribuir? Sim, BuildCombat é chamado em Awake.
+
+**§3. Layout / posicionamento**
+- HP bar é largura total da hero rect (anchoredPosition Y=-8, pivot Y=1). Significa que ela vai do Y=-8 para Y=-34 aproximadamente (sizeDelta height 26).
+- Icons "bottom-right OVER the HP bar" → anchor (1, 0) na hero rt, sizeDelta 36×36, anchoredPosition (-4, -8) ou parecido.
+- Shield icon à esquerda do dot icon? Ou empilhados verticalmente? User não especificou. Recomendar.
+- Tamanho 36×36 está ok ou muito pequeno em 1080p?
+
+**§4. Edge cases**
+- Hero KO com status ativo: ícone deve sumir (status bag não é limpo no KO mas o herói está morto). Ou continuar mostrando? Recomendar "esconder se hp <= 0".
+- Status com magnitude 0: pode acontecer? Shield drenado deveria ser pruned por AbsorbWithShield. DoT 0-magnitude indica dado errado.
+- Shield magnitude diminui a cada hit (drena). Ícone precisa atualizar a cada enemy attack, não só cast. Mas o número só aparece em RefreshAllCombatBars que é chamado entre ações atômicas? Verificar. **Importante**: cada vez que um inimigo bate em um herói com shield, o shield drena. Preciso chamar UpdateHeroStatusIcons também ali.
+- DoT damage tick em end-of-round drena duração mas não magnitude (DoT mantém magnitude até prune). Após prune (ticksRemaining=0), magnitude=N mas removido do bag. UpdateHeroStatusIcons após end-of-round mostraria sumir.
+
+**§5. Performance**
+- Update por hero por action atômica = barato.
+- Texture loading: 2 sprites de 1024×1024 RGBA = ~8MB cada. Talvez import com max 256×256 no .meta. Recomendar.
+
+**§6. Determinismo**
+- UI puro, presentation-only. Não afeta resolver. Confirmar.
+
+**§7. Save/load impact**
+- Status icons são UI runtime; nenhum impacto em PlayerPrefs save. Confirmar.
+
+**§8. Buracos no plano**
+- Esqueci alguma coisa?
+- O que pode quebrar?
+
+══════════════════════════════════════════════════════════════════
+DELIVERABLE
+══════════════════════════════════════════════════════════════════
+
+Cada modelo: review tight, file:line cited, action-oriented. Vote em §1 (A/B/C) e §3 (layout). Flag §4 edge cases load-bearing.
+
+End com **BUILD** (proceder com plan + sugestões) ou **BLOCK** (precisa redesign).

@@ -1,0 +1,143 @@
+TAREFA: Finalizar a Main Menu redesenhada (Mockup B — Modern Mobile RPG) já construída via MCP no canvas hierarchy. Validar abordagem para 5 itens pendentes antes de aplicar.
+
+## CONTEXTO DO PROJETO
+
+- Engine: Unity 2022+ uGUI + TextMeshPro
+- Build: hierarquia de Canvas no Prototype.unity (escolhida via MCP, NÃO via runtime script)
+- Cena: Assets/Prototype/Scenes/Prototype.unity
+- Script principal: Assets/Prototype/Scripts/UIController.cs (3121 linhas, monolítico, builda menus em runtime)
+- Resolução de referência: 390x844 (portrait mobile)
+
+## O QUE JÁ FOI CONSTRUÍDO (canvas hierarchy, sem erros)
+
+```
+MainMenuCanvas (Canvas, ScreenSpaceOverlay)
+├── Background (#0e0a1f)
+│   ├── BG_TopWash (purple)
+│   ├── AtmosphereGold / AtmosphereRed / AtmospherePurple (Image rectangles, alpha 0.10-0.18)
+├── Header
+│   ├── TitleLine1 ("DUNGEON", TMP, gradient gold)
+│   ├── TitleLine2 ("DIVERS",  TMP, gradient gold)
+│   └── Subtitle ("DESCEND INTO THE DEPTHS")
+├── StatStrip (HorizontalLayoutGroup)
+│   ├── ChipGold / ChipDeepest / ChipRuns (Image bg + Outline + VLG; Key+Value TMPs)
+├── DiveCenter
+│   ├── PulseRing1 (Image, sprite=circle_ring.png, 280x280, scale 1)
+│   ├── PulseRing2 (Image, sprite=circle_ring.png, scale 0.85)
+│   ├── DiveButton (Image circle_solid.png 220x220, red, Button)
+│   │   └── DiveLabel ("DIVE", TMP, 44pt)
+│   └── DiveHint ("PARTY OF 3 READY", TMP rich text)
+└── Navbar (HorizontalLayoutGroup, glassy bg)
+    ├── NavCity / NavShop / NavGear (CanvasGroup interactable=false alpha=0.4, Icon+Label)
+    ├── NavPlay → PlayFab (gold circle 56x56 raised +22, "PLAY")
+    └── NavParty (active: alpha 1)
+```
+
+Sprites geradas (Python+PIL, salvas em Assets/UI/Sprites/):
+- circle_solid.png (512x512 white antialiased disc)
+- circle_ring.png (94% inner cutout — outline only)
+- soft_blob.png (radial smoothstep falloff, white→transparent)
+
+## ITENS PENDENTES (5)
+
+### 1. Desligar BuildMainMenu runtime
+UIController.BuildMainMenu() (linha 565-594) instancia em runtime um menu paralelo que vai sobrepor o canvas estático. Precisa parar de criar o `mainMenuPanel`.
+
+Restrições:
+- O resto do UIController (ShowScreen, OnEnterDungeonClicked, BeginDungeonRun, ReturnToMainMenu, RefreshMainMenu) é referenciado em ~6 lugares. Não posso quebrar.
+- ShowScreen(Screen.MainMenu) usa `mainMenuPanel.gameObject.SetActive(s == Screen.MainMenu)` — se mainMenuPanel for null, NRE.
+- RefreshMainMenu() escreve em `mainMenuStatus.text` e `menuEnterDungeonBtn.interactable` — se forem null, NRE.
+
+Opção A: Comentar/remover BuildMainMenu inteiro + as chamadas a Refresh/SetActive em ShowScreen para o caso MainMenu. Cena é a fonte da verdade.
+Opção B: Esvaziar BuildMainMenu (deixa só as referências necessárias setadas como null safe), mas RefreshMainMenu e ShowScreen ainda tentam usá-las.
+Opção C: Cachear referências do canvas estático em fields e fazer RefreshMainMenu atualizar o canvas (chip values, dive hint), e ShowScreen ativar/desativar MainMenuCanvas.
+
+Recomendação técnica desejada: qual minimiza risco e mantém consistência com Screen system?
+
+### 2. Wirar onClick do DIVE e PARTY
+- DIVE button (DiveButton/Button) → equivalente do antigo `OnEnterDungeonClicked` (RefreshRoster + ShowScreen(Screen.Roster))
+- NavParty button → mesmo destino (manage party screen)
+
+Como UIController constrói menus em runtime no Awake/Start, o `Button.onClick` do canvas estático precisa ser wirado de algum jeito.
+
+Opção A: Wirar via Inspector usando UnityEvent persistente (drag-drop, mas eu uso MCP — preciso definir o `m_PersistentCalls` do Button via MCP).
+Opção B: Adicionar `[SerializeField]` no UIController para os 2 buttons, plus um pequeno `Awake` que faz `.AddListener` (single line por button, NÃO é "build menu", é só wiring).
+Opção C: Criar um component novo `MainMenuBindings` que tem refs para os buttons + chama UIController via SendMessage/UnityEvent.
+
+Qual é mais correto/idiomático para Unity, considerando que NÃO posso construir menus em runtime?
+
+### 3. Pulse animation nos rings
+PulseRing1 e PulseRing2 são Image circulares estáticos. CSS original tinha:
+- scale 0.85 → 1.25 + opacity 0.7 → 0 ao longo de 2.4s, loop infinito
+- Ring2 com delay 1.2s (offset metade do ciclo)
+
+Implementação Unity:
+Opção A: Animator + AnimationClip com keyframes em scale e Image.color.alpha. Loop=true. Estado único, animação rolada do início.
+Opção B: DOTween (não está no projeto, addiria dependência).
+Opção C: Coroutine em Start (mas isso é "runtime build" e foi proibido).
+Opção D: Uma classe pequena `UIPulse` MonoBehaviour reutilizável (Update com Mathf.Repeat) — ainda é código mas é declarativo, não constrói hierarchy.
+
+Qual a abordagem mais limpa para Mockup B mobile-RPG, sem adicionar deps?
+
+### 4. Atmosphere blobs — softness
+Hoje são Image retangulares com cor flat. Em mobile mockup B, deveriam ser blobs radiais soft (CSS `radial-gradient(circle, color 0%, transparent 25%)`).
+
+Já existe `Assets/UI/Sprites/soft_blob.png` (radial alpha falloff smoothstep).
+
+Plano: trocar o `Image.sprite` dos 3 atmosphere objects para soft_blob.png e ajustar `color.a` para que o blob mantenha intensidade visual (0.12 / 0.10 / 0.18 → testar 0.4 / 0.35 / 0.5 com sprite soft).
+
+Pergunta: blend mode? Image padrão usa SrcAlpha/OneMinusSrcAlpha. Para "luz aditiva" (atmosphere), seria melhor usar Material com Additive blend? Trade-off: 1 material novo vs visual fidelity vs dark theme.
+
+### 5. PLAY FAB — outline polish
+PlayFab (gold circle 56x56) usa Outline (UnityEngine.UI.Outline) com cor #0e0a1f e effectDistance 3,-3 — simula a "border 3px solid #0e0a1f" do CSS, mas em retângulo (Outline funciona com qualquer Image; com sprite circular ele simplesmente desloca cópias do sprite, criando halo).
+
+Resultado: pode ficar com "borda" assimétrica ou borrada, não um anel limpo.
+
+Alternativas:
+Opção A: Remover Outline. Em vez disso, criar um child Image atrás do FAB (PlayFab_BorderRing): mesmo sprite circle_solid.png, cor #0e0a1f, sizeDelta 62x62 (3px maior em cada lado). Render order garante que apareça atrás (parent ordering ou siblingIndex).
+Opção B: Manter Outline, ajustar effectDistance para 2/2 (mais sutil).
+Opção C: Criar um shader custom para anel circular limpo (overkill).
+
+Qual é mais idiomática para Unity uGUI sem custom shader?
+
+## PERGUNTAS POR PAPEL
+
+### Para Claude Opus 4.7 (edge cases)
+1. No item 1, opção A (remover BuildMainMenu): vai dar NRE na primeira vez que ShowScreen(Screen.MainMenu) ou RefreshMainMenu rodam? Como blindar?
+2. No item 2, ao wirar onClick em runtime via AddListener no Awake do UIController, e ao mesmo tempo desligar BuildMainMenu, há risco de o UIController não encontrar o GameObject (cena ainda não carregou)? Order of execution garante que Canvas existe antes do UIController.Awake?
+3. No item 3, com Animator + clip rolando do início + Ring2 com delay: dá pra fazer Ring2 tocar com offset de tempo no mesmo clip OU precisa de 2 clips? Solução mais limpa?
+
+### Para Claude Sonnet 4.6 (security/baseline)
+1. Item 4 com Material aditivo: alguma armadilha de mobile (overdraw, fillrate)?
+2. Há algum risco de a abordagem proposta quebrar a Roster screen ou outras telas que UIController gerencia?
+
+### Para GPT-5.3 Codex (lógica pura)
+1. Para o item 1, faz mais sentido a opção A ou C? Justifique em 1-2 frases.
+2. Para o item 5, opção A (child border ring) — qual o sibling order correto? Background ring DEVE ser antes do PlayFab no hierarchy ou depois? (uGUI é "renderiza na ordem do hierarchy, último por cima").
+
+### Para Qwen 3.6 Plus (advogado do diabo)
+1. Estou over-engineering algum desses 5 itens? Há solução mais simples?
+2. Posso pular algum item por agora e voltar depois?
+
+### Para Gemini 3 Flash (didático)
+1. Quais são os passos exatos, ordenados, para aplicar os 5 itens minimizando rebuild da cena?
+
+### Para KAT Coder Pro V2 (Unity-specific)
+1. Animator vs MonoBehaviour com Update() — prós e contras pra animação de UI loop infinita em mobile?
+2. Como referenciar onClick handler de um MonoBehaviour via Persistent Calls do Button quando estou criando via MCP (sem Inspector)? Existe forma de setar `m_PersistentCalls.m_Calls` programaticamente?
+3. No item 4, soft_blob.png importado como Sprite — qual setting de import é melhor pra um blob de fundo (Mip Maps? Compression?)
+
+### Para GPT-5.5 (co-coder)
+1. Reveja o plano dos 5 itens. Há ordem que reduza risco?
+2. Para o item 1, escreva o diff EXATO para UIController.cs (BuildMainMenu, RefreshMainMenu, ShowScreen) que minimize blast radius.
+
+### Para Grok 4.20 (red team)
+1. Quebra esse plano. Qual é o caminho mais provável de quebrar a cena/build agora?
+2. O canvas estático estar na cena de Prototype.unity (que já tem GameManager + UIController+RunController) cria conflito de inicialização?
+
+## OBJETIVO
+
+- Confirmar abordagem técnica para CADA um dos 5 itens.
+- Identificar 1-2 itens que devem ser feitos PRIMEIRO para destravar os outros (ex: item 1 antes de tudo).
+- Apontar QUALQUER risco concreto de quebrar Prototype.unity ou outras telas (Roster, Combat).
+- Aprovar OR sugerir mudança ESPECÍFICA (não opinião de estilo).
