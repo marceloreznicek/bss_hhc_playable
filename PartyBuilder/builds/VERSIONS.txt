@@ -1,0 +1,11 @@
+PartyBuilder Playable Builds — v1
+==================================
+bss_hhc_partybuilder_v1_AppLovin.html   — AppLovin / generic (window.open)
+bss_hhc_partybuilder_v1_UnityAds.html   — Unity Ads (mraid.open)
+bss_hhc_partybuilder_v1_GoogleAds.html  — Google Ads HTML (ExitApi.exit), unzipped
+bss_hhc_partybuilder_v1_GoogleAds.zip   — Google Ads upload package (contains index.html)
+
+Source: ../PartyBuilder_v0.1.html
+Real assets are baked in via SPRITES/SOUNDS registries (see qa/bundle_assets.cjs).
+Store CTA routes to the live HHC iOS / Android listings (goToStore() in master HTML).
+Portrait only (1080×1920).

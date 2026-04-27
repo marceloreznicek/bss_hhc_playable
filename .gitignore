@@ -1,10 +1,15 @@
-# Node QA harness
+# Node QA harness (also catches symlinks to HeroSwarm/qa/node_modules)
+**/node_modules
 **/node_modules/
 **/package-lock.json
 
 # Build output / generated screenshots (regenerate via qa scripts)
 HeroSwarm/qa/screenshots/
 HeroMerge/qa/screenshots/
+PartyBuilder/qa/screenshots/
+
+# Asset backups (originals before -trim, kept locally for diffing)
+PartyBuilder/assets/_originals/
 
 # Large binary archives (duplicates of unpacked folder contents)
 HHC_Playable.rar
